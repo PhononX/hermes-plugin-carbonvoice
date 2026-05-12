@@ -19,6 +19,8 @@ hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
   ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
 
 # 3. Add your PAT + open the bot to all senders (dev) — append to ~/.hermes/.env
+#    Prefer a GUI? `open $(hermes config env-path)` opens it in your editor,
+#    or run `hermes dashboard` for the web UI at http://127.0.0.1:9119.
 cat >> ~/.hermes/.env <<'EOF'
 CARBONVOICE_PAT=cv_pat_xxxxxxxxxxxxxxxxxxxxxxxx
 CARBONVOICE_ALLOW_ALL_USERS=true
