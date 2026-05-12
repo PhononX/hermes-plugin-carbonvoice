@@ -1,22 +1,14 @@
 # Carbon Voice plugin installed 🎙️
 
-Your PAT is saved. Two short steps and the agent is live.
+Your PAT is saved. One command left — start the gateway and DM the agent from any Carbon Voice account.
 
-## 1. Install the Socket.IO client *(recommended)*
-
-Without it the plugin still works — it just polls every 5 seconds instead of receiving push events. Hermes ships a uv-managed venv without `pip`, so this bootstraps pip first.
-
-```bash
-~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
-```
-
-## 2. Start the gateway
+## Start the gateway
 
 ```bash
 hermes gateway run
 ```
 
-Now DM the agent's Carbon Voice account from anywhere. It reacts with ✅ within a second and replies in-thread.
+The agent reacts with ✅ within a second and replies in-thread. On first startup the plugin will auto-install `python-socketio` (for real-time delivery) if it's missing — you'll see a one-line log and then the gateway starts normally.
 
 ---
 

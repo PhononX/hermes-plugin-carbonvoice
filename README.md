@@ -11,29 +11,23 @@ You need Hermes already installed and a Carbon Voice Personal Access Token (grab
 
 ### 1. Install the plugin
 
-The installer will prompt you for your Carbon Voice PAT — paste it in and press Enter. Then follow the green panel that prints when the install completes.
+The installer prompts you for your Carbon Voice PAT — paste it in and press Enter.
 
 ```bash
 hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
 ```
 
-### 2. Install the Socket.IO client for real-time delivery *(recommended)*
-
-Without it the plugin still works — it just polls every 5 seconds instead of receiving push events. Hermes ships a uv-managed venv without `pip`, so we bootstrap pip first.
-
-```bash
-~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
-```
-
-### 3. Start Hermes
+### 2. Start Hermes
 
 ```bash
 hermes gateway run
 ```
 
+On the first run, the plugin auto-installs `python-socketio` (for real-time delivery via Socket.IO) if it's not already present — you'll see one log line and then the gateway starts normally. If the install fails (offline, sandboxed venv, etc.) the plugin still works in REST-polling mode.
+
 On startup you'll see `carbonvoice: connected as <your_user_guid>` — handy if you decide to restrict access later.
 
-### 4. Send a message from Carbon Voice
+### 3. Send a message from Carbon Voice
 
 Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It reacts with ✅ within a second and replies in-thread.
 
