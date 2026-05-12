@@ -1,7 +1,7 @@
 name: carbonvoice-platform
 label: Carbon Voice
 kind: platform
-version: 0.3.2
+version: 0.3.3
 description: >
   Carbon Voice gateway adapter for Hermes Agent.
   Connects via Socket.IO (primary) with REST polling fallback — no public
@@ -41,11 +41,11 @@ optional_env:
     prompt: "Allowed creator id (or empty)"
     password: false
   - name: CARBONVOICE_ALLOWED_USERS
-    description: "Comma-separated Carbon Voice user_guids allowed to trigger the bot"
-    prompt: "Allowed user_guids (comma-separated)"
+    description: "Comma-separated Carbon Voice user_guids allowed to trigger the bot (when set, only these users are accepted)"
+    prompt: "Allowed user_guids (comma-separated, blank to keep open)"
     password: false
   - name: CARBONVOICE_ALLOW_ALL_USERS
-    description: "Allow any Carbon Voice user to trigger the bot (dev only)"
+    description: "Default true. Set to false (with empty ALLOWED_USERS) to explicitly close the bot to everyone"
     prompt: "Allow all users? (true/false)"
     password: false
   - name: CARBONVOICE_HOME_CHANNEL

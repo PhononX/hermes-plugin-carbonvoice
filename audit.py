@@ -28,7 +28,19 @@ logger = logging.getLogger(__name__)
 
 
 class AllowlistGate:
-    """Mirrors Hermes' allowlist semantics so we can log rejections."""
+    """Default-allow access control for inbound Carbon Voice messages.
+
+    Semantics (intentionally permissive — the plugin is mostly used for
+    personal/dev bots where install-and-forget should "just work"):
+
+    - ``CARBONVOICE_ALLOWED_USERS=a,b,c`` → only those user_guids accepted
+    - ``CARBONVOICE_ALLOW_ALL_USERS=false`` (with no allowed list) → deny all
+    - Anything else (including unset) → allow all
+
+    Setting ``CARBONVOICE_ALLOW_ALL_USERS=true`` is redundant but accepted
+    for explicitness; the in-process default in ``register()`` writes it
+    to ``os.environ`` so Hermes core's own allowlist check also sees it.
+    """
 
     def __init__(self, allow_all: bool, allowed_ids: Set[str]):
         self._allow_all = allow_all
@@ -36,12 +48,15 @@ class AllowlistGate:
 
     @classmethod
     def from_env(cls) -> "AllowlistGate":
-        allow_all = os.getenv("CARBONVOICE_ALLOW_ALL_USERS", "").strip().lower() in (
-            "true", "1", "yes", "on",
-        )
         raw = os.getenv("CARBONVOICE_ALLOWED_USERS", "")
         allowed = {u.strip() for u in raw.split(",") if u.strip()}
-        return cls(allow_all=allow_all, allowed_ids=allowed)
+        if allowed:
+            return cls(allow_all=False, allowed_ids=allowed)
+        # No specific list — default open, unless explicitly disabled.
+        disabled = os.getenv("CARBONVOICE_ALLOW_ALL_USERS", "").strip().lower() in (
+            "false", "0", "no", "off",
+        )
+        return cls(allow_all=not disabled, allowed_ids=set())
 
     def is_allowed(self, user_id: Optional[str]) -> bool:
         if self._allow_all:
@@ -49,11 +64,6 @@ class AllowlistGate:
         if not user_id:
             return False
         return user_id in self._allowed_ids
-
-    @property
-    def is_inactive(self) -> bool:
-        """True when no gating env vars are set — defer to Hermes core's filter."""
-        return not self._allow_all and not self._allowed_ids
 
 
 class IgnoredSenderLog:

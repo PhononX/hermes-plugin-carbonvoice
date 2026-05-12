@@ -129,6 +129,19 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """Called by the Hermes plugin system on discovery."""
+    # Default-allow: if the operator hasn't configured either env var, set
+    # CARBONVOICE_ALLOW_ALL_USERS=true in-process so Hermes core's own
+    # allowlist check (which runs in parallel to our AllowlistGate) also
+    # treats this as open. Only mutates os.environ for the running gateway
+    # — never persists to ~/.hermes/.env, so the user's file stays untouched
+    # and they can flip the behavior by setting CARBONVOICE_ALLOWED_USERS
+    # (restrict) or CARBONVOICE_ALLOW_ALL_USERS=false (close completely).
+    if (
+        not os.getenv("CARBONVOICE_ALLOW_ALL_USERS")
+        and not os.getenv("CARBONVOICE_ALLOWED_USERS")
+    ):
+        os.environ["CARBONVOICE_ALLOW_ALL_USERS"] = "true"
+
     ctx.register_platform(
         name="carbonvoice",
         label="Carbon Voice",

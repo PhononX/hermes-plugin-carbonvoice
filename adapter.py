@@ -290,10 +290,11 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._creator_id and creator_id and creator_id != self._creator_id:
             return False
 
-        # Allowlist gate (mirrors Hermes core) — when configured, short-circuit
-        # rejected senders here so we can log them with a resolved username.
-        # When unconfigured we let Hermes core handle filtering as before.
-        if not self._allowlist.is_inactive and not self._allowlist.is_allowed(creator_id):
+        # Allowlist gate — default is allow-all (see AllowlistGate docstring).
+        # When the operator has configured a restriction, short-circuit
+        # rejected senders here so we can log them with a resolved username
+        # before Hermes core's parallel check drops them.
+        if not self._allowlist.is_allowed(creator_id):
             logger.info(
                 "carbonvoice: dropped message from unauthorized sender %s",
                 creator_id,

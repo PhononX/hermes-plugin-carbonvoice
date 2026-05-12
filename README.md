@@ -25,27 +25,29 @@ Without it the plugin still works — it just polls every 5 seconds instead of r
 ~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
 ```
 
-### 3. Open the bot to all senders *(dev mode)*
-
-This lets any Carbon Voice user DM the bot. To restrict, replace the command with `echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>' >> "$(hermes config env-path)"` — your `user_guid` prints on startup as `connected as <guid>`.
-
-```bash
-echo 'CARBONVOICE_ALLOW_ALL_USERS=true' >> "$(hermes config env-path)"
-```
-
-> 💡 Prefer a GUI for editing the `.env`? Run `open $(hermes config env-path)` to open it in your default editor, or `hermes dashboard` for the web UI at <http://127.0.0.1:9119>.
-
-### 4. Start Hermes
+### 3. Start Hermes
 
 ```bash
 hermes gateway run
 ```
 
-On startup you'll see `carbonvoice: connected as <your_user_guid>` — that's the id you'd use in step 3 if you switch to restricted mode later.
+On startup you'll see `carbonvoice: connected as <your_user_guid>` — handy if you decide to restrict access later.
 
-### 5. Send a message from Carbon Voice
+### 4. Send a message from Carbon Voice
 
 Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It reacts with ✅ within a second and replies in-thread.
+
+---
+
+### Optional: restrict who can talk to the bot
+
+By default the bot accepts messages from any Carbon Voice user (good for personal/dev setups). To limit access to specific people, add their `user_guid`s to `~/.hermes/.env`:
+
+```bash
+echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>,<teammate_guid>' >> "$(hermes config env-path)"
+```
+
+> 💡 Prefer a GUI for editing the `.env`? Run `open $(hermes config env-path)` to open it in your default editor, or `hermes dashboard` for the web UI at <http://127.0.0.1:9119>.
 
 ---
 
@@ -69,19 +71,19 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 
 ## Configure
 
-Add one line to `~/.hermes/.env`:
+Add one line to `~/.hermes/.env` (the install wizard does this for you on `--enable`):
 
 ```bash
 CARBONVOICE_PAT=cv_pat_...
 ```
 
-By default the bot rejects all senders. For dev, the easiest unlock is:
+That's the only required variable. By default the bot accepts messages from any Carbon Voice user. To restrict, set:
 
 ```bash
-CARBONVOICE_ALLOW_ALL_USERS=true
+CARBONVOICE_ALLOWED_USERS=<your_carbonvoice_user_guid>[,<another_guid>...]
 ```
 
-To restrict who can trigger the bot, replace `CARBONVOICE_ALLOW_ALL_USERS` with `CARBONVOICE_ALLOWED_USERS=<your_carbonvoice_user_guid>`. Your own `user_guid` shows up in the gateway logs as `carbonvoice: connected as <guid>` on startup.
+To explicitly close the bot to everyone (e.g., temporary maintenance mode), set `CARBONVOICE_ALLOW_ALL_USERS=false` and leave `CARBONVOICE_ALLOWED_USERS` empty. Your own `user_guid` shows up in the gateway logs as `carbonvoice: connected as <guid>` on startup.
 
 ## Run
 
@@ -111,8 +113,8 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
-| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed to trigger the bot. |
-| `CARBONVOICE_ALLOW_ALL_USERS` | `false` | Allow any Carbon Voice user (dev only). |
+| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed to trigger the bot. When set, **only** these users are accepted. |
+| `CARBONVOICE_ALLOW_ALL_USERS` | `true` | Default open access. Set to `false` (and leave `CARBONVOICE_ALLOWED_USERS` empty) to explicitly close the bot. |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 | `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |

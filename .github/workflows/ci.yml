@@ -81,12 +81,19 @@ jobs:
 
           from carbonvoice.audit import AllowlistGate
           import os
+          # Default-allow semantics: unset env vars → allow anyone.
           os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS', None)
           os.environ.pop('CARBONVOICE_ALLOWED_USERS', None)
-          assert AllowlistGate.from_env().is_inactive
-          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'true'
+          assert AllowlistGate.from_env().is_allowed('anyone')
+          # Explicit close.
+          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'false'
+          assert not AllowlistGate.from_env().is_allowed('anyone')
+          os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS')
+          # Allowed list overrides the default.
+          os.environ['CARBONVOICE_ALLOWED_USERS'] = 'abc'
           g = AllowlistGate.from_env()
-          assert not g.is_inactive and g.is_allowed('any')
+          assert g.is_allowed('abc') and not g.is_allowed('xyz')
+          os.environ.pop('CARBONVOICE_ALLOWED_USERS')
 
           from carbonvoice.dedupe import SeenCache
           c = SeenCache(ttl_s=60)
