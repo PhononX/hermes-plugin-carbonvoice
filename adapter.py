@@ -2,26 +2,29 @@
 Carbon Voice platform adapter for Hermes Agent.
 
 Architecture:
-    Carbon Voice  ──POST /apps/subscribe──>  registers our webhook URL
-    Carbon Voice  ──POST <webhook_url>──>    inbound user messages
-    Hermes agent  ──POST /v3/messages/start──>  outbound replies
+    Hermes  <──Socket.IO (primary)──   api.carbonvoice.app
+    Hermes  ── REST poll fallback ──>  /v3/messages/recent
+    Hermes  ── POST /v3/messages/start ──>  outbound replies
 
-Receives `message.posted.to.channel` webhook events (Carbon Voice
-transcribes voice to text before delivery, so this adapter is text-only).
-Replies via POST /v3/messages/start with `is_text_message: true`.
+No public webhook is required — the adapter holds an outbound Socket.IO
+connection and polls /v3/messages/recent as a fallback. Cursor state is
+persisted to disk so messages received while Hermes was offline are
+processed on the next startup.
 
-Spec sourced from the Open Claw `openclaw-carbonvoice` plugin
-(2026.3.14).  See ~/.claude memory `project_carbonvoice_api.md` for the
-full contract.
+Spec sourced from the Open Claw `openclaw-carbonvoice` plugin and the
+PhononX `cv-claude-channel` reference implementation.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
+import json
 import logging
 import os
+import time
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -32,11 +35,11 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 try:
-    from aiohttp import web
-    AIOHTTP_AVAILABLE = True
+    import socketio  # python-socketio[asyncio_client]
+    SOCKETIO_AVAILABLE = True
 except ImportError:
-    AIOHTTP_AVAILABLE = False
-    web = None  # type: ignore[assignment]
+    SOCKETIO_AVAILABLE = False
+    socketio = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -50,24 +53,12 @@ from gateway.session import SessionSource
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.carbonvoice.app"
-DEFAULT_WEBHOOK_PATH = "/carbonvoice/webhook"
-DEFAULT_PORT = 8645
-DEFAULT_BIND_HOST = "0.0.0.0"
-MESSAGE_POSTED_EVENT = "message.posted.to.channel"
-MAX_DEDUPE_ENTRIES = 10_000
+DEFAULT_POLL_INTERVAL_MS = 5_000
+DEFAULT_WS_RETRY_INITIAL_MS = 1_000
+DEFAULT_WS_RETRY_MAX_MS = 30_000
+DEFAULT_SEEN_TTL_S = 5 * 60
+DEFAULT_FLUSH_DEBOUNCE_S = 5.0
 HTTP_TIMEOUT = 30.0
-
-
-def _parse_bool(value: Any, *, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"1", "true", "yes", "on"}:
-            return True
-        if v in {"0", "false", "no", "off", ""}:
-            return False
-    return default
 
 
 def _auth_headers(pat: str) -> Dict[str, str]:
@@ -78,12 +69,6 @@ def _auth_headers(pat: str) -> Dict[str, str]:
     return {"x-api-key": trimmed}
 
 
-def _join_url(base: str, path: str) -> str:
-    base_clean = base.rstrip("/")
-    p = path if path.startswith("/") else "/" + path
-    return f"{base_clean}{p}"
-
-
 def _first_str(*vals: Any) -> Optional[str]:
     for v in vals:
         if isinstance(v, str) and v.strip():
@@ -91,13 +76,59 @@ def _first_str(*vals: Any) -> Optional[str]:
     return None
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _default_state_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception:
+        home = Path.home() / ".hermes"
+    return home / "state" / "carbonvoice.json"
+
+
+def _extract_transcript(msg: Dict[str, Any]) -> str:
+    """Pull the human-readable transcript from a CV message payload.
+
+    The transcript lives in ``text_models[].timecodes[].t`` joined by spaces;
+    the ``value`` field is empty for transcript models. When the message is
+    still being transcribed, all transcript fields are empty — the caller
+    must treat an empty return as "not ready yet" and retry later.
+    """
+    text_models = msg.get("text_models") or []
+    if isinstance(text_models, list):
+        for m in text_models:
+            if not isinstance(m, dict):
+                continue
+            if m.get("type") in ("transcript_with_timecode", "transcript"):
+                timecodes = m.get("timecodes") or []
+                if isinstance(timecodes, list):
+                    joined = " ".join(
+                        tc.get("t", "")
+                        for tc in timecodes
+                        if isinstance(tc, dict) and isinstance(tc.get("t"), str)
+                    ).strip()
+                    if joined:
+                        return joined
+                value = m.get("value")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    # Webhook-style payloads use different field names — accept those too.
+    fallback = _first_str(msg.get("transcript_txt"), msg.get("ai_summary_txt"))
+    return fallback or ""
+
+
 def check_requirements() -> bool:
     if not HTTPX_AVAILABLE:
         logger.error("carbonvoice: httpx not installed")
         return False
-    if not AIOHTTP_AVAILABLE:
-        logger.error("carbonvoice: aiohttp not installed")
-        return False
+    if not SOCKETIO_AVAILABLE:
+        logger.warning(
+            "carbonvoice: python-socketio not installed — running in polling-only mode "
+            "(install with: pip install 'python-socketio[asyncio_client]')"
+        )
     return True
 
 
@@ -105,35 +136,31 @@ def validate_config(config: PlatformConfig) -> bool:
     """Return True when the config has the minimum required credentials."""
     extra = getattr(config, "extra", {}) or {}
     pat = os.getenv("CARBONVOICE_PAT") or config.token or extra.get("pat", "")
-    public_base = (
-        os.getenv("CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL")
-        or extra.get("public_webhook_base_url", "")
-    )
-    return bool(pat and public_base)
+    return bool(pat)
 
 
 def is_connected(config: PlatformConfig) -> bool:
-    extra = config.extra or {}
-    return bool((config.token or extra.get("pat")) and extra.get("public_webhook_base_url"))
+    extra = getattr(config, "extra", {}) or {}
+    return bool(config.token or extra.get("pat"))
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
     """Seed PlatformConfig.extra from env vars before adapter construction."""
     pat = os.getenv("CARBONVOICE_PAT")
-    public_base = os.getenv("CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL")
-    if not pat or not public_base:
+    if not pat:
         return None
 
     seed: Dict[str, Any] = {
         "pat": pat,
-        "public_webhook_base_url": public_base.rstrip("/"),
         "base_url": (os.getenv("CARBONVOICE_BASE_URL") or DEFAULT_BASE_URL).rstrip("/"),
-        "webhook_path": os.getenv("CARBONVOICE_WEBHOOK_PATH") or DEFAULT_WEBHOOK_PATH,
-        "port": int(os.getenv("CARBONVOICE_PORT") or DEFAULT_PORT),
-        "bind_host": os.getenv("CARBONVOICE_BIND_HOST") or DEFAULT_BIND_HOST,
+        "poll_interval_ms": int(
+            os.getenv("CARBONVOICE_POLL_INTERVAL_MS") or DEFAULT_POLL_INTERVAL_MS
+        ),
+        "ws_retry_max_ms": int(
+            os.getenv("CARBONVOICE_WS_RETRY_MAX_MS") or DEFAULT_WS_RETRY_MAX_MS
+        ),
         "creator_id": os.getenv("CARBONVOICE_CREATOR_ID") or None,
-        "webhook_auth_header_name": os.getenv("CARBONVOICE_WEBHOOK_AUTH_HEADER_NAME") or None,
-        "webhook_auth_header_value": os.getenv("CARBONVOICE_WEBHOOK_AUTH_HEADER_VALUE") or None,
+        "state_path": os.getenv("CARBONVOICE_STATE_PATH") or None,
     }
 
     home_channel_id = os.getenv("CARBONVOICE_HOME_CHANNEL")
@@ -146,7 +173,7 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
 
 
 class CarbonVoiceAdapter(BasePlatformAdapter):
-    """Hermes ↔ Carbon Voice bridge."""
+    """Hermes ↔ Carbon Voice bridge over Socket.IO + REST polling fallback."""
 
     MAX_MESSAGE_LENGTH = 8000
 
@@ -155,32 +182,44 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._pat: str = config.token or extra.get("pat") or ""
         self._base_url: str = (extra.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-        self._public_base_url: str = (extra.get("public_webhook_base_url") or "").rstrip("/")
-        self._webhook_path: str = extra.get("webhook_path") or DEFAULT_WEBHOOK_PATH
-        self._port: int = int(extra.get("port") or DEFAULT_PORT)
-        self._bind_host: str = extra.get("bind_host") or DEFAULT_BIND_HOST
+        self._poll_interval_s: float = (
+            float(extra.get("poll_interval_ms") or DEFAULT_POLL_INTERVAL_MS) / 1000.0
+        )
+        self._ws_retry_max_s: float = (
+            float(extra.get("ws_retry_max_ms") or DEFAULT_WS_RETRY_MAX_MS) / 1000.0
+        )
         self._creator_id: Optional[str] = extra.get("creator_id") or None
-        self._auth_header_name: Optional[str] = extra.get("webhook_auth_header_name") or None
-        self._auth_header_value: Optional[str] = extra.get("webhook_auth_header_value") or None
+        sp = extra.get("state_path")
+        self._state_path: Path = (
+            Path(sp).expanduser() if sp else _default_state_path()
+        )
 
         self._self_user_id: Optional[str] = None
-        self._client: Optional[httpx.AsyncClient] = None
-        self._app: Optional[web.Application] = None
-        self._runner: Optional[web.AppRunner] = None
-        self._site: Optional[web.TCPSite] = None
-        self._dedupe: set[str] = set()
-        # Stash last seen incoming message_guid per channel for clean reply threading
-        # when Hermes core calls send() without an explicit reply_to.
+        self._client: Optional["httpx.AsyncClient"] = None
+        self._sio: Optional["socketio.AsyncClient"] = None
+
+        # Background tasks
+        self._poll_task: Optional[asyncio.Task] = None
+        self._ws_reconnect_task: Optional[asyncio.Task] = None
+        self._flush_task: Optional[asyncio.Task] = None
+
+        # Connection mode: connecting | websocket | polling | shutdown
+        self._mode: str = "connecting"
+        self._ws_retry_backoff_s: float = DEFAULT_WS_RETRY_INITIAL_MS / 1000.0
+
+        # Cursor + dedupe
+        self._last_seen_at: Optional[str] = None
+        self._state_dirty: bool = False
+        self._seen: Dict[str, float] = {}  # message_id → expiry epoch seconds
+
+        # Threading helper for reply_to_message_id on outbound sends.
         self._last_inbound_msg: Dict[str, str] = {}
 
-    # ── Lifecycle ────────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
         if not self._pat:
             logger.error("carbonvoice: CARBONVOICE_PAT not set")
-            return False
-        if not self._public_base_url:
-            logger.error("carbonvoice: CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL not set")
             return False
 
         self._client = httpx.AsyncClient(
@@ -200,30 +239,60 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             await self._close_client()
             return False
 
-        public_webhook_url = _join_url(self._public_base_url, self._webhook_path)
-        try:
-            await self._subscribe(public_webhook_url)
-        except Exception as exc:
-            logger.error("carbonvoice: webhook subscribe failed: %s", exc)
-            await self._close_client()
-            return False
+        await self._load_state()
 
         try:
-            await self._start_webhook_server()
+            await self._fetch_missed_messages()
         except Exception as exc:
-            logger.error("carbonvoice: webhook server failed to start: %s", exc)
-            await self._close_client()
-            return False
+            logger.warning("carbonvoice: initial catch-up failed: %s", exc)
+
+        if SOCKETIO_AVAILABLE:
+            try:
+                await self._connect_websocket()
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: WS initial connect failed (%s) — using polling", exc
+                )
+                self._mode = "polling"
+                self._start_polling()
+                self._schedule_ws_reconnect()
+        else:
+            self._mode = "polling"
+            self._start_polling()
 
         self._mark_connected()
         logger.info(
-            "carbonvoice: connected as %s, listening on %s:%d%s, public webhook %s",
-            self._self_user_id, self._bind_host, self._port, self._webhook_path, public_webhook_url,
+            "carbonvoice: connected as %s (mode=%s, state=%s)",
+            self._self_user_id, self._mode, self._state_path,
         )
         return True
 
     async def disconnect(self) -> None:
-        await self._stop_webhook_server()
+        self._mode = "shutdown"
+
+        tasks = [
+            t for t in (self._poll_task, self._ws_reconnect_task, self._flush_task)
+            if t is not None and not t.done()
+        ]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._poll_task = None
+        self._ws_reconnect_task = None
+        self._flush_task = None
+
+        if self._sio is not None:
+            try:
+                await self._sio.disconnect()
+            except Exception:
+                pass
+            self._sio = None
+
+        # Final flush of any pending cursor advances.
+        self._state_dirty = True
+        await self._flush_state()
+
         await self._close_client()
         self._mark_disconnected()
 
@@ -235,7 +304,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 pass
             self._client = None
 
-    # ── Outbound (Hermes → Carbon Voice) ────────────────────────────────────
+    # ── Outbound (Hermes → Carbon Voice) ─────────────────────────────────
 
     async def send(
         self,
@@ -249,8 +318,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        # Thread the reply: explicit reply_to wins; otherwise use the last
-        # inbound message_guid we saw for this channel.
         reply_target = reply_to or self._last_inbound_msg.get(chat_id)
 
         body = {
@@ -282,13 +349,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        # Carbon Voice agent typing indicators are not part of the public REST surface.
         return None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "carbonvoice", "chat_id": chat_id}
 
-    # ── Carbon Voice REST helpers ───────────────────────────────────────────
+    # ── REST helpers ─────────────────────────────────────────────────────
 
     async def _whoami(self) -> Optional[str]:
         assert self._client is not None
@@ -298,130 +364,305 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         user = data.get("user") or {}
         return _first_str(user.get("user_guid"), user.get("_id"), user.get("id"))
 
-    async def _subscribe(self, webhook_url: str) -> None:
-        assert self._client is not None
-        filters = [{"key": "creator_id", "operator": "ne", "value": self._self_user_id}]
-        if self._creator_id:
-            filters.append({"key": "creator_id", "operator": "eq", "value": self._creator_id})
-        body = {
-            "subscriptions": [MESSAGE_POSTED_EVENT],
-            "webhookURL": webhook_url,
-            "subscription_filters": filters,
-        }
+    # ── State persistence ────────────────────────────────────────────────
+
+    async def _load_state(self) -> None:
         try:
-            resp = await self._client.post("/apps/subscribe", json=body)
-            resp.raise_for_status()
-            logger.info("carbonvoice: subscribed webhook %s", webhook_url)
-        except httpx.HTTPStatusError as exc:
-            # Duplicate subscribe on restart returns 400 with body mentioning "same webhook url".
-            body_text = exc.response.text.lower() if exc.response is not None else ""
-            if exc.response is not None and exc.response.status_code == 400 and "same webhook url" in body_text:
-                logger.info("carbonvoice: webhook already subscribed (%s)", webhook_url)
-                return
-            raise
-
-    # ── Inbound webhook server ──────────────────────────────────────────────
-
-    async def _start_webhook_server(self) -> None:
-        self._app = web.Application()
-        self._app.router.add_post(self._webhook_path, self._handle_webhook)
-        self._app.router.add_get("/healthz", lambda _r: web.json_response({"ok": True}))
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self._bind_host, self._port)
-        await self._site.start()
-
-    async def _stop_webhook_server(self) -> None:
-        if self._site is not None:
-            try:
-                await self._site.stop()
-            except Exception:
-                pass
-            self._site = None
-        if self._runner is not None:
-            try:
-                await self._runner.cleanup()
-            except Exception:
-                pass
-            self._runner = None
-        self._app = None
-
-    async def _handle_webhook(self, request: web.Request) -> web.Response:
-        if self._auth_header_name and self._auth_header_value:
-            got = request.headers.get(self._auth_header_name)
-            if not got or not hmac.compare_digest(got.strip(), self._auth_header_value.strip()):
-                logger.warning("carbonvoice: webhook auth header mismatch")
-                return web.json_response({"error": "Unauthorized"}, status=401)
-
-        try:
-            payload = await request.json()
+            raw = self._state_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            last = data.get("lastSeenAt")
+            if isinstance(last, str) and last:
+                self._last_seen_at = last
+                logger.info("carbonvoice: resuming from %s", last)
+        except FileNotFoundError:
+            pass
         except Exception as exc:
-            logger.warning("carbonvoice: invalid webhook JSON: %s", exc)
-            return web.json_response({"error": "invalid json"}, status=400)
+            logger.warning("carbonvoice: failed to load state: %s", exc)
 
-        if not isinstance(payload, dict):
-            return web.json_response({"error": "invalid payload"}, status=400)
+    async def _flush_state(self) -> None:
+        if not self._state_dirty or self._last_seen_at is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps({"lastSeenAt": self._last_seen_at}),
+                encoding="utf-8",
+            )
+            self._state_dirty = False
+        except Exception as exc:
+            logger.warning("carbonvoice: failed to flush state: %s", exc)
 
-        if payload.get("eventName") != MESSAGE_POSTED_EVENT:
-            return web.Response(status=204)
+    def _schedule_flush(self) -> None:
+        if self._flush_task and not self._flush_task.done():
+            return
 
-        data = payload.get("data") or {}
-        resource = data.get("resource") or {}
-        if not isinstance(resource, dict):
-            return web.json_response({"error": "missing resource"}, status=400)
+        async def _delayed():
+            try:
+                await asyncio.sleep(DEFAULT_FLUSH_DEBOUNCE_S)
+                await self._flush_state()
+            except asyncio.CancelledError:
+                pass
 
-        channel_guid = _first_str(resource.get("channel_guid"), resource.get("channel_id"))
-        message_guid = _first_str(resource.get("message_guid"), resource.get("message_id"))
-        creator_guid = _first_str(resource.get("creator_guid"), resource.get("creator_id"))
-        text = (_first_str(resource.get("transcript_txt"), resource.get("ai_summary_txt")) or "").strip()
+        self._flush_task = asyncio.create_task(_delayed())
 
-        if not channel_guid or not message_guid or not creator_guid:
-            logger.warning("carbonvoice: webhook missing channel/message/creator id")
-            return web.json_response({"error": "missing identifiers"}, status=400)
+    def _advance_cursor(self, iso_ts: str) -> None:
+        self._last_seen_at = iso_ts
+        self._state_dirty = True
+        self._schedule_flush()
 
-        if not text:
-            return web.Response(status=204)
+    # ── Dedupe (in-memory, TTL-based) ────────────────────────────────────
 
-        if message_guid in self._dedupe:
-            return web.Response(status=204)
-        self._dedupe.add(message_guid)
-        if len(self._dedupe) > MAX_DEDUPE_ENTRIES:
-            self._dedupe.clear()
+    def _is_recently_seen(self, message_id: str) -> bool:
+        exp = self._seen.get(message_id)
+        if exp is None:
+            return False
+        if time.time() > exp:
+            self._seen.pop(message_id, None)
+            return False
+        return True
 
-        # Track last inbound for reply threading.
-        self._last_inbound_msg[channel_guid] = message_guid
+    def _mark_seen(self, message_id: str) -> None:
+        self._seen[message_id] = time.time() + DEFAULT_SEEN_TTL_S
+        if len(self._seen) % 100 == 0:
+            now = time.time()
+            for mid, exp in list(self._seen.items()):
+                if now > exp:
+                    self._seen.pop(mid, None)
 
-        parent_guid = _first_str(resource.get("parent_message_guid"), resource.get("parent_message_id"))
-        reply_anchor = parent_guid or message_guid
+    # ── Core: process a single inbound message ───────────────────────────
+
+    async def _process_message(self, msg: Dict[str, Any]) -> bool:
+        message_id = _first_str(msg.get("message_id"), msg.get("_id"))
+        if not message_id:
+            return False
+
+        channel_ids = msg.get("channel_ids")
+        if isinstance(channel_ids, list) and channel_ids:
+            channel_id = channel_ids[0]
+        else:
+            channel_id = _first_str(msg.get("channel_id"), msg.get("channel_guid"))
+        if not channel_id:
+            return False
+
+        creator_id = _first_str(msg.get("creator_id"), msg.get("creator_guid"))
+
+        # Self-loop guard.
+        if creator_id and self._self_user_id and creator_id == self._self_user_id:
+            return False
+
+        # Optional single-user restriction (acts before transcript check so
+        # we don't waste cycles on transcripts we'll drop anyway).
+        if self._creator_id and creator_id and creator_id != self._creator_id:
+            return False
+
+        # Dedupe early so retries on still-transcribing messages don't multiply.
+        if self._is_recently_seen(message_id):
+            return False
+
+        # Two-phase transcript: empty means "not ready yet" — don't mark seen.
+        transcript = _extract_transcript(msg)
+        if not transcript:
+            return False
+
+        self._mark_seen(message_id)
+
+        parent_guid = _first_str(
+            msg.get("parent_message_id"), msg.get("parent_message_guid")
+        )
+        reply_anchor = parent_guid or message_id
+        self._last_inbound_msg[channel_id] = message_id
 
         source = SessionSource(
             platform=Platform("carbonvoice"),
-            chat_id=channel_guid,
-            chat_name=f"cv:{channel_guid[:8]}",
+            chat_id=channel_id,
+            chat_name=f"cv:{channel_id[:8]}",
             chat_type="dm",
-            user_id=creator_guid,
-            user_name=creator_guid,
-            message_id=message_guid,
+            user_id=creator_id or "",
+            user_name=creator_id or "",
+            message_id=message_id,
         )
         event = MessageEvent(
-            text=text,
+            text=transcript,
             message_type=MessageType.TEXT,
             source=source,
-            raw_message=payload,
-            message_id=message_guid,
-            reply_to_message_id=reply_anchor if reply_anchor != message_guid else None,
+            raw_message=msg,
+            message_id=message_id,
+            reply_to_message_id=(
+                reply_anchor if reply_anchor != message_id else None
+            ),
         )
 
-        # Return 204 immediately and process in the background — Carbon Voice
-        # may otherwise retry while the agent is still thinking.
+        # Dispatch in a background task so processing one message can't block
+        # the poll/WS loop while the agent thinks.
         asyncio.create_task(self._dispatch(event))
-        return web.Response(status=204)
+        return True
 
     async def _dispatch(self, event: MessageEvent) -> None:
         try:
             await self.handle_message(event)
         except Exception as exc:
             logger.exception("carbonvoice: dispatch failed: %s", exc)
+
+    # ── Catch-up via REST ────────────────────────────────────────────────
+
+    async def _fetch_missed_messages(self) -> None:
+        if self._client is None:
+            return
+
+        request_started_at = _now_iso()
+
+        if not self._last_seen_at:
+            logger.info("carbonvoice: first run, starting from %s", request_started_at)
+            self._advance_cursor(request_started_at)
+            return
+
+        body = {
+            "date": self._last_seen_at,
+            "direction": "newer",
+            "limit": 100,
+            "use_last_updated": False,
+        }
+        try:
+            resp = await self._client.post("/v3/messages/recent", json=body)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("carbonvoice: /v3/messages/recent failed: %s", exc)
+            return  # don't advance cursor — retry same window next tick
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("carbonvoice: /v3/messages/recent bad JSON: %s", exc)
+            return
+
+        messages = data if isinstance(data, list) else []
+        messages.sort(key=lambda m: m.get("created_at") or "")
+
+        for msg in messages:
+            try:
+                await self._process_message(msg)
+            except Exception as exc:
+                logger.error("carbonvoice: process_message error: %s", exc)
+
+        # Advance cursor to when this request was fired, not message timestamps —
+        # avoids missing concurrent writes that landed during the call.
+        self._advance_cursor(request_started_at)
+
+    # ── Polling loop ─────────────────────────────────────────────────────
+
+    def _start_polling(self) -> None:
+        if self._poll_task and not self._poll_task.done():
+            return
+        logger.info("carbonvoice: polling every %.1fs", self._poll_interval_s)
+
+        async def _tick():
+            try:
+                while self._mode not in ("shutdown", "websocket"):
+                    try:
+                        await self._fetch_missed_messages()
+                    except Exception as exc:
+                        logger.warning("carbonvoice: poll tick failed: %s", exc)
+                    await asyncio.sleep(self._poll_interval_s)
+            except asyncio.CancelledError:
+                pass
+
+        self._poll_task = asyncio.create_task(_tick())
+
+    def _stop_polling(self) -> None:
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            logger.info("carbonvoice: polling stopped (WS active)")
+        self._poll_task = None
+
+    # ── Socket.IO (primary transport) ────────────────────────────────────
+
+    async def _connect_websocket(self) -> None:
+        if not SOCKETIO_AVAILABLE:
+            raise RuntimeError("python-socketio not installed")
+
+        sio = socketio.AsyncClient(reconnection=False)
+        self._sio = sio
+
+        @sio.on("connect")
+        async def _on_connect():  # noqa: F811
+            logger.info("carbonvoice: Socket.IO connected")
+            self._mode = "websocket"
+            self._ws_retry_backoff_s = DEFAULT_WS_RETRY_INITIAL_MS / 1000.0
+            self._stop_polling()
+
+        @sio.on("connected")
+        async def _on_connected(user: Any = None):  # noqa: F811
+            if isinstance(user, dict):
+                uid = _first_str(user.get("user_guid"), user.get("id"))
+                if uid and not self._self_user_id:
+                    self._self_user_id = uid
+
+        async def _on_message_event(payload: Any = None):
+            if not isinstance(payload, dict):
+                return
+            # message:created fires before the transcript is ready;
+            # message:updated fires once transcription completes.
+            if payload.get("status") != "active":
+                return
+            try:
+                await self._fetch_missed_messages()
+            except Exception as exc:
+                logger.warning("carbonvoice: catch-up after WS event failed: %s", exc)
+
+        sio.on("message:created", _on_message_event)
+        sio.on("message:updated", _on_message_event)
+
+        @sio.on("disconnect")
+        async def _on_disconnect():  # noqa: F811
+            if self._mode == "shutdown":
+                return
+            logger.warning(
+                "carbonvoice: Socket.IO disconnected — falling back to polling"
+            )
+            self._mode = "polling"
+            try:
+                await self._fetch_missed_messages()
+            except Exception:
+                pass
+            self._start_polling()
+            self._schedule_ws_reconnect()
+
+        await sio.connect(
+            self._base_url,
+            auth={"authorization": f"Bearer {self._pat}"},
+            transports=["websocket"],
+        )
+
+    def _schedule_ws_reconnect(self) -> None:
+        if self._ws_reconnect_task and not self._ws_reconnect_task.done():
+            return
+        if self._mode == "shutdown" or not SOCKETIO_AVAILABLE:
+            return
+
+        async def _reconnect():
+            try:
+                while self._mode not in ("shutdown", "websocket"):
+                    await asyncio.sleep(self._ws_retry_backoff_s)
+                    if self._mode == "shutdown":
+                        return
+                    logger.info(
+                        "carbonvoice: attempting WS reconnect (backoff %.1fs)",
+                        self._ws_retry_backoff_s,
+                    )
+                    try:
+                        await self._fetch_missed_messages()
+                        await self._connect_websocket()
+                        return  # connected — exit loop
+                    except Exception as exc:
+                        logger.debug("carbonvoice: WS reconnect failed: %s", exc)
+                        self._ws_retry_backoff_s = min(
+                            self._ws_retry_backoff_s * 2,
+                            self._ws_retry_max_s,
+                        )
+            except asyncio.CancelledError:
+                pass
+
+        self._ws_reconnect_task = asyncio.create_task(_reconnect())
 
 
 # ── Standalone sender for out-of-process delivery (cron) ───────────────────
@@ -448,32 +689,31 @@ async def _standalone_send(
         "is_streaming": False,
         "channel_id": chat_id.strip(),
     }
-    async with httpx.AsyncClient(base_url=base_url, headers=_auth_headers(pat), timeout=HTTP_TIMEOUT) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url, headers=_auth_headers(pat), timeout=HTTP_TIMEOUT
+    ) as client:
         try:
             resp = await client.post("/v3/messages/start", json=body)
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
-            return {"success": True, "message_id": _first_str(data.get("message_id"), data.get("id"))}
+            return {
+                "success": True,
+                "message_id": _first_str(data.get("message_id"), data.get("id")),
+            }
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
 
 def interactive_setup() -> Optional[Dict[str, str]]:
-    """Lightweight wizard: gather PAT and public webhook base URL."""
+    """Lightweight wizard: gather PAT."""
     try:
         pat = input("Carbon Voice PAT (cv_pat_...): ").strip()
-        public_base = input("Public webhook base URL (e.g. https://abc123.ngrok.io): ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
-    if not pat or not public_base:
+    if not pat:
         return None
-    return {
-        "CARBONVOICE_PAT": pat,
-        "CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL": public_base,
-    }
+    return {"CARBONVOICE_PAT": pat}
 
-
-# ── Plugin entry point ─────────────────────────────────────────────────────
 
 def register(ctx) -> None:
     """Called by the Hermes plugin system on discovery."""
@@ -484,8 +724,11 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["CARBONVOICE_PAT", "CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL"],
-        install_hint="pip install httpx aiohttp  (usually already present in the Hermes venv)",
+        required_env=["CARBONVOICE_PAT"],
+        install_hint=(
+            "pip install httpx 'python-socketio[asyncio_client]' "
+            "(python-socketio is optional — polling-only without it)"
+        ),
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="CARBONVOICE_HOME_CHANNEL",

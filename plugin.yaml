@@ -1,14 +1,16 @@
 name: carbonvoice-platform
 label: Carbon Voice
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   Carbon Voice gateway adapter for Hermes Agent.
-  Receives messages via Carbon Voice webhooks (message.posted.to.channel)
-  and replies via POST /v3/messages/start, so the Hermes agent appears as
-  a bot user inside Carbon Voice. Text-only — Carbon Voice transcribes
-  voice messages to text before delivering them.
-author: Cristian (hermes ↔ carbonvoice bridge)
+  Connects via Socket.IO (primary) with REST polling fallback — no public
+  webhook or tunnel required. Persists a cursor to disk so messages received
+  while Hermes is offline are processed on the next startup. Replies via
+  POST /v3/messages/start, so the Hermes agent appears as a bot user inside
+  Carbon Voice. Text-only — Carbon Voice transcribes voice messages to text
+  before delivering them.
+author: PhononX
 
 requires_env:
   - name: CARBONVOICE_PAT
@@ -16,40 +18,28 @@ requires_env:
     prompt: "Carbon Voice PAT"
     url: "https://www.developer.carbonvoice.app/"
     password: true
-  - name: CARBONVOICE_PUBLIC_WEBHOOK_BASE_URL
-    description: "Public base URL Carbon Voice can POST to (e.g. https://xxx.ngrok.io)"
-    prompt: "Public webhook base URL (e.g. ngrok https URL)"
-    password: false
 
 optional_env:
   - name: CARBONVOICE_BASE_URL
     description: "Carbon Voice API base URL (default: https://api.carbonvoice.app)"
     prompt: "API base URL"
     password: false
-  - name: CARBONVOICE_WEBHOOK_PATH
-    description: "Path under the public base URL where Carbon Voice POSTs (default: /carbonvoice/webhook)"
-    prompt: "Webhook path"
+  - name: CARBONVOICE_POLL_INTERVAL_MS
+    description: "Polling interval when running in fallback mode (default: 5000)"
+    prompt: "Polling interval (ms)"
     password: false
-  - name: CARBONVOICE_PORT
-    description: "Local port the adapter listens on for webhooks (default: 8645)"
-    prompt: "Local listen port"
+  - name: CARBONVOICE_WS_RETRY_MAX_MS
+    description: "Maximum WebSocket reconnect backoff (default: 30000)"
+    prompt: "Max WS retry backoff (ms)"
     password: false
-  - name: CARBONVOICE_BIND_HOST
-    description: "Bind address for the local webhook server (default: 0.0.0.0)"
-    prompt: "Bind host"
+  - name: CARBONVOICE_STATE_PATH
+    description: "Path to the cursor state file (default: $HERMES_HOME/state/carbonvoice.json)"
+    prompt: "State file path"
     password: false
   - name: CARBONVOICE_CREATOR_ID
     description: "Restrict inbound messages to this Carbon Voice user_guid (optional personal-bot mode)"
     prompt: "Allowed creator id (or empty)"
     password: false
-  - name: CARBONVOICE_WEBHOOK_AUTH_HEADER_NAME
-    description: "Custom HTTP header name to verify on inbound webhooks (optional shared-secret)"
-    prompt: "Webhook auth header name"
-    password: false
-  - name: CARBONVOICE_WEBHOOK_AUTH_HEADER_VALUE
-    description: "Expected value for the auth header (constant-time compared)"
-    prompt: "Webhook auth header value"
-    password: true
   - name: CARBONVOICE_ALLOWED_USERS
     description: "Comma-separated Carbon Voice user_guids allowed to trigger the bot"
     prompt: "Allowed user_guids (comma-separated)"
