@@ -9,28 +9,43 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [Phonon
 
 You need Hermes already installed and a Carbon Voice Personal Access Token (grab one at <https://www.developer.carbonvoice.app/>).
 
+### 1. Install the plugin
+
+The installer will prompt you for your Carbon Voice PAT — paste it in and press Enter. Then follow the green panel that prints when the install completes.
+
 ```bash
-# 1. Install the plugin
 hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
+```
 
-# 2. (Recommended) install the optional Socket.IO client for real-time delivery.
-#    Hermes ships a uv-managed venv without pip, so we bootstrap pip first.
-~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && \
-  ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
+### 2. Install the Socket.IO client for real-time delivery *(recommended)*
 
-# 3. Add your PAT + open the bot to all senders (dev) — append to ~/.hermes/.env
-#    Prefer a GUI? `open $(hermes config env-path)` opens it in your editor,
-#    or run `hermes dashboard` for the web UI at http://127.0.0.1:9119.
-cat >> ~/.hermes/.env <<'EOF'
-CARBONVOICE_PAT=cv_pat_xxxxxxxxxxxxxxxxxxxxxxxx
-CARBONVOICE_ALLOW_ALL_USERS=true
-EOF
+Without it the plugin still works — it just polls every 5 seconds instead of receiving push events. Hermes ships a uv-managed venv without `pip`, so we bootstrap pip first.
 
-# 4. Run Hermes
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
+```
+
+### 3. Open the bot to all senders *(dev mode)*
+
+This lets any Carbon Voice user DM the bot. To restrict, replace the command with `echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>' >> "$(hermes config env-path)"` — your `user_guid` prints on startup as `connected as <guid>`.
+
+```bash
+echo 'CARBONVOICE_ALLOW_ALL_USERS=true' >> "$(hermes config env-path)"
+```
+
+> 💡 Prefer a GUI for editing the `.env`? Run `open $(hermes config env-path)` to open it in your default editor, or `hermes dashboard` for the web UI at <http://127.0.0.1:9119>.
+
+### 4. Start Hermes
+
+```bash
 hermes gateway run
 ```
 
-Now DM the agent from any Carbon Voice account — it reacts with ✅ within a second and replies in-thread. To restrict who can talk to it, replace `CARBONVOICE_ALLOW_ALL_USERS=true` with `CARBONVOICE_ALLOWED_USERS=<your_user_guid>` (your guid prints on startup as `connected as <guid>`).
+On startup you'll see `carbonvoice: connected as <your_user_guid>` — that's the id you'd use in step 3 if you switch to restricted mode later.
+
+### 5. Send a message from Carbon Voice
+
+Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It reacts with ✅ within a second and replies in-thread.
 
 ---
 
