@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'httpx>=0.27' 'python-socketio[asyncio_client]>=5.11' pyyaml
+
+      - name: Syntax check all modules
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          fail = False
+          for p in sorted(pathlib.Path('.').glob('*.py')):
+              try:
+                  ast.parse(p.read_text())
+                  print(f"OK  {p.name}")
+              except SyntaxError as e:
+                  print(f"ERR {p.name}: {e}")
+                  fail = True
+          sys.exit(1 if fail else 0)
+          PY
+
+      - name: Validate plugin.yaml
+        run: |
+          python - <<'PY'
+          import yaml, sys
+          data = yaml.safe_load(open('plugin.yaml'))
+          required = {'name', 'label', 'kind', 'version', 'requires_env'}
+          missing = required - set(data.keys())
+          assert not missing, f"plugin.yaml missing keys: {missing}"
+          assert data['kind'] == 'platform', f"unexpected kind: {data['kind']!r}"
+          assert any(e['name'] == 'CARBONVOICE_PAT' for e in data['requires_env']), \
+              "CARBONVOICE_PAT must be in requires_env"
+          print(f"plugin.yaml v{data['version']} OK")
+          PY
+
+      - name: Import hermes-agent-free modules
+        run: |
+          # adapter.py and setup.py import from `gateway.*` which only exists
+          # inside an installed Hermes. The rest of the package is pure and
+          # should import cleanly with just httpx + python-socketio.
+          python - <<'PY'
+          import importlib.util, pathlib, sys, types
+
+          ROOT = pathlib.Path('.').resolve()
+          pkg_name = 'carbonvoice'
+          pkg = types.ModuleType(pkg_name)
+          pkg.__path__ = [str(ROOT)]
+          sys.modules[pkg_name] = pkg
+
+          # Modules that don't touch gateway.*
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions']:
+              spec = importlib.util.spec_from_file_location(
+                  f'{pkg_name}.{name}', ROOT / f'{name}.py'
+              )
+              mod = importlib.util.module_from_spec(spec)
+              sys.modules[f'{pkg_name}.{name}'] = mod
+              spec.loader.exec_module(mod)
+              print(f'imported {pkg_name}.{name}')
+
+          # Sanity checks against the API surface
+          from carbonvoice.parse import extract_transcript, extract_message_id
+          assert extract_transcript({'text_models': [{'type': 'transcript', 'value': 'hi'}]}) == 'hi'
+          assert extract_message_id({'message_id': 'abc'}) == 'abc'
+
+          from carbonvoice.audit import AllowlistGate
+          import os
+          os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS', None)
+          os.environ.pop('CARBONVOICE_ALLOWED_USERS', None)
+          assert AllowlistGate.from_env().is_inactive
+          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'true'
+          g = AllowlistGate.from_env()
+          assert not g.is_inactive and g.is_allowed('any')
+
+          from carbonvoice.dedupe import SeenCache
+          c = SeenCache(ttl_s=60)
+          assert not c.is_seen('x')
+          c.mark('x')
+          assert c.is_seen('x')
+
+          print('smoke tests OK')
+          PY

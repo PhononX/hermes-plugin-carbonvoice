@@ -1,5 +1,8 @@
 # hermes-plugin — Carbon Voice
 
+[![ci](https://github.com/PhononX/hermes-plugin-carbonvoice/actions/workflows/ci.yml/badge.svg)](https://github.com/PhononX/hermes-plugin-carbonvoice/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [PhononX](https://github.com/PhononX) that connects Hermes to [Carbon Voice](https://carbonvoice.app), so the Hermes agent appears as a bot user inside Carbon Voice channels.
 
 ## ⚡ Quickstart (60 seconds)
@@ -10,8 +13,10 @@ You need Hermes already installed and a Carbon Voice Personal Access Token (grab
 # 1. Install the plugin
 hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
 
-# 2. (Recommended) install the optional Socket.IO client for real-time delivery
-~/.hermes/hermes-agent/venv/bin/pip install 'python-socketio[asyncio_client]'
+# 2. (Recommended) install the optional Socket.IO client for real-time delivery.
+#    Hermes ships a uv-managed venv without pip, so we bootstrap pip first.
+~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade > /dev/null && \
+  ~/.hermes/hermes-agent/venv/bin/python -m pip install 'python-socketio[asyncio_client]'
 
 # 3. Add your PAT + open the bot to all senders (dev) — append to ~/.hermes/.env
 cat >> ~/.hermes/.env <<'EOF'
