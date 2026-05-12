@@ -58,7 +58,6 @@ from .parse import (
     extract_channel_id,
     extract_creator_id,
     extract_message_id,
-    extract_reply_anchor,
     extract_transcript,
     first_str,
     now_iso,
@@ -197,11 +196,35 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             msg_id = first_str(data.get("message_id"), data.get("id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
         except httpx.HTTPStatusError as exc:
-            text = exc.response.text[:500] if exc.response is not None else ""
+            status = exc.response.status_code if exc.response is not None else 0
+            body = exc.response.text if exc.response is not None else ""
+
+            # Safety net: if CV rejects our reply_to because the target is
+            # itself a reply, drop the anchor and retry as a top-level
+            # message. Covers stale state from before the lane-anchor fix
+            # and any future drift between our cache and CV's tree.
+            if (
+                status == 400
+                and reply_target
+                and "cannot reply to a message that is a reply" in body.lower()
+            ):
+                logger.warning(
+                    "carbonvoice: stale reply anchor %s — retrying as top-level",
+                    reply_target,
+                )
+                if self._last_inbound_msg.get(chat_id) == reply_target:
+                    self._last_inbound_msg.pop(chat_id, None)
+                try:
+                    data = await self._api.send_message(chat_id, content, reply_to=None)
+                    msg_id = first_str(data.get("message_id"), data.get("id"))
+                    return SendResult(success=True, message_id=msg_id, raw_response=data)
+                except Exception as exc2:
+                    return SendResult(success=False, error=f"top-level retry failed: {exc2}")
+
             return SendResult(
                 success=False,
-                error=f"HTTP {exc.response.status_code}: {text}",
-                retryable=exc.response.status_code in (408, 429, 500, 502, 503, 504),
+                error=f"HTTP {status}: {body[:500]}",
+                retryable=status in (408, 429, 500, 502, 503, 504),
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
@@ -295,8 +318,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._reactions is not None:
             self._reactions.ack(message_id)
 
-        reply_anchor = extract_reply_anchor(msg) or message_id
-        self._last_inbound_msg[channel_id] = reply_anchor
+        # Lane anchor: ONLY top-level messages (no parent) define the
+        # thread we'll reply under. Carbon Voice's `parent_message_id` is
+        # the direct parent in the tree, not the lane anchor — so if an
+        # inbound reply's parent is itself a Hermes reply, threading our
+        # next response under that parent gets us a CV 400 ("cannot reply
+        # to a message that is a reply"). Keep whatever anchor we had;
+        # the next top-level message overwrites it.
+        parent = first_str(
+            msg.get("parent_message_id"), msg.get("parent_message_guid")
+        )
+        if parent is None:
+            self._last_inbound_msg[channel_id] = message_id
 
         user_name = ""
         if creator_id and self._users is not None:
@@ -319,9 +352,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             source=source,
             raw_message=msg,
             message_id=message_id,
-            reply_to_message_id=(
-                reply_anchor if reply_anchor != message_id else None
-            ),
+            reply_to_message_id=parent,
         )
 
         # Dispatch in a background task so processing one message can't block
