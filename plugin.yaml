@@ -1,7 +1,7 @@
 name: carbonvoice-platform
 label: Carbon Voice
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: >
   Carbon Voice gateway adapter for Hermes Agent.
   Connects via Socket.IO (primary) with REST polling fallback — no public
@@ -55,4 +55,20 @@ optional_env:
   - name: CARBONVOICE_HOME_CHANNEL_NAME
     description: "Display name for the Carbon Voice home channel"
     prompt: "Home channel display name"
+    password: false
+  - name: CARBONVOICE_REACTION_ID
+    description: "Reaction id used to acknowledge inbound messages (default: 'acknowledged'). Available ids are logged on startup."
+    prompt: "Ack reaction id"
+    password: false
+  - name: CARBONVOICE_DISABLE_ACK_REACTION
+    description: "Disable the visual ack reaction on inbound messages (default: false)"
+    prompt: "Disable ack reaction? (true/false)"
+    password: false
+  - name: CARBONVOICE_DISABLE_MARK_READ
+    description: "Disable clearing the unread notification after the agent replies (default: false)"
+    prompt: "Disable mark-as-read? (true/false)"
+    password: false
+  - name: CARBONVOICE_IGNORED_SENDERS_LOG
+    description: "Path to the audit log of rejected senders (default: $HERMES_HOME/logs/carbonvoice-ignored-senders.log)"
+    prompt: "Ignored senders log path"
     password: false

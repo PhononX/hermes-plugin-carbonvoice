@@ -107,6 +107,37 @@ class CarbonVoiceAPI:
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
+    async def fetch_reactions(self) -> List[Dict[str, Any]]:
+        """GET /reactions — returns the workspace's available reactions."""
+        client = self._require_client()
+        resp = await client.get("/reactions")
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def react(self, reaction_id: str, message_id: str) -> None:
+        """POST /reactions/{reaction_id}/{message_id} — empty body."""
+        client = self._require_client()
+        resp = await client.post(f"/reactions/{reaction_id}/{message_id}")
+        resp.raise_for_status()
+
+    async def mark_read(self, channel_id: str, message_id: str) -> None:
+        """DELETE /notifications/{channel}/{message} — clears the unread badge."""
+        client = self._require_client()
+        resp = await client.delete(
+            f"/notifications/{channel_id}/{message_id}",
+            params={"type": "message", "notification_removal_mode": "hard"},
+        )
+        resp.raise_for_status()
+
+    async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """GET /v3/users/{user_id} — returns user profile dict or None on 4xx."""
+        client = self._require_client()
+        resp = await client.get(f"/v3/users/{user_id}")
+        if resp.status_code >= 400:
+            return None
+        return resp.json() if resp.content else None
+
 
 async def standalone_send(
     pat: str,

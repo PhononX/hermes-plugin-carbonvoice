@@ -60,6 +60,10 @@ def is_connected(config: PlatformConfig) -> bool:
     return bool(config.token or extra.get("pat"))
 
 
+def _bool_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("true", "1", "yes", "on")
+
+
 def _env_enablement() -> Optional[Dict[str, Any]]:
     """Seed PlatformConfig.extra from env vars before adapter construction.
 
@@ -82,6 +86,10 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         ),
         "creator_id": os.getenv("CARBONVOICE_CREATOR_ID") or None,
         "state_path": os.getenv("CARBONVOICE_STATE_PATH") or None,
+        "reaction_id": os.getenv("CARBONVOICE_REACTION_ID") or None,
+        "disable_ack_reaction": _bool_env("CARBONVOICE_DISABLE_ACK_REACTION"),
+        "disable_mark_read": _bool_env("CARBONVOICE_DISABLE_MARK_READ"),
+        "ignored_senders_log": os.getenv("CARBONVOICE_IGNORED_SENDERS_LOG") or None,
     }
 
     home_channel_id = os.getenv("CARBONVOICE_HOME_CHANNEL")

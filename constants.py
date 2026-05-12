@@ -10,3 +10,8 @@ DEFAULT_SEEN_TTL_S = 5 * 60
 DEFAULT_FLUSH_DEBOUNCE_S = 5.0
 HTTP_TIMEOUT = 30.0
 MAX_MESSAGE_LENGTH = 8000
+
+# "acknowledged" is a built-in Carbon Voice reaction id — works out of the
+# box without operator config. Override with CARBONVOICE_REACTION_ID after
+# inspecting the available reactions logged on startup.
+DEFAULT_REACTION_ID = "acknowledged"

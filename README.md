@@ -4,6 +4,10 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [Phonon
 
 - **No webhook, no tunnel.** Connects via Socket.IO (primary) and polls `POST /v3/messages/recent` as a REST fallback.
 - **Offline catch-up.** Persists a cursor to `$HERMES_HOME/state/carbonvoice.json`, so messages that arrived while Hermes was down are processed on the next startup.
+- **Visual ack on receipt.** Reacts to every inbound message with a Carbon Voice reaction (default: `acknowledged`) so users see feedback in <100ms even before the agent finishes thinking.
+- **Mark-as-read.** Clears the unread notification once the agent has handled the message.
+- **Usernames in logs.** Resolves `user_guid` → display name via `GET /v3/users/{id}` and caches in memory.
+- **Audit log of rejected senders.** Any message dropped by the allowlist is appended to `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` with timestamp + resolved username.
 - **Self-loop filtered** out via the agent's own `user_guid`.
 - **Text-only.** Carbon Voice transcribes voice messages to text before delivery; transcripts arrive in two phases (`message:created` → `message:updated`) and the adapter waits for the populated transcript before dispatching.
 
@@ -76,6 +80,10 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_ALLOW_ALL_USERS` | `false` | Allow any Carbon Voice user (dev only). |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
+| `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |
+| `CARBONVOICE_DISABLE_ACK_REACTION` | `false` | Disable the visual ack reaction. |
+| `CARBONVOICE_DISABLE_MARK_READ` | `false` | Disable clearing the unread notification after the agent replies. |
+| `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Path to the audit log of rejected senders (one JSON line per rejection). |
 
 ## Architecture
 
