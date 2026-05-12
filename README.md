@@ -2,6 +2,33 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [PhononX](https://github.com/PhononX) that connects Hermes to [Carbon Voice](https://carbonvoice.app), so the Hermes agent appears as a bot user inside Carbon Voice channels.
 
+## ⚡ Quickstart (60 seconds)
+
+You need Hermes already installed and a Carbon Voice Personal Access Token (grab one at <https://www.developer.carbonvoice.app/>).
+
+```bash
+# 1. Install the plugin
+hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
+
+# 2. (Recommended) install the optional Socket.IO client for real-time delivery
+~/.hermes/hermes-agent/venv/bin/pip install 'python-socketio[asyncio_client]'
+
+# 3. Add your PAT + open the bot to all senders (dev) — append to ~/.hermes/.env
+cat >> ~/.hermes/.env <<'EOF'
+CARBONVOICE_PAT=cv_pat_xxxxxxxxxxxxxxxxxxxxxxxx
+CARBONVOICE_ALLOW_ALL_USERS=true
+EOF
+
+# 4. Run Hermes
+hermes gateway run
+```
+
+Now DM the agent from any Carbon Voice account — it reacts with ✅ within a second and replies in-thread. To restrict who can talk to it, replace `CARBONVOICE_ALLOW_ALL_USERS=true` with `CARBONVOICE_ALLOWED_USERS=<your_user_guid>` (your guid prints on startup as `connected as <guid>`).
+
+---
+
+## What it does
+
 - **No webhook, no tunnel.** Connects via Socket.IO (primary) and polls `POST /v3/messages/recent` as a REST fallback.
 - **Offline catch-up.** Persists a cursor to `$HERMES_HOME/state/carbonvoice.json`, so messages that arrived while Hermes was down are processed on the next startup.
 - **Visual ack on receipt.** Reacts to every inbound message with a Carbon Voice reaction (default: `acknowledged`) so users see feedback in <100ms even before the agent finishes thinking.
@@ -15,22 +42,8 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [Phonon
 
 - Hermes Agent installed and configured (`hermes setup` already done with an LLM provider).
 - A [Carbon Voice](https://carbonvoice.app) account for the identity the agent will use.
-- A Carbon Voice Personal Access Token — get one at https://www.developer.carbonvoice.app/.
+- A Carbon Voice Personal Access Token — get one at <https://www.developer.carbonvoice.app/>.
 - `httpx` (already in the Hermes venv). Optional: `python-socketio[asyncio_client]` for real-time WebSocket delivery — without it the adapter runs in polling-only mode and still works.
-
-## Install
-
-```bash
-hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
-```
-
-That drops the plugin into `~/.hermes/plugins/carbonvoice/` and enables it.
-
-For real-time delivery (recommended), also install the Socket.IO client:
-
-```bash
-~/.hermes/hermes-agent/venv/bin/pip install 'python-socketio[asyncio_client]'
-```
 
 ## Configure
 
