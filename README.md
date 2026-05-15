@@ -23,8 +23,6 @@ hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
 hermes gateway run
 ```
 
-On the first run, the plugin auto-installs `python-socketio` (for real-time delivery via Socket.IO) if it's not already present — you'll see one log line and then the gateway starts normally. If the install fails (offline, sandboxed venv, etc.) the plugin still works in REST-polling mode.
-
 On startup you'll see `carbonvoice: connected as <your_user_guid>` — handy if you decide to restrict access later.
 
 ### 3. Send a message from Carbon Voice
@@ -61,7 +59,7 @@ echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>,<teammate_guid>' >> "$(hermes c
 - Hermes Agent installed and configured (`hermes setup` already done with an LLM provider).
 - A [Carbon Voice](https://carbonvoice.app) account for the identity the agent will use.
 - A Carbon Voice Personal Access Token — get one at <https://www.developer.carbonvoice.app/>.
-- `httpx` (already in the Hermes venv). Optional: `python-socketio[asyncio_client]` for real-time WebSocket delivery — without it the adapter runs in polling-only mode and still works.
+- `httpx` and `python-socketio[asyncio_client]` — installed automatically as package dependencies.
 
 ## Configure
 
