@@ -47,6 +47,7 @@ from gateway.session import SessionSource
 
 from .api import CarbonVoiceAPI
 from .audit import AllowlistGate, IgnoredSenderLog, default_ignored_log_path
+from .channels import ChannelCache
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
@@ -109,6 +110,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             on_tick=self._fetch_missed_messages,
         )
         self._users = UserCache(self._api) if self._api else None
+        self._channels = ChannelCache(self._api) if self._api else None
         self._reactions = (
             ReactionService(
                 self._api,
@@ -338,11 +340,15 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         elif creator_id:
             user_name = creator_id
 
+        chat_type = "dm"
+        if self._channels is not None:
+            chat_type = await self._channels.resolve_chat_type(channel_id)
+
         source = SessionSource(
             platform=Platform("carbonvoice"),
             chat_id=channel_id,
             chat_name=f"cv:{channel_id[:8]}",
-            chat_type="dm",
+            chat_type=chat_type,
             user_id=creator_id or "",
             user_name=user_name or creator_id or "",
             message_id=message_id,
