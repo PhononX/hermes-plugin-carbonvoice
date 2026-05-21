@@ -344,6 +344,8 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._channels is not None:
             chat_type = await self._channels.resolve_chat_type(channel_id)
 
+        reply_to_text = await self._resolve_parent_text(parent)
+
         source = SessionSource(
             platform=Platform("carbonvoice"),
             chat_id=channel_id,
@@ -360,12 +362,35 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             raw_message=msg,
             message_id=message_id,
             reply_to_message_id=parent,
+            reply_to_text=reply_to_text,
         )
 
         # Dispatch in a background task so processing one message can't block
         # the poll/WS loop while the agent thinks.
         asyncio.create_task(self._dispatch(event))
         return True
+
+    async def _resolve_parent_text(self, parent_id: Optional[str]) -> Optional[str]:
+        """Fetch a parent message's transcript so the agent sees thread context.
+
+        Returns ``None`` on a missing id, a failed lookup, or an empty
+        transcript — Hermes treats ``None`` as "no reply context", which
+        matches the prior behavior. Failures are logged at debug so a flaky
+        parent endpoint does not spam the operator's logs.
+        """
+        if not parent_id or self._api is None:
+            return None
+        try:
+            parent_msg = await self._api.get_message(parent_id)
+        except Exception as exc:
+            logger.debug(
+                "carbonvoice: get_message(%s) failed: %s", parent_id, exc
+            )
+            return None
+        if not parent_msg:
+            return None
+        text = extract_transcript(parent_msg)
+        return text or None
 
     async def _dispatch(self, event: MessageEvent) -> None:
         try:
