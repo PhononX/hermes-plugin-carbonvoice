@@ -6,8 +6,16 @@ of the input dict. Keeps the rest of the plugin free of payload-shape knowledge.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Carbon Voice embeds mentions inline in the transcript as ``@[Display
+# Name](user_guid)`` — markdown-link-style syntax produced by the Flutter
+# client when a user tags someone. The display name can include any
+# character except ``]``; the guid is opaque alphanumerics but we accept
+# anything that isn't ``)`` to stay forgiving of future format tweaks.
+_INLINE_MENTION_PATTERN = re.compile(r"@\[([^\]]+)\]\(([^)]+)\)")
 
 
 def auth_headers(pat: str) -> Dict[str, str]:
@@ -76,6 +84,55 @@ def extract_channel_id(msg: Dict[str, Any]) -> Optional[str]:
 
 def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
+
+
+def extract_inline_mentions(text: Optional[str]) -> List[Tuple[str, str]]:
+    """Return ``(display_name, user_guid)`` pairs from CV's inline syntax.
+
+    Carbon Voice's Flutter app emits mentions as ``@[Display Name](guid)``
+    in the message transcript. This helper extracts each pair in order of
+    appearance, without de-duplication (so the caller can count repeats
+    if it ever matters).
+    """
+    if not text:
+        return []
+    return [
+        (m.group(1), m.group(2))
+        for m in _INLINE_MENTION_PATTERN.finditer(text)
+    ]
+
+
+def is_user_mentioned(msg: Dict[str, Any], user_id: Optional[str]) -> bool:
+    """Return True when *user_id* is tagged in *msg*.
+
+    Forward-compatible: prefers a structured ``tagged_user_ids`` field
+    when the API exposes it (pending cv-api PR), and falls back to
+    parsing the inline ``@[name](guid)`` syntax in the transcript. The
+    fallback works today; the structured path will take over
+    automatically once the backend ships the field.
+    """
+    if not user_id:
+        return False
+    tagged = msg.get("tagged_user_ids")
+    if isinstance(tagged, list) and tagged:
+        return user_id in tagged
+    return any(
+        guid == user_id
+        for _, guid in extract_inline_mentions(extract_transcript(msg))
+    )
+
+
+def strip_inline_mentions(text: Optional[str]) -> str:
+    """Replace ``@[name](guid)`` with a bare ``@name`` for cleaner agent input.
+
+    The agent doesn't need to see the guid — it adds noise to the LLM
+    prompt and can confuse instruction-following. Slack and Discord
+    adapters do the equivalent: strip the bot mention marker before
+    forwarding text to the model.
+    """
+    if not text:
+        return text or ""
+    return _INLINE_MENTION_PATTERN.sub(r"@\1", text)
 
 
 def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
