@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -100,6 +100,21 @@ jobs:
           assert not c.is_seen('x')
           c.mark('x')
           assert c.is_seen('x')
+
+          from carbonvoice.parse import chat_type_from_channel
+          # Safe defaults: missing/empty/unknown payload → "dm" (preserves
+          # prior "bot responds always" behavior until we gate on chat_type).
+          assert chat_type_from_channel(None) == 'dm'
+          assert chat_type_from_channel({}) == 'dm'
+          assert chat_type_from_channel({'unrelated': 'field'}) == 'dm'
+          # Explicit signals from PersonalizedChannel.type
+          assert chat_type_from_channel({'type': 'directMessage'}) == 'dm'
+          assert chat_type_from_channel({'type': 'namedConversation'}) == 'group'
+          assert chat_type_from_channel({'type': 'customerConversation'}) == 'group'
+          assert chat_type_from_channel({'type': 'asyncMeeting'}) == 'group'
+          # dm_hash fallback when ``type`` is absent
+          assert chat_type_from_channel({'dm_hash': 'abc123'}) == 'dm'
+          assert chat_type_from_channel({'dm_hash': None}) == 'dm'
 
           print('smoke tests OK')
           PY
