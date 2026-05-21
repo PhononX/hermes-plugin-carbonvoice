@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels', 'gate']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -115,6 +115,77 @@ jobs:
           # dm_hash fallback when ``type`` is absent
           assert chat_type_from_channel({'dm_hash': 'abc123'}) == 'dm'
           assert chat_type_from_channel({'dm_hash': None}) == 'dm'
+
+          # Inline mention helpers: extract / detect / strip
+          from carbonvoice.parse import (
+              extract_inline_mentions, is_user_mentioned, strip_inline_mentions,
+          )
+          assert extract_inline_mentions(None) == []
+          assert extract_inline_mentions('plain text') == []
+          assert extract_inline_mentions('@[A](1)') == [('A', '1')]
+          assert extract_inline_mentions('@[A](1) and @[B](2)') == [('A', '1'), ('B', '2')]
+          # Display name may contain spaces and unicode
+          assert extract_inline_mentions('@[Gi’ Martínez](GUID) hi') == [('Gi’ Martínez', 'GUID')]
+
+          # Forward-compat: prefer tagged_user_ids when present
+          assert is_user_mentioned({'tagged_user_ids': ['BOT']}, 'BOT') is True
+          assert is_user_mentioned({'tagged_user_ids': ['OTHER']}, 'BOT') is False
+          # Fallback to inline parsing
+          assert is_user_mentioned({'transcript_txt': '@[Bot](BOT) hi'}, 'BOT') is True
+          assert is_user_mentioned({'transcript_txt': 'no mention'}, 'BOT') is False
+          # Empty tagged_user_ids falls through to inline path
+          assert is_user_mentioned(
+              {'tagged_user_ids': [], 'transcript_txt': '@[Bot](BOT) hi'}, 'BOT'
+          ) is True
+          # Missing user_id never matches
+          assert is_user_mentioned({'tagged_user_ids': ['BOT']}, None) is False
+
+          assert strip_inline_mentions(None) == ''
+          assert strip_inline_mentions('plain') == 'plain'
+          assert strip_inline_mentions('@[A](1) hi') == '@A hi'
+          assert strip_inline_mentions('@[A](1) and @[B](2)') == '@A and @B'
+
+          # MentionGate decisions
+          from carbonvoice.gate import MentionGate
+          g = MentionGate(require_mention=True, free_response_channels=set(), ignored_channels=set())
+          # DM always passes regardless of mention
+          assert g.evaluate(msg={'transcript_txt': 'hi'}, chat_type='dm', channel_id='c', self_user_id='BOT').process
+          # Group without mention → skip
+          assert not g.evaluate(msg={'transcript_txt': 'hi'}, chat_type='group', channel_id='c', self_user_id='BOT').process
+          # Group with inline mention → process
+          assert g.evaluate(msg={'transcript_txt': '@[Bot](BOT) hi'}, chat_type='group', channel_id='c', self_user_id='BOT').process
+          # Group with tagged_user_ids forward-compat → process
+          assert g.evaluate(msg={'tagged_user_ids': ['BOT']}, chat_type='group', channel_id='c', self_user_id='BOT').process
+
+          # Ignored channel vetoes everything, including DMs
+          g_mute = MentionGate(require_mention=True, free_response_channels=set(), ignored_channels={'mute'})
+          assert not g_mute.evaluate(msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='dm', channel_id='mute', self_user_id='BOT').process
+          assert not g_mute.evaluate(msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='group', channel_id='mute', self_user_id='BOT').process
+
+          # Free-response channel bypasses mention requirement
+          g_free = MentionGate(require_mention=True, free_response_channels={'free'}, ignored_channels=set())
+          assert g_free.evaluate(msg={'transcript_txt': 'no mention'}, chat_type='group', channel_id='free', self_user_id='BOT').process
+
+          # require_mention=false → group passes without mention
+          g_open = MentionGate(require_mention=False, free_response_channels=set(), ignored_channels=set())
+          assert g_open.evaluate(msg={'transcript_txt': 'no mention'}, chat_type='group', channel_id='c', self_user_id='BOT').process
+
+          # from_env smoke
+          import os
+          for k in ['CARBONVOICE_REQUIRE_MENTION', 'CARBONVOICE_FREE_RESPONSE_CHANNELS', 'CARBONVOICE_IGNORED_CHANNELS']:
+              os.environ.pop(k, None)
+          gd = MentionGate.from_env()
+          assert gd._require_mention is True
+          assert gd._free_response_channels == set() and gd._ignored_channels == set()
+          os.environ['CARBONVOICE_REQUIRE_MENTION'] = 'false'
+          os.environ['CARBONVOICE_FREE_RESPONSE_CHANNELS'] = 'a, b ,c'
+          os.environ['CARBONVOICE_IGNORED_CHANNELS'] = 'mute'
+          ge = MentionGate.from_env()
+          assert ge._require_mention is False
+          assert ge._free_response_channels == {'a', 'b', 'c'}
+          assert ge._ignored_channels == {'mute'}
+          for k in ['CARBONVOICE_REQUIRE_MENTION', 'CARBONVOICE_FREE_RESPONSE_CHANNELS', 'CARBONVOICE_IGNORED_CHANNELS']:
+              os.environ.pop(k, None)
 
           print('smoke tests OK')
           PY
