@@ -78,6 +78,33 @@ def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
 
 
+def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
+    """Map a Carbon Voice channel payload to Hermes ``chat_type``.
+
+    Returns ``"dm"`` for one-to-one direct messages, ``"group"`` for every
+    other channel kind (workspace channels, customer conversations, async
+    meetings). Defaults to ``"dm"`` when the payload is missing so the
+    adapter degrades to the prior single-tier behavior rather than dropping
+    messages on a transient channel-lookup failure.
+
+    Discriminator priority:
+      1. ``type == "directMessage"`` — explicit type from PersonalizedChannel.
+      2. ``dm_hash`` non-null — present only on DM channels (1:1 fingerprint
+         used by the merge service); a reliable fallback if ``type`` is
+         absent from older payloads.
+    """
+    if not channel:
+        return "dm"
+    ch_type = channel.get("type")
+    if isinstance(ch_type, str) and ch_type.strip():
+        return "dm" if ch_type == "directMessage" else "group"
+    if channel.get("dm_hash"):
+        return "dm"
+    # Unknown/partial payload — preserve the prior "bot responds always"
+    # behavior by defaulting to DM until we gain a positive signal.
+    return "dm"
+
+
 def extract_reply_anchor(msg: Dict[str, Any]) -> Optional[str]:
     """The message_id to thread *next* replies under.
 
