@@ -55,6 +55,7 @@ from .constants import (
     MAX_MESSAGE_LENGTH,
 )
 from .dedupe import SeenCache
+from .gate import MentionGate
 from .parse import (
     extract_channel_id,
     extract_creator_id,
@@ -62,6 +63,7 @@ from .parse import (
     extract_transcript,
     first_str,
     now_iso,
+    strip_inline_mentions,
 )
 from .reactions import ReactionService
 from .state import Cursor, default_state_path
@@ -121,6 +123,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             else None
         )
         self._allowlist = AllowlistGate.from_env()
+        self._gate = MentionGate.from_env()
         self._ignored_log = (
             IgnoredSenderLog(ignored_log_path, self._users) if self._users else None
         )
@@ -316,6 +319,33 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         self._seen.mark(message_id)
 
+        # Resolve chat_type before the mention gate so the gate can short-
+        # circuit group messages without spinning up the rest of the
+        # pipeline (visual ack, parent lookup, name resolution). The
+        # channel cache makes the first message in each channel pay one
+        # HTTP call; every subsequent message is free.
+        chat_type = "dm"
+        if self._channels is not None:
+            chat_type = await self._channels.resolve_chat_type(channel_id)
+
+        # Mention gate: in group channels, only respond when the agent
+        # is @-mentioned (or the channel is configured to bypass). DMs
+        # always pass. Evaluated before the visual ack so users in
+        # non-mention scenarios don't see a phantom "I saw it" with no
+        # follow-up reply.
+        decision = self._gate.evaluate(
+            msg=msg,
+            chat_type=chat_type,
+            channel_id=channel_id,
+            self_user_id=self._self_user_id,
+        )
+        if not decision.process:
+            logger.debug(
+                "carbonvoice: skip message %s in %s — %s",
+                message_id, channel_id, decision.reason,
+            )
+            return False
+
         # Fire the visual ack first so the user sees feedback in <100ms,
         # well before the agent's reply (which can take 10+ seconds).
         if self._reactions is not None:
@@ -340,11 +370,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         elif creator_id:
             user_name = creator_id
 
-        chat_type = "dm"
-        if self._channels is not None:
-            chat_type = await self._channels.resolve_chat_type(channel_id)
-
         reply_to_text = await self._resolve_parent_text(parent)
+
+        # Strip CV's inline @[name](guid) markup so the agent sees
+        # readable text — the guid in the original is LLM noise that
+        # can confuse instruction following.
+        clean_text = strip_inline_mentions(transcript)
 
         source = SessionSource(
             platform=Platform("carbonvoice"),
@@ -356,7 +387,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
         event = MessageEvent(
-            text=transcript,
+            text=clean_text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=msg,
