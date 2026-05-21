@@ -138,6 +138,20 @@ class CarbonVoiceAPI:
             return None
         return resp.json() if resp.content else None
 
+    async def get_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """GET /channel/{id} — returns the PersonalizedChannel dict or None on 4xx.
+
+        Carbon Voice's response exposes ``type`` (directMessage |
+        customerConversation | namedConversation | asyncMeeting) and
+        ``dm_hash`` (null for non-DMs) — both usable to discriminate DM
+        vs group conversation when gating the agent's behavior.
+        """
+        client = self._require_client()
+        resp = await client.get(f"/channel/{channel_id}")
+        if resp.status_code >= 400:
+            return None
+        return resp.json() if resp.content else None
+
 
 async def standalone_send(
     pat: str,
