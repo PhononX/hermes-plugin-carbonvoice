@@ -138,6 +138,35 @@ class CarbonVoiceAPI:
             return None
         return resp.json() if resp.content else None
 
+    async def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """GET /v3/messages/{message_id} — returns the message dict or None on 4xx.
+
+        Same payload shape as inbound Socket.IO / fetch_recent messages, so
+        parse helpers (``extract_transcript``, ``extract_creator_id``, etc.)
+        work unchanged. Used to resolve the text of a parent message when an
+        inbound reply carries ``parent_message_id`` — gives the agent the
+        thread context it would otherwise have to guess at.
+        """
+        client = self._require_client()
+        resp = await client.get(f"/v3/messages/{message_id}")
+        if resp.status_code >= 400:
+            return None
+        return resp.json() if resp.content else None
+
+    async def get_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """GET /channel/{id} — returns the PersonalizedChannel dict or None on 4xx.
+
+        Carbon Voice's response exposes ``type`` (directMessage |
+        customerConversation | namedConversation | asyncMeeting) and
+        ``dm_hash`` (null for non-DMs) — both usable to discriminate DM
+        vs group conversation when gating the agent's behavior.
+        """
+        client = self._require_client()
+        resp = await client.get(f"/channel/{channel_id}")
+        if resp.status_code >= 400:
+            return None
+        return resp.json() if resp.content else None
+
 
 async def standalone_send(
     pat: str,
