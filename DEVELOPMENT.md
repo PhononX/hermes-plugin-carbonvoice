@@ -133,18 +133,18 @@ Ordered by user-visible value per unit of effort. Items in **bold** are the next
 3. **`get_message()` caching.** Currently every reply fetches the parent on demand. A small LRU cache (~128 entries) cuts cost for star-shaped threads where many replies share a root.
 
 ### Medium term
-3. **Lifecycle hooks refactor.** Move `mark_read` (currently in `_dispatch.finally`) to `on_processing_complete()`, and move `reaction.ack` to `on_processing_start()`. No behavior change; aligns the plugin with the convention used by Slack/Discord/Telegram adapters and shrinks `_process_message`. See [base.py:2346](https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/base.py#L2346) for the hook signatures.
-4. **Per-channel system prompts.** Surface `MessageEvent.channel_prompt` by reading an env-driven map (`CARBONVOICE_CHANNEL_PROMPTS=guid:"you are support",guid2:"you are sales"`). Hermes core injects it as an ephemeral system prompt per message.
-5. **Media support.** Populate `MessageEvent.media_urls` and `.media_types` from `attachments[]` and `audio_url`, using Hermes' `cache_image_from_url` / `cache_audio_from_url` helpers. Decision needed: do we break the "text-only" contract documented in the README?
+4. **Lifecycle hooks refactor.** Move `mark_read` (currently in `_dispatch.finally`) to `on_processing_complete()`, and move `reaction.ack` to `on_processing_start()`. No behavior change; aligns the plugin with the convention used by Slack/Discord/Telegram adapters and shrinks `_process_message`. See [base.py:2346](https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/base.py#L2346) for the hook signatures.
+5. **Per-channel system prompts.** Surface `MessageEvent.channel_prompt` by reading an env-driven map (`CARBONVOICE_CHANNEL_PROMPTS=guid:"you are support",guid2:"you are sales"`). Hermes core injects it as an ephemeral system prompt per message.
+6. **Media support.** Populate `MessageEvent.media_urls` and `.media_types` from `attachments[]` and `audio_url`, using Hermes' `cache_image_from_url` / `cache_audio_from_url` helpers. Decision needed: do we break the "text-only" contract documented in the README?
 
 ### Long term (requires backend coordination or larger scope)
-6. **Output rich.** Implement `edit_message()` for streaming, `send_voice()` for TTS replies, `send_image()` / `send_document()` for multimodal outputs.
-7. **Interrupt support.** Implement `interrupt_session_activity()` so `/stop`, `/new`, `/reset` from CV cancel the in-flight agent task.
-8. **Per-workspace skill bindings.** Map workspace_id → skill set so the agent loads different tools depending on which workspace the message came from.
+7. **Output rich.** Implement `edit_message()` for streaming, `send_voice()` for TTS replies, `send_image()` / `send_document()` for multimodal outputs.
+8. **Interrupt support.** Implement `interrupt_session_activity()` so `/stop`, `/new`, `/reset` from CV cancel the in-flight agent task.
+9. **Per-workspace skill bindings.** Map workspace_id → skill set so the agent loads different tools depending on which workspace the message came from.
 
 ### Blocked on backend
-9. **Migrate `is_user_mentioned()` to prefer `tagged_user_ids`.** Already coded as the forward-compat path. No-op once cv-api ships the field — works automatically. Removes the voice-only-mention limitation.
-10. **Enriched mention metadata.** If cv-api eventually returns `tagged_users: { id, display_name }[]` instead of raw IDs, the adapter could pass display names through to the agent for nicer replies ("@user1, ...").
+10. ~~**Migrate `is_user_mentioned()` to prefer `tagged_user_ids`.**~~ ✅ **Resolved (Q2 2026).** Forward-compat path was already coded, and cv-api now ships the field. No-op migration — already in effect. Voice memos with UI tagging reach the bot today.
+11. **Enriched mention metadata.** If cv-api eventually returns `tagged_users: { id, display_name }[]` instead of raw IDs, the adapter could pass display names through to the agent for nicer replies ("@user1, ...").
 
 ## 6. Architecture decisions
 
