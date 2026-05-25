@@ -246,9 +246,10 @@ class CarbonVoiceAPI:
     ) -> List[Dict[str, Any]]:
         """POST /v5/messages/by-ids — batch fetch of multiple MessageV5s.
 
-        Used by future memory wiring to fetch all replies in a thread
-        efficiently after resolving the parent ids from a single
-        ``get_message_v5`` call.
+        Used by the thread-context fetch path (see
+        ``adapter._fetch_thread_context``) to pull the transcripts for the
+        message ids that ``list_channel_message_index`` identified as
+        belonging to the thread, in a single round-trip.
         """
         if not message_ids:
             return []
@@ -257,6 +258,46 @@ class CarbonVoiceAPI:
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("messages", []) if isinstance(data, dict) else []
+
+    async def list_channel_message_index(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 200,
+        direction: str = "older",
+    ) -> List[Dict[str, Any]]:
+        """GET /messages/<channel_id>/index — lightweight list-by-channel.
+
+        Returns ``MessageIndex`` items (``message_id`` /
+        ``parent_message_id`` / ``status`` / ``created_at`` / ...) without
+        transcripts. Used by the thread-context path: we list the channel's
+        recent messages, filter client-side by ``parent_message_id ==
+        thread_id`` (CV is flat — every reply's ``parent_message_id`` is
+        the true root, see DEVELOPMENT.md §4), then batch-fetch the
+        identified ids via :meth:`get_messages_by_ids_v5`.
+
+        ``direction='older'`` defaults to "the last <limit> messages in the
+        channel" — what we want for thread context. The caller passes
+        ``limit`` sized for typical active-channel volume (200 is a
+        reasonable upper bound for a 30-message thread cap).
+
+        This is a v3-only endpoint today; the cv-api roadmap may add a
+        more direct ``GET /v5/channels/:id/threads/:thread_id/messages``
+        in the future, at which point the workaround here collapses to a
+        single call.
+        """
+        client = self._require_client()
+        params: Dict[str, Any] = {
+            "limit": int(limit),
+            "direction": direction,
+        }
+        resp = await client.get(f"/messages/{channel_id}/index", params=params)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        results = data.get("results")
+        if isinstance(results, list):
+            return results
+        return data if isinstance(data, list) else []
 
     async def fetch_reactions(self) -> List[Dict[str, Any]]:
         """GET /reactions — returns the workspace's available reactions."""
