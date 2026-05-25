@@ -608,6 +608,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             + "\n[End of thread context]\n\n"
         )
         self._tracker.set_cached_thread_context(thread_id, content)
+        # INFO so it shows up in default gateway.log — operators need to
+        # see when context was injected to debug "why did the bot know
+        # that?" / "why did the bot miss that?" questions without flipping
+        # to DEBUG. Volume is bounded: fires at most once per thread per
+        # TTL window (subsequent mentions in the same thread hit the
+        # active-session guard and skip this method entirely).
+        logger.info(
+            "carbonvoice: thread context injected for %s — %d prior message(s), %d chars",
+            thread_id, len(parts), len(content),
+        )
         return content
 
     # ── Inbound processing ───────────────────────────────────────────────
