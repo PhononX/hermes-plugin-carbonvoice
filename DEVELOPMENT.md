@@ -120,7 +120,8 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | ~~**No engaged-thread context on first @mention.**~~ ✅ **Resolved (Q2 2026 PR 4).** When the agent is @mentioned in a thread for the first time (no Hermes session yet for that thread), `adapter._fetch_thread_context` pulls the prior messages and prepends them as a `[Thread context …]` block so the LLM has history from turn 1. Cached per-thread (TTL 30 min, LRU 200) so re-mentions in a hot thread don't re-hit the API. Subsequent turns ride on Hermes' SQLite session history. | The first @mention in a long-running thread now carries the prior conversation; no more "wait, what are we talking about?" responses. | — |
 | **No native "list messages in thread" endpoint on cv-api.** PR 4's thread-context fetch combines two REST calls (`GET /messages/<channel_id>/index` for ids + `parent_message_id`, then `POST /v5/messages/by-ids` for transcripts) and filters client-side. Works, but pays the index fetch on every cold cache. | One extra index call per thread per TTL window. Negligible for low-volume workspaces; worth optimizing for high-volume ones. | Backend ask: `GET /v5/messages/<thread_id>/replies?limit=N` or extend `getMessageIdsV5` to accept `thread_id` filter. Collapses the workaround to a single call. |
 | ~~**No deep-thread anchor walking.**~~ ✅ **Not applicable to Carbon Voice.** CV enforces flat replies — the Flutter client's [`Message.getTopLevelGuid()`](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_domain/lib/message/models/message.dart) returns `parent_message_id` (or self if top-level) without walking, and the [send queue](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_data/lib/message/message_send_queue.dart) explicitly redirects any reply targeting a non-top-level message back to its parent. Backend rejects depth-2+ replies with `400 "You cannot reply to a message that is a reply"`. So `parent_message_id` is always the true thread root — no walking, no cache needed in the plugin. | — | — |
-| **Text-only.** Voice messages are transcribed before delivery; attachments (`audio_url`, `attachments[]`) are not surfaced to the agent. | Agent can't "see" images, original audio, or document content. | Requires implementing `media_urls` / `media_types` in `_process_message`, downloading attachments via Hermes' `cache_*_from_url` helpers. Scope decision pending. |
+| **Text-only inbound.** Inbound voice messages are transcribed before delivery; inbound attachments (`audio_url`, `attachments[]`) are not surfaced to the agent. | Agent can't "see" inbound images, original audio, or document content. | Requires implementing `media_urls` / `media_types` in `_process_message`, downloading attachments via Hermes' `cache_*_from_url` helpers. Scope decision pending. |
+| ~~**Local file attachments not supported on outbound.**~~ ✅ **Resolved (Q2 2026 PR 5).** `send_document` and `send_image` now accept either a URL or a local file path. Local files follow the Flutter client's flow: `POST /v3/attachments/signedurl` → direct S3 PUT → `POST /v5/messages/{text,attachment}` with `type:"file"` + `status:"Initializing"` → background `PUT /messages/{m}/attachment/{a}` to flip status to `Uploaded`/`Failed`. The agent gets `SendResult(success=True)` immediately; the recipient sees the bubble appear with a placeholder that resolves once S3 acks. URL inputs skip the upload and attach `type:"link"`. `send_voice` keeps using `/v5/messages/audio` (multipart, server-side transcription) — that's the right tool for voice memos; for plain audio attachments use `send_document` with an `.mp3`/`.wav` path. | The agent can now ship `.md` reports, PDFs, images, and arbitrary files generated locally — same UX as a Flutter user pressing the attach button. | — |
 | **No streaming replies.** `edit_message()` is not implemented; the agent's reply is delivered as a single complete message after thinking. | Long-running responses feel laggy with no "thinking" indicator. | Requires CV backend support for `PATCH /v3/messages/{id}` (verify) plus `edit_message()` override in the adapter. |
 | **No interrupt support.** `/stop`, `/new`, `/reset` commands from CV won't cancel an in-flight agent run. | Users can't abort runaway responses. | Implement `interrupt_session_activity()`. |
 | ~~**`tagged_user_ids` not in API response.**~~ ✅ **Resolved (Q2 2026).** The DB field is now surfaced in `Message`, `MessageV2`, and `MessageV5` DTOs. The plugin's forward-compat `is_user_mentioned()` automatically prefers the structured field over inline parsing. | Voice memos with UI tagging now reach the bot. | — |
@@ -265,15 +266,16 @@ post-2026-05-25 priorities baked in:
 | ~~v5 transport~~ | ~~api.py~~ | ~~PR 3~~ ✅ Shipped | `send_text_v5` / `send_audio_v5` / `send_attachment_v5` + `get_message_v5` / `get_messages_by_ids_v5` in api.py. `adapter.send` migrated; new `send_voice` / `send_image` / `send_document` overrides land via v5 endpoints. CV team's "always reply to thread_id" intent encoded — no client reply-anchor lookup. |
 | `edit_message(chat_id, message_id, content, finalize=)` | base.py:1744 | **blocked on backend** | The big UX gap (chain-of-thought as one growing bubble vs N messages). v5 has no PATCH endpoint and `/v5/messages/stream` is for audio uploads, not text editing. The closest path — `PUT /v3/messages/transcript` — is meant for human voice-transcript corrections and requires shoehorning text into `WordsWithTimeCode` format. Needs a backend `PATCH /v5/messages/{id}` (or equivalent) before this can ship cleanly. |
 | ~~Engaged-thread context via API fetch~~ | ~~(custom — adapter-level)~~ | ~~PR 4~~ ✅ Shipped | `adapter._fetch_thread_context` pulls the thread's prior messages on first `@mention` and prepends as `[Thread context …]` block. Combines `list_channel_message_index` + `get_messages_by_ids_v5` (workaround for the missing thread-listing endpoint — see §4). Cached per-thread (TTL 30 min, LRU 200); subsequent turns ride on Hermes' SQLite session. |
-| `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **PR 5** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
+| ~~Local file attachments on outbound (`send_document`, `send_image`)~~ | ~~adapter.py~~ | ~~PR 5~~ ✅ Shipped | Signed-URL → S3 PUT → message-create with `type:"file"` + `status:"Initializing"` → background status update. Mirrors the Flutter client flow. Agent ships `.md`/PDFs/audio just like a human attaches files. |
+| `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **PR 6** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
 | `interrupt_session_activity(session_key, chat_id)` | base.py:2502 | medium | Needed for `/stop`, `/new`, `/reset` to cancel an in-flight run. |
 | `delete_message` | base.py:1773 | medium | Enables `EphemeralReply` auto-deletion of system notices. |
 | `MessageEvent.channel_prompt` | base.py:1073 | medium | Per-channel ephemeral system prompts (Discord pattern). |
-| Thread memory + reply-to-bot shortcuts (was PR 3) | gate.py + tracker | **deferred → PR 6 (probably unnecessary after PR 4)** | Once PR 4 fetches thread history on every `@mention`, the engagement-bypass shortcut adds little value. Revisit after PR 4 dogfooding. |
+| Thread memory + reply-to-bot shortcuts (was PR 3) | gate.py + tracker | **deferred → PR 7 (probably unnecessary after PR 4)** | Once PR 4 fetches thread history on every `@mention`, the engagement-bypass shortcut adds little value. Revisit after PR 4 dogfooding. |
 | `format_message` | base.py:3985 | low | Override if CV doesn't render markdown — strip `**`/backticks so the LLM's formatting doesn't bleed through. |
 | Media in (`media_urls` / `media_types`) | base.py:1060 | long | Breaks current text-only contract; product decision. |
-| `send_voice` (via v5 audio endpoint) | base.py:2038 | long | CV being voice-first makes `send_voice` particularly high-value. Lands cheaply once v5 transport is in (PR 3). |
-| `send_image`, `send_document`, `send_animation`, `send_image_file` | base.py:2110–2230 | long | Less critical for CV's text-first agent UX. |
+| ~~`send_voice` (via v5 audio endpoint)~~ | ~~base.py:2038~~ | ~~PR 3~~ ✅ Shipped | Uses `/v5/messages/audio` for server-side transcription — the right tool for voice memos. Generic audio attachments (`.mp3` files etc.) flow through PR 5's `send_document`. |
+| ~~`send_image`, `send_document`~~ | ~~base.py:2110–2230~~ | ~~PR 5~~ ✅ Shipped | Local file or URL both supported (see PR 5). `send_animation` / `send_image_file` remain unimplemented (low priority — CV doesn't distinguish them from generic file attachments). |
 | `play_tts` + auto-TTS plumbing | base.py:2156 | long | Hermes core already gates this via `_should_auto_tts_for_chat`. |
 | `create_handoff_thread` | base.py:1717 | optional | Only if CV grows native sub-threads. |
 | `send_clarify` / `send_slash_confirm` with inline buttons | base.py:1852, 1887 | skip | CV has no native button UI; text fallback works. |
@@ -530,14 +532,39 @@ was reversed on 2026-05-25 — see §7.0 for the rationale.
   (or `getMessageIdsV5` extended with a `thread_id` filter) would
   collapse the workaround to a single call. Tracked in §4.
 
-**PR 5 — lifecycle hooks refactor.** Pure technical hygiene.
+**PR 5 — local file attachments (Flutter-style flow).** ✅ Shipped.
+- `send_document` and `send_image` now accept a URL **or** a local
+  file path. URL → single-call `type:"link"` attachment as before.
+  Local file → 4-step flow that mirrors the Flutter client:
+    1. `POST /v3/attachments/signedurl` → pre-signed S3 PUT URL.
+    2. `POST /v5/messages/{text,attachment}` with `type:"file"`,
+       canonical link (signed URL minus the query string),
+       `status:"Initializing"`.
+    3. Return `SendResult(success=True)` to the caller immediately —
+       the recipient's UI shows the bubble with a placeholder.
+    4. Background `asyncio.create_task` PUTs bytes to S3 and PUTs
+       `status:"Uploaded"`/`"Failed"` to
+       `/messages/{m}/attachment/{a}`.
+- Routing between `/v5/messages/text` and `/v5/messages/attachment`
+  depends on caption: text+file goes via `/text` (transcript must be
+  non-empty there); file-only goes via `/attachment`.
+- `send_voice` unchanged: voice memos still use `/v5/messages/audio`
+  (multipart, server-side transcription) since that gives the
+  voice-memo UX. Plain audio attachments (`.mp3`/`.wav` files) go
+  through `send_document` and arrive as generic file attachments.
+- Fixes the latent invalid-enum bug from PR 3: the old code sent
+  `type:"image"`/`"document"` which aren't in `AttachmentType`; the
+  server silently coerced them to `link`. New code uses `type:"file"`
+  for binary uploads and `type:"link"` for hosted URLs — both valid.
+
+**PR 6 — lifecycle hooks refactor.** Pure technical hygiene.
 - Move `reactions.ack` call to `on_processing_start(event)`.
 - Move `mark_read` call to `on_processing_complete(event, outcome)`.
 - Optional: tri-state ack reactions (`acknowledged` → swap to `done` /
   `failed` based on `ProcessingOutcome`).
 - Shrink `_process_message` / `_dispatch` accordingly.
 
-**PR 6 — thread memory + reply-to-bot shortcuts.** Deferred,
+**PR 7 — thread memory + reply-to-bot shortcuts.** Deferred,
 probably unnecessary after PR 4. Original PR 3 from the pre-revision
 plan: `tracker.mark_engaged` / `is_engaged` / `record_outbound`,
 `MentionGate.evaluate` gets `is_engaged_thread` / `is_reply_to_bot`
