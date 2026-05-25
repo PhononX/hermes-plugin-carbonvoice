@@ -113,6 +113,21 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_DISABLE_ACK_REACTION` | `false` | Disable the visual ack reaction. |
 | `CARBONVOICE_DISABLE_MARK_READ` | `false` | Disable clearing the unread notification after the agent replies. |
 | `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Path to the audit log of rejected senders (one JSON line per rejection). |
+| `CARBONVOICE_REQUIRE_MENTION` | `true` | In group channels, only respond when the agent is `@`-mentioned. DMs are always processed. Set to `false` to make the bot respond to every message in every channel it can see (the pre-gate behavior — useful for personal-bot setups). |
+| `CARBONVOICE_FREE_RESPONSE_CHANNELS` | _(unset)_ | Comma-separated `channel_guid`s where the agent always responds, regardless of mention. Useful for channels dedicated to the bot. |
+| `CARBONVOICE_IGNORED_CHANNELS` | _(unset)_ | Comma-separated `channel_guid`s where the agent **never** responds, even when mentioned. Hard veto — also applies to DMs if the channel guid is listed. |
+
+### Mention behavior
+
+The agent uses a DM-vs-channel split that mirrors how Slack/Discord/Telegram adapters in Hermes core gate messages:
+
+- **DMs (1:1):** always processed.
+- **Group channels:** require an `@`-mention of the agent unless the channel is in `CARBONVOICE_FREE_RESPONSE_CHANNELS` or `CARBONVOICE_REQUIRE_MENTION=false`.
+- **Ignored channels:** never processed, even when mentioned.
+
+Carbon Voice's Flutter client embeds mentions in the transcript as `@[Display Name](user_guid)` — the adapter parses this format to detect when the agent's `user_guid` was tagged. Once the cv-api exposes `tagged_user_ids` directly on the message DTO, the adapter prefers that structured field and falls back to inline parsing automatically.
+
+> ⚠️ **Voice-only messages:** mentions made by speaking the agent's name without typing `@` will not be detected, because the transcript won't contain the structured marker. To mention the agent from a voice memo, type the `@`-mention in the message caption or use the tagging UI before recording.
 
 ## Architecture
 

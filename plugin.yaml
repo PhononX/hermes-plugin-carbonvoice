@@ -72,3 +72,15 @@ optional_env:
     description: "Path to the audit log of rejected senders (default: $HERMES_HOME/logs/carbonvoice-ignored-senders.log)"
     prompt: "Ignored senders log path"
     password: false
+  - name: CARBONVOICE_REQUIRE_MENTION
+    description: "In group channels, only respond when the agent is @-mentioned (default: true). DMs always pass. Set to false for the pre-gate 'respond to every message' behavior."
+    prompt: "Require @mention in group channels? (true/false)"
+    password: false
+  - name: CARBONVOICE_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated channel_guids where the agent always responds, regardless of mention."
+    prompt: "Free-response channel_guids (comma-separated, blank to skip)"
+    password: false
+  - name: CARBONVOICE_IGNORED_CHANNELS
+    description: "Comma-separated channel_guids where the agent NEVER responds, even when mentioned (hard veto, applies to DMs too)."
+    prompt: "Ignored channel_guids (comma-separated, blank to skip)"
+    password: false
