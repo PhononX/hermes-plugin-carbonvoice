@@ -1,6 +1,14 @@
 # Carbon Voice plugin installed 🎙️
 
-Your PAT is saved. One command left — start the gateway and DM the agent from any Carbon Voice account.
+Your PAT is saved. **One more step before starting the gateway** — install the WebSocket client manually.
+
+## Required: install `python-socketio`
+
+This plugin needs `python-socketio` for real-time delivery. Hermes does **not** auto-install plugin dependencies (security boundary — runtime installs from arbitrary plugin repos bypass the same trust controls that protect Hermes itself), so install it explicitly:
+
+```bash
+python -m pip install 'python-socketio[asyncio_client]>=5'
+```
 
 ## Start the gateway
 
@@ -8,7 +16,13 @@ Your PAT is saved. One command left — start the gateway and DM the agent from 
 hermes gateway run
 ```
 
-The agent reacts with ✅ within a second and replies in-thread. On first startup the plugin will auto-install `python-socketio` (for real-time delivery) if it's missing — you'll see a one-line log and then the gateway starts normally.
+The agent reacts with ✅ within a second and replies in-thread.
+
+### If you skip the install above
+
+The plugin still works — it falls back to **REST polling mode**, fetching new messages every 5 seconds instead of receiving them in real time via WebSocket. You'll see a warning at startup with the install command above.
+
+For personal/dev setups polling is fine. For production where sub-second response matters, install the dep.
 
 ---
 
@@ -26,4 +40,4 @@ Your own `user_guid` prints in the gateway logs on the first startup as `connect
 
 ---
 
-Full docs, troubleshooting, all env vars: <https://github.com/PhononX/hermes-plugin-carbonvoice#readme>
+Full docs, troubleshooting, all env vars, and mention-gate config: <https://github.com/PhononX/hermes-plugin-carbonvoice#readme>

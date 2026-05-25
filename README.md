@@ -9,7 +9,17 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin by [Phonon
 
 You need Hermes already installed and a Carbon Voice Personal Access Token (grab one at <https://www.developer.carbonvoice.app/>).
 
-### 1. Install the plugin
+### 1. Install the WebSocket client
+
+`hermes plugins install` clones the plugin but does **not** run `pip install` on its dependencies (security boundary — see [Hermes plugin guide](https://hermes-agent.nousresearch.com/docs/guides/build-a-hermes-plugin)). Install `python-socketio` manually so the plugin can deliver messages in real time:
+
+```bash
+python -m pip install 'python-socketio[asyncio_client]>=5'
+```
+
+> If you skip this step, the plugin still works — it falls back to REST polling (5s latency). You'll see a clear warning at gateway startup with the install command.
+
+### 2. Install the plugin
 
 The installer prompts you for your Carbon Voice PAT — paste it in and press Enter.
 
@@ -17,17 +27,15 @@ The installer prompts you for your Carbon Voice PAT — paste it in and press En
 hermes plugins install PhononX/hermes-plugin-carbonvoice --enable
 ```
 
-### 2. Start Hermes
+### 3. Start Hermes
 
 ```bash
 hermes gateway run
 ```
 
-On the first run, the plugin auto-installs `python-socketio` (for real-time delivery via Socket.IO) if it's not already present — you'll see one log line and then the gateway starts normally. If the install fails (offline, sandboxed venv, etc.) the plugin still works in REST-polling mode.
-
 On startup you'll see `carbonvoice: connected as <your_user_guid>` — handy if you decide to restrict access later.
 
-### 3. Send a message from Carbon Voice
+### 4. Send a message from Carbon Voice
 
 Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It reacts with ✅ within a second and replies in-thread.
 
@@ -61,7 +69,8 @@ echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>,<teammate_guid>' >> "$(hermes c
 - Hermes Agent installed and configured (`hermes setup` already done with an LLM provider).
 - A [Carbon Voice](https://carbonvoice.app) account for the identity the agent will use.
 - A Carbon Voice Personal Access Token — get one at <https://www.developer.carbonvoice.app/>.
-- `httpx` (already in the Hermes venv). Optional: `python-socketio[asyncio_client]` for real-time WebSocket delivery — without it the adapter runs in polling-only mode and still works.
+- `httpx` (already in the Hermes venv).
+- `python-socketio[asyncio_client]` — **install manually** with `python -m pip install 'python-socketio[asyncio_client]>=5'`. Hermes does not auto-install plugin dependencies (security boundary). Without it, the adapter runs in REST polling mode and you'll see a warning at startup.
 
 ## Configure
 
@@ -92,7 +101,13 @@ carbonvoice: connected as <your_user_guid> (mode=websocket, state=…/carbonvoic
 carbonvoice: Socket.IO connected
 ```
 
-If `python-socketio` is not installed, you'll see `mode=polling` instead — equally functional, just polls every 5 seconds.
+If `python-socketio` is not installed, you'll see a warning like:
+
+```
+carbonvoice: Carbon Voice realtime websocket support is unavailable because python-socketio is not installed. Falling back to REST polling. To enable websocket mode, install python-socketio[asyncio_client] in the Hermes venv: python -m pip install 'python-socketio[asyncio_client]>=5'
+```
+
+The adapter then runs in polling-only mode (functional, 5s latency).
 
 Now DM the agent's Carbon Voice account from another account. Hermes replies in the same channel, threaded to your message.
 
