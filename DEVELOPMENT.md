@@ -117,7 +117,7 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | **Spoken-only mentions undetectable.** A user who records a voice memo *saying* "Hey Hermes" without typing `@` or using the tagging UI produces a transcript with no `@[name](guid)` markup and no entry in `tagged_user_ids`. The mention is invisible to the gate. | Voice users in group channels who don't use the tagging UI can't reach the bot. | No resolution planned for v1 — would require CV to detect mentions in spoken audio server-side. Voice memos *with* UI tagging work today via the `tagged_user_ids` field (deployed Q2 2026). |
 | **No multi-user awareness in group channels.** Each user has an isolated session with the bot (`group_sessions_per_user=true` by default). The agent cannot reference what other participants said — it can't say "as Thomas mentioned earlier…" because Thomas's messages never enter Cristian's session history. | In group conversations the bot replies one-to-one even though humans perceive it as a multi-party discussion. | Set `SessionSource.thread_id` to the lane anchor; threads default to `thread_sessions_per_user=false` so all participants share one session. Hermes core then prefixes every user message with `[sender name]` ([run.py:6704](https://github.com/NousResearch/hermes-agent/blob/main/gateway/run.py#L6704)) and the agent attributes accordingly. Pairs with thread memory below — both need the same thread_id computation. |
 | **No thread memory.** Every message in a group channel requires re-mention. A user mentioning the bot, then sending a follow-up in the same thread without re-mentioning, gets silence. | Conversational UX in groups is choppy. | Next-branch feature. Track engaged thread roots + outbound message ids in adapter state, pass booleans to the gate. Design sketched in §5. |
-| **No deep-thread anchor walking.** Threads of depth >2 may mis-identify the "thread root." | Rare in CV in practice; affects nested reply chains. | Acceptable for v1 of thread memory. Resolution would be caching `parent_id → root_id` mappings or fetching the chain on first encounter. |
+| ~~**No deep-thread anchor walking.**~~ ✅ **Not applicable to Carbon Voice.** CV enforces flat replies — the Flutter client's [`Message.getTopLevelGuid()`](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_domain/lib/message/models/message.dart) returns `parent_message_id` (or self if top-level) without walking, and the [send queue](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_data/lib/message/message_send_queue.dart) explicitly redirects any reply targeting a non-top-level message back to its parent. Backend rejects depth-2+ replies with `400 "You cannot reply to a message that is a reply"`. So `parent_message_id` is always the true thread root — no walking, no cache needed in the plugin. | — | — |
 | **Text-only.** Voice messages are transcribed before delivery; attachments (`audio_url`, `attachments[]`) are not surfaced to the agent. | Agent can't "see" images, original audio, or document content. | Requires implementing `media_urls` / `media_types` in `_process_message`, downloading attachments via Hermes' `cache_*_from_url` helpers. Scope decision pending. |
 | **No streaming replies.** `edit_message()` is not implemented; the agent's reply is delivered as a single complete message after thinking. | Long-running responses feel laggy with no "thinking" indicator. | Requires CV backend support for `PATCH /v3/messages/{id}` (verify) plus `edit_message()` override in the adapter. |
 | **No interrupt support.** `/stop`, `/new`, `/reset` commands from CV won't cancel an in-flight agent run. | Users can't abort runaway responses. | Implement `interrupt_session_activity()`. |
@@ -290,12 +290,14 @@ Today `SessionSource.thread_id` is never set (`adapter.py:380`):
 ### 7.4 Target behavior
 
 For group channels, compute a "lane anchor" from CV's reply tree and use it
-as `thread_id`:
+as `thread_id`. Because CV enforces flat replies (see §4 — frontend redirects
+non-top-level replies via `getTopLevelGuid()`, backend rejects depth-2+ with
+HTTP 400), `parent_message_id` is **always the true thread root**. No walking
+or caching is required:
 
 ```python
-# Lane anchor: top-level messages are their own root; replies use the parent.
-# v1 uses the direct parent (acceptable per §4 deep-thread limitation).
-# v2 walks up to the true root with a parent_id → root_id cache.
+# Lane anchor: top-level messages are their own root; replies use parent_message_id,
+# which CV guarantees is the top-level root (never a nested reply).
 thread_id = parent_message_id if parent_message_id else message_id
 
 source = SessionSource(
@@ -325,7 +327,7 @@ some are misplaced. Consolidate them in a new `ConversationTracker`:
 | Display names | per-user | process | `users.py` (`UserCache`) | keep |
 | Seen messages (dedup) | per-message | TTL ~10m | `dedupe.py` (`SeenCache`) | keep |
 | Outbound reply anchor | **per-thread** | process | `adapter._last_inbound_msg` keyed by `channel_id` ⚠️ | **move + rekey** |
-| Thread root (parent→root) | per-message | process, LRU | — | **add** |
+| ~~Thread root (parent→root)~~ | ~~per-message~~ | ~~process, LRU~~ | ~~—~~ | ~~**add**~~ — **not needed**, CV is flat (§4) |
 | Engaged threads | per-thread | TTL ~30m, LRU | — | **add** |
 | Outbound message ids (bot's own) | per-message | LRU ~1000 | — | **add** |
 | Parent transcript cache | per-message | LRU ~128 | — | **add** |
@@ -348,10 +350,11 @@ class ConversationTracker:
     ):
         ...
 
-    # Thread resolution
-    async def resolve_thread_root(
-        self, msg: dict, api: CarbonVoiceAPI
-    ) -> str: ...
+    # Thread resolution — synchronous one-liner because CV enforces flat
+    # replies (§4): `parent_message_id` is always the true thread root, no
+    # API calls or walking needed.
+    @staticmethod
+    def thread_id_of(msg: dict) -> str: ...
 
     # Engagement
     def mark_engaged(self, thread_id: str) -> None: ...
@@ -413,7 +416,7 @@ config.
 
 | Decision | Options | Default chosen | Revisit when |
 |---|---|---|---|
-| Thread root resolution | (a) direct parent, (b) walk-up with cache | **(a) v1** | deep-reply chains become common in dogfood |
+| Thread root resolution | (a) direct parent, (b) walk-up with cache | **(a) — there is no (b)**: CV enforces flat replies, `parent_message_id` IS the root (§4) | — (CV's data model would have to fundamentally change) |
 | Engagement TTL | 30m / 1h / 4h / no TTL | **30 min** | observe operator complaints about re-mentioning |
 | Engagement persistence | in-memory / disk | **in-memory** | restart frequency increases |
 | Reply anchor key | channel_id / thread_id | **thread_id** | — (fix the latent bug) |
