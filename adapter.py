@@ -197,63 +197,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        # Resolve the reply anchor. CV requires ``reply_to`` to be a
-        # top-level message — it returns ``400 "cannot reply to a
-        # message that is a reply"`` if pointed at anything that has a
-        # parent. Hermes core's default ``_reply_anchor_for_event``
-        # (gateway/platforms/base.py:99) passes ``event.message_id``
-        # (the inbound message that triggered the run) as ``reply_to``,
-        # which is itself a reply whenever the inbound is a follow-up
-        # within a thread — so trusting it produces 400s on every
-        # second/third turn in a group thread.
+        # v5 transport: pass ``thread_id`` directly to the server. The CV
+        # team's design intent — "Just always reply to thread_id when
+        # wanting to do thread; eliminate client guessing" — means the
+        # server resolves the threading; no client-side reply-anchor
+        # lookup is required.
         #
-        # Preference order:
+        # ``thread_id`` priority:
         #   1. ``metadata['thread_id']`` — populated by Hermes core from
-        #      ``SessionSource.thread_id`` via ``_thread_metadata_for_source``.
-        #      The tracker stores ``reply_anchors[thread_id]`` = the
-        #      thread root (CV is flat per §4 — parent_message_id IS
-        #      the root), which is guaranteed top-level and accepted by
-        #      the API.
-        #   2. ``reply_to`` from the caller — used when no thread context
-        #      exists (DMs today, since we keep ``thread_id=None`` on DM
+        #      ``SessionSource.thread_id`` for group messages.
+        #   2. ``reply_to`` from the caller — used as a fallback when no
+        #      thread context exists (DMs keep thread_id=None on
         #      ``SessionSource`` to preserve one-session-per-DM-pair).
-        thread_id = (metadata or {}).get("thread_id")
-        if thread_id:
-            reply_target = self._tracker.get_reply_anchor(thread_id) or reply_to
-        else:
-            reply_target = reply_to
+        thread_id = (metadata or {}).get("thread_id") or reply_to
 
         try:
-            data = await self._api.send_message(chat_id, content, reply_to=reply_target)
-            msg_id = first_str(data.get("message_id"), data.get("id"))
+            data = await self._api.send_text_v5(
+                conversation_id=chat_id,
+                transcript=content,
+                thread_id=thread_id,
+            )
+            msg_id = first_str(data.get("id"), data.get("message_id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
             body = exc.response.text if exc.response is not None else ""
-
-            # Safety net: if CV rejects our reply_to because the target is
-            # itself a reply, drop the anchor and retry as a top-level
-            # message. Covers stale state from before the lane-anchor fix
-            # and any future drift between our cache and CV's tree.
-            if (
-                status == 400
-                and reply_target
-                and "cannot reply to a message that is a reply" in body.lower()
-            ):
-                logger.warning(
-                    "carbonvoice: stale reply anchor %s — retrying as top-level",
-                    reply_target,
-                )
-                # Drop the tracker entry pointing at the stale anchor
-                # so the next send() falls through to a top-level post.
-                self._tracker.clear_reply_anchor(reply_target)
-                try:
-                    data = await self._api.send_message(chat_id, content, reply_to=None)
-                    msg_id = first_str(data.get("message_id"), data.get("id"))
-                    return SendResult(success=True, message_id=msg_id, raw_response=data)
-                except Exception as exc2:
-                    return SendResult(success=False, error=f"top-level retry failed: {exc2}")
-
             return SendResult(
                 success=False,
                 error=f"HTTP {status}: {body[:500]}",
@@ -266,6 +234,145 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        path: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a voice memo via ``POST /v5/messages/audio`` (multipart).
+
+        ``path`` is a local audio file. CV transcribes it server-side and
+        threads the resulting message using ``thread_id`` from metadata
+        (same resolution rules as :meth:`send`).
+        """
+        if self._api is None:
+            return SendResult(success=False, error="adapter not connected")
+        thread_id = (metadata or {}).get("thread_id") or reply_to
+        try:
+            data = await self._api.send_audio_v5(
+                conversation_id=chat_id,
+                audio_path=path,
+                thread_id=thread_id,
+            )
+            msg_id = first_str(data.get("id"), data.get("message_id"))
+            return SendResult(success=True, message_id=msg_id, raw_response=data)
+        except FileNotFoundError as exc:
+            return SendResult(success=False, error=str(exc))
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            body = exc.response.text if exc.response is not None else ""
+            return SendResult(
+                success=False,
+                error=f"HTTP {status}: {body[:500]}",
+                retryable=status in (408, 429, 500, 502, 503, 504),
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an image attachment via ``POST /v5/messages/attachment``.
+
+        ``image_url`` must be a publicly-resolvable URL (the v5 attachment
+        endpoint is URL-based; binary uploads aren't supported here).
+        ``caption``, if provided, becomes the message transcript via a
+        follow-up :meth:`send` so the agent's text accompanies the image.
+
+        Local file paths are not supported in this v1 — callers needing
+        local-file uploads should use :meth:`send_image_file` (currently
+        unimplemented; see :class:`BasePlatformAdapter` for the default
+        no-op).
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            url=image_url,
+            attachment_type="image",
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a document attachment via ``POST /v5/messages/attachment``.
+
+        ``path`` must be a publicly-resolvable URL (the v5 attachment
+        endpoint is URL-based). Local file paths are not supported in
+        this v1 — see :meth:`send_image` for the same rationale.
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            url=path,
+            attachment_type="document",
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def _send_attachment(
+        self,
+        *,
+        chat_id: str,
+        url: str,
+        attachment_type: str,
+        caption: Optional[str],
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        if self._api is None:
+            return SendResult(success=False, error="adapter not connected")
+        if not url:
+            return SendResult(success=False, error="attachment URL required")
+
+        thread_id = (metadata or {}).get("thread_id") or reply_to
+        attachments = [{"type": attachment_type, "link": url}]
+
+        try:
+            data = await self._api.send_attachment_v5(
+                conversation_id=chat_id,
+                attachments=attachments,
+                thread_id=thread_id,
+            )
+            msg_id = first_str(data.get("id"), data.get("message_id"))
+            # When the caller passed a caption, follow up with a text
+            # message in the same thread so the agent's voice accompanies
+            # the attachment instead of leaving the user to guess context.
+            if caption and caption.strip():
+                await self.send(
+                    chat_id=chat_id,
+                    content=caption,
+                    metadata={"thread_id": thread_id} if thread_id else None,
+                )
+            return SendResult(success=True, message_id=msg_id, raw_response=data)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            body = exc.response.text if exc.response is not None else ""
+            return SendResult(
+                success=False,
+                error=f"HTTP {status}: {body[:500]}",
+                retryable=status in (408, 429, 500, 502, 503, 504),
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "carbonvoice", "chat_id": chat_id}
