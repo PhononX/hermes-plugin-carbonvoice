@@ -256,8 +256,9 @@ jobs:
               'send_text_v5',          # v5 outbound text
               'send_audio_v5',         # v5 outbound audio (multipart)
               'send_attachment_v5',    # v5 outbound attachments (URL-based)
-              'get_message_v5',        # v5 fetch single (for PR 4)
-              'get_messages_by_ids_v5',# v5 batch fetch (for PR 4)
+              'get_message_v5',        # v5 fetch single
+              'get_messages_by_ids_v5',# v5 batch fetch (PR 4 thread context)
+              'list_channel_message_index',  # v3 channel index (PR 4)
               'get_message',           # legacy v3 single fetch (kept)
               'get_channel',           # channel metadata
               'whoami', 'fetch_recent', 'fetch_reactions', 'react', 'mark_read',
@@ -265,6 +266,33 @@ jobs:
           ):
               assert hasattr(CarbonVoiceAPI, method), f'CarbonVoiceAPI is missing {method}'
           print(f'CarbonVoiceAPI surface: {sum(1 for m in dir(CarbonVoiceAPI) if not m.startswith("_"))} public methods')
+
+          # PR 4 — thread-context cache on ConversationTracker:
+          # TTL eviction (entries past ttl_s return None) + LRU eviction
+          # (max_thread_context bounds the live set) + clear() path.
+          # The cache is what stops the adapter re-fetching the channel
+          # index + by-ids batch on every @mention in a hot thread, so
+          # regressions here would silently hammer the CV API.
+          import time as _time
+          tc = ConversationTracker(api=None, max_thread_context=2, thread_context_ttl_s=1800)
+          assert tc.get_cached_thread_context('thr1') is None
+          tc.set_cached_thread_context('thr1', 'hello')
+          assert tc.get_cached_thread_context('thr1') == 'hello'
+          # LRU: max_thread_context=2, three inserts → first one evicted.
+          tc.set_cached_thread_context('thr2', 'world')
+          tc.set_cached_thread_context('thr3', 'evict')
+          assert tc.get_cached_thread_context('thr1') is None
+          assert tc.get_cached_thread_context('thr3') == 'evict'
+          tc.clear_cached_thread_context('thr3')
+          assert tc.get_cached_thread_context('thr3') is None
+          # Empty thread_id is silently ignored on both read and write.
+          tc.set_cached_thread_context('', 'noop')
+          assert tc.get_cached_thread_context(None) is None
+          # TTL=0 → immediate expiry on the next read.
+          tc_ttl = ConversationTracker(api=None, thread_context_ttl_s=0)
+          tc_ttl.set_cached_thread_context('x', 'v')
+          _time.sleep(0.01)
+          assert tc_ttl.get_cached_thread_context('x') is None
 
           print('smoke tests OK')
           PY
