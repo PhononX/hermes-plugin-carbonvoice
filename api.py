@@ -92,7 +92,14 @@ class CarbonVoiceAPI:
         content: str,
         reply_to: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """POST /v3/messages/start. Returns the parsed response dict on 2xx."""
+        """POST /v3/messages/start — legacy. Prefer ``send_text_v5``.
+
+        Kept for compatibility with code paths that still pass through the v3
+        contract. New code should use ``send_text_v5`` which accepts
+        ``thread_id`` directly (no reply-anchor resolution required) and
+        uses ``idempotency_key`` instead of the deprecated
+        ``unique_client_id``.
+        """
         client = self._require_client()
         body: Dict[str, Any] = {
             "unique_client_id": str(uuid.uuid4()),
@@ -106,6 +113,150 @@ class CarbonVoiceAPI:
         resp = await client.post("/v3/messages/start", json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
+
+    # ── v5 transport ────────────────────────────────────────────────────
+    #
+    # The v5 endpoints replace the v3 contract with cleaner naming
+    # (``thread_id`` as the preferred public field, ``idempotency_key``
+    # in place of ``unique_client_id``) and split create paths by media
+    # kind: ``/text``, ``/audio`` (multipart), and ``/attachment`` (URLs).
+    #
+    # The CV team's design intent — "Just always reply to ``thread_id``
+    # when wanting to do thread; eliminate client guessing" — is encoded
+    # natively in these endpoints. Callers pass ``thread_id`` from the
+    # inbound message (``ConversationTracker.thread_id_of(msg)``) and the
+    # server resolves the rest. No reply-anchor lookup needed.
+
+    async def send_text_v5(
+        self,
+        conversation_id: str,
+        transcript: str,
+        thread_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v5/messages/text — create a text message in a conversation.
+
+        Returns the created MessageV5 dict on 2xx. ``thread_id`` is the
+        preferred field for threading (see module docstring); pass
+        ``None`` for a new top-level post.
+        """
+        client = self._require_client()
+        body: Dict[str, Any] = {
+            "conversation_id": conversation_id.strip(),
+            "transcript": transcript,
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+        }
+        if thread_id:
+            body["thread_id"] = str(thread_id)
+        resp = await client.post("/v5/messages/text", json=body)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    async def send_audio_v5(
+        self,
+        conversation_id: str,
+        audio_path: str,
+        thread_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """POST /v5/messages/audio — multipart upload of an audio file.
+
+        Sends two parts: ``payload`` (JSON with conversation_id /
+        thread_id / idempotency_key / duration) and ``audio_file`` (the
+        raw bytes of the file at ``audio_path``). The server transcribes
+        and threads the resulting message; returns the created
+        MessageV5 dict on 2xx.
+
+        For Hermes' ``send_voice`` adapter override.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        client = self._require_client()
+        path = _Path(audio_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"audio file not found: {path}")
+
+        payload: Dict[str, Any] = {
+            "conversation_id": conversation_id.strip(),
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+        }
+        if thread_id:
+            payload["thread_id"] = str(thread_id)
+        if duration_ms is not None:
+            payload["duration"] = int(duration_ms)
+
+        with path.open("rb") as fh:
+            files = {
+                "payload": (None, _json.dumps(payload), "application/json"),
+                "audio_file": (path.name, fh.read(), "application/octet-stream"),
+            }
+            resp = await client.post("/v5/messages/audio", files=files)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    async def send_attachment_v5(
+        self,
+        conversation_id: str,
+        attachments: List[Dict[str, Any]],
+        thread_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v5/messages/attachment — create a message with link attachments.
+
+        ``attachments`` is a list of ``V5RequestAttachmentPayload`` dicts
+        (``{type, link, idempotency_key?, ...}``). The CV API expects
+        each attachment to reference an already-hosted resource by URL;
+        binary uploads via this endpoint are not supported (use
+        ``send_audio_v5`` for audio, or host the file elsewhere first and
+        pass the URL here).
+
+        For Hermes' ``send_image`` / ``send_document`` adapter overrides
+        when the caller passes a URL.
+        """
+        client = self._require_client()
+        body: Dict[str, Any] = {
+            "conversation_id": conversation_id.strip(),
+            "attachments": attachments,
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+        }
+        if thread_id:
+            body["thread_id"] = str(thread_id)
+        resp = await client.post("/v5/messages/attachment", json=body)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """GET /v5/messages/{id} — returns the MessageV5 dict or None on 4xx.
+
+        Same shape as ``GET /v3/messages/{id}`` but with ``thread_id`` as
+        the preferred public field and ``parent_message_id`` as the
+        deprecated alias. Used by future memory wiring to fetch full
+        thread context on @mention without local buffering.
+        """
+        client = self._require_client()
+        resp = await client.get(f"/v5/messages/{message_id}")
+        if resp.status_code >= 400:
+            return None
+        return resp.json() if resp.content else None
+
+    async def get_messages_by_ids_v5(
+        self, message_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """POST /v5/messages/by-ids — batch fetch of multiple MessageV5s.
+
+        Used by future memory wiring to fetch all replies in a thread
+        efficiently after resolving the parent ids from a single
+        ``get_message_v5`` call.
+        """
+        if not message_ids:
+            return []
+        client = self._require_client()
+        resp = await client.post("/v5/messages/by-ids", json={"ids": message_ids})
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("messages", []) if isinstance(data, dict) else []
 
     async def fetch_reactions(self) -> List[Dict[str, Any]]:
         """GET /reactions — returns the workspace's available reactions."""
