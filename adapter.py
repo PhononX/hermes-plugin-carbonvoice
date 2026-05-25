@@ -197,20 +197,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        # Resolve the reply anchor. Preference order:
-        #   1. Explicit ``reply_to`` from the caller (rare).
-        #   2. ``metadata['thread_id']`` — populated by Hermes core via
-        #      ``gateway/platforms/base.py::_thread_metadata_for_source``
-        #      from ``SessionSource.thread_id``. The tracker's per-thread
-        #      anchor closes the §7.6 latent bug end-to-end: parallel
-        #      threads in the same channel now resolve their own
-        #      anchors instead of trampling on a shared channel-keyed
-        #      slot.
-        reply_target = reply_to
-        if not reply_target:
-            thread_id = (metadata or {}).get("thread_id")
-            if thread_id:
-                reply_target = self._tracker.get_reply_anchor(thread_id)
+        # Resolve the reply anchor. CV requires ``reply_to`` to be a
+        # top-level message — it returns ``400 "cannot reply to a
+        # message that is a reply"`` if pointed at anything that has a
+        # parent. Hermes core's default ``_reply_anchor_for_event``
+        # (gateway/platforms/base.py:99) passes ``event.message_id``
+        # (the inbound message that triggered the run) as ``reply_to``,
+        # which is itself a reply whenever the inbound is a follow-up
+        # within a thread — so trusting it produces 400s on every
+        # second/third turn in a group thread.
+        #
+        # Preference order:
+        #   1. ``metadata['thread_id']`` — populated by Hermes core from
+        #      ``SessionSource.thread_id`` via ``_thread_metadata_for_source``.
+        #      The tracker stores ``reply_anchors[thread_id]`` = the
+        #      thread root (CV is flat per §4 — parent_message_id IS
+        #      the root), which is guaranteed top-level and accepted by
+        #      the API.
+        #   2. ``reply_to`` from the caller — used when no thread context
+        #      exists (DMs today, since we keep ``thread_id=None`` on DM
+        #      ``SessionSource`` to preserve one-session-per-DM-pair).
+        thread_id = (metadata or {}).get("thread_id")
+        if thread_id:
+            reply_target = self._tracker.get_reply_anchor(thread_id) or reply_to
+        else:
+            reply_target = reply_to
 
         try:
             data = await self._api.send_message(chat_id, content, reply_to=reply_target)
