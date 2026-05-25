@@ -133,6 +133,7 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_REQUIRE_MENTION` | `true` | In group channels, only respond when the agent is `@`-mentioned. DMs are always processed. Set to `false` to make the bot respond to every message in every channel it can see (the pre-gate behavior — useful for personal-bot setups). |
 | `CARBONVOICE_FREE_RESPONSE_CHANNELS` | _(unset)_ | Comma-separated `channel_guid`s where the agent always responds, regardless of mention. Useful for channels dedicated to the bot. |
 | `CARBONVOICE_IGNORED_CHANNELS` | _(unset)_ | Comma-separated `channel_guid`s where the agent **never** responds, even when mentioned. Hard veto — also applies to DMs if the channel guid is listed. |
+| `CARBONVOICE_SHARED_GROUP_SESSIONS` | `false` | When `true`, all participants in a group channel share one session with the agent even outside of threads. Default `false` — sessions are already shared per thread (Hermes automatically adds `[sender name]` prefixes to each user message so the agent can attribute statements). Set `true` for bot-room channels where strict per-user isolation isn't wanted. |
 
 ### Mention behavior
 

@@ -84,3 +84,7 @@ optional_env:
     description: "Comma-separated channel_guids where the agent NEVER responds, even when mentioned (hard veto, applies to DMs too)."
     prompt: "Ignored channel_guids (comma-separated, blank to skip)"
     password: false
+  - name: CARBONVOICE_SHARED_GROUP_SESSIONS
+    description: "When true, all participants in a group channel share one session with the agent even outside of threads (flips group_sessions_per_user=false). Default false — sessions are already shared per thread (Hermes adds [sender name] prefixes automatically). Set true for bot-room channels where strict per-user isolation isn't wanted."
+    prompt: "Share group sessions across all participants? (true/false)"
+    password: false

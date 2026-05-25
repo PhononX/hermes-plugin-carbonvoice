@@ -238,5 +238,13 @@ jobs:
               assert api.calls == 2
           asyncio.run(_tracker_async())
 
+          # Note: setup._env_enablement (which seeds group_sessions_per_user
+          # from CARBONVOICE_SHARED_GROUP_SESSIONS) imports from gateway.*
+          # and so can't run in this gateway-free CI step. The logic is a
+          # one-liner ``if _bool_env('CARBONVOICE_SHARED_GROUP_SESSIONS'):
+          # seed['group_sessions_per_user'] = False`` — covered by the
+          # ``Syntax check all modules`` step and validated end-to-end in
+          # local dogfooding before each PR.
+
           print('smoke tests OK')
           PY

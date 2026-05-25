@@ -92,6 +92,17 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         "ignored_senders_log": os.getenv("CARBONVOICE_IGNORED_SENDERS_LOG") or None,
     }
 
+    # CARBONVOICE_SHARED_GROUP_SESSIONS=true → flip
+    # ``group_sessions_per_user`` to False so every participant in a
+    # group channel shares one session, *regardless of thread_id*. Use
+    # for bot-room channels where strict per-user isolation isn't
+    # wanted. Default behavior already shares sessions within a thread
+    # (because SessionSource.thread_id is now populated for groups);
+    # this knob extends sharing to non-threaded conversations too.
+    # See DEVELOPMENT.md §7.4 / §7.9 for the design rationale.
+    if _bool_env("CARBONVOICE_SHARED_GROUP_SESSIONS"):
+        seed["group_sessions_per_user"] = False
+
     home_channel_id = os.getenv("CARBONVOICE_HOME_CHANNEL")
     if home_channel_id:
         seed["home_channel"] = {
