@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -282,22 +283,17 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an image attachment via ``POST /v5/messages/attachment``.
+        """Attach an image to the conversation.
 
-        ``image_url`` must be a publicly-resolvable URL (the v5 attachment
-        endpoint is URL-based; binary uploads aren't supported here).
-        ``caption``, if provided, becomes the message transcript via a
-        follow-up :meth:`send` so the agent's text accompanies the image.
-
-        Local file paths are not supported in this v1 — callers needing
-        local-file uploads should use :meth:`send_image_file` (currently
-        unimplemented; see :class:`BasePlatformAdapter` for the default
-        no-op).
+        ``image_url`` accepts either a publicly-resolvable URL or a path
+        to a local file. URL → single attachment with ``type:"link"``.
+        Local file → 4-step signed-URL flow (see
+        :meth:`_send_file_or_link`). ``caption`` becomes the transcript
+        on the same bubble — agent text and image arrive together.
         """
-        return await self._send_attachment(
+        return await self._send_file_or_link(
             chat_id=chat_id,
-            url=image_url,
-            attachment_type="image",
+            path_or_url=image_url,
             caption=caption,
             reply_to=reply_to,
             metadata=metadata,
@@ -311,56 +307,166 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a document attachment via ``POST /v5/messages/attachment``.
+        """Attach a document (any non-image file) to the conversation.
 
-        ``path`` must be a publicly-resolvable URL (the v5 attachment
-        endpoint is URL-based). Local file paths are not supported in
-        this v1 — see :meth:`send_image` for the same rationale.
+        Same mechanics as :meth:`send_image` — both go through the
+        ``type:"file"`` attachment shape on CV; the difference is purely
+        in the Hermes core method dispatch. Use this for ``.md``, PDFs,
+        archives, audio clips not meant as voice memos, etc. For voice
+        memos (transcribed server-side) use :meth:`send_voice`.
         """
-        return await self._send_attachment(
+        return await self._send_file_or_link(
             chat_id=chat_id,
-            url=path,
-            attachment_type="document",
+            path_or_url=path,
             caption=caption,
             reply_to=reply_to,
             metadata=metadata,
         )
 
-    async def _send_attachment(
+    # ── Attachment flow (URL or local file) ─────────────────────────────
+    #
+    # Mirrors the Flutter client's pattern: the agent sees its message
+    # appear in the conversation immediately with an "Initializing"
+    # placeholder, while the actual S3 upload runs in the background and
+    # flips the status to ``Uploaded`` (or ``Failed``) when it settles.
+    #
+    # URL inputs skip the upload entirely — they just attach the URL
+    # with ``type:"link"`` since the file is already hosted somewhere
+    # the recipient can fetch.
+
+    @staticmethod
+    def _is_url(path_or_url: str) -> bool:
+        return path_or_url.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _guess_mime(path: Path) -> str:
+        """Best-effort MIME type from filename extension.
+
+        ``mimetypes`` ships a tiny built-in DB plus the system's
+        ``/etc/mime.types``. We add ``.md`` → ``text/markdown`` because
+        the stdlib still classifies markdown as ``text/x-markdown`` on
+        some platforms and ``None`` on others; ``text/markdown`` is the
+        IANA-registered form (RFC 7763) and what the agent's tooling
+        will actually produce.
+        """
+        if path.suffix.lower() == ".md":
+            return "text/markdown"
+        guessed, _ = mimetypes.guess_type(str(path))
+        return guessed or "application/octet-stream"
+
+    async def _send_file_or_link(
         self,
         *,
         chat_id: str,
-        url: str,
-        attachment_type: str,
+        path_or_url: str,
         caption: Optional[str],
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> SendResult:
         if self._api is None:
             return SendResult(success=False, error="adapter not connected")
-        if not url:
-            return SendResult(success=False, error="attachment URL required")
+        if not path_or_url:
+            return SendResult(success=False, error="attachment path/URL required")
 
         thread_id = (metadata or {}).get("thread_id") or reply_to
-        attachments = [{"type": attachment_type, "link": url}]
+        caption_text = (caption or "").strip()
 
         try:
-            data = await self._api.send_attachment_v5(
-                conversation_id=chat_id,
-                attachments=attachments,
+            if self._is_url(path_or_url):
+                attachment = {"type": "link", "link": path_or_url}
+                data = await self._create_attachment_message(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    caption=caption_text,
+                    attachment=attachment,
+                )
+                msg_id = first_str(data.get("id"), data.get("message_id"))
+                return SendResult(success=True, message_id=msg_id, raw_response=data)
+
+            # Local file: signed URL → message-create with Initializing →
+            # background S3 PUT + status update.
+            path = Path(path_or_url).expanduser()
+            if not path.is_file():
+                return SendResult(
+                    success=False, error=f"file not found: {path}",
+                )
+            mime_type = self._guess_mime(path)
+            filename = path.name
+
+            urls = await self._api.get_signed_upload_urls(
+                [{"filename": filename, "mimetype": mime_type}],
+            )
+            if not urls or not urls[0].get("url"):
+                return SendResult(
+                    success=False,
+                    error="signedurl: empty response from /v3/attachments/signedurl",
+                )
+            signed_url = urls[0]["url"]
+            canonical_link = signed_url.split("?", 1)[0]
+
+            attachment = {
+                "type": "file",
+                "link": canonical_link,
+                "filename": filename,
+                "mime_type": mime_type,
+                "status": "Initializing",
+                "percent_complete": 0,
+            }
+            try:
+                attachment["length_in_bytes"] = path.stat().st_size
+            except OSError:
+                pass  # non-fatal; server tolerates missing size
+
+            data = await self._create_attachment_message(
+                chat_id=chat_id,
                 thread_id=thread_id,
+                caption=caption_text,
+                attachment=attachment,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
-            # When the caller passed a caption, follow up with a text
-            # message in the same thread so the agent's voice accompanies
-            # the attachment instead of leaving the user to guess context.
-            if caption and caption.strip():
-                await self.send(
-                    chat_id=chat_id,
-                    content=caption,
-                    metadata={"thread_id": thread_id} if thread_id else None,
+
+            # Find the just-created attachment id in the response so the
+            # background task can flip its status when S3 settles. The
+            # server returns ``attachments[]`` in the order we sent them,
+            # so the first/only entry is ours.
+            created_attachments = data.get("attachments") or []
+            attachment_id: Optional[str] = None
+            if created_attachments:
+                first_att = created_attachments[0]
+                if isinstance(first_att, dict):
+                    attachment_id = first_str(
+                        first_att.get("id"), first_att.get("_id"),
+                    )
+
+            if attachment_id:
+                base_body = {
+                    "type": "file",
+                    "link": canonical_link,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                }
+                # Fire-and-forget — survives this method returning.
+                asyncio.create_task(
+                    self._upload_attachment_in_background(
+                        signed_url=signed_url,
+                        file_path=str(path),
+                        mime_type=mime_type,
+                        message_id=msg_id or "",
+                        attachment_id=attachment_id,
+                        base_body=base_body,
+                    )
                 )
+            else:
+                logger.warning(
+                    "carbonvoice: no attachment id in response for %s — "
+                    "skipping background upload + status update (message "
+                    "will show 'Initializing' indefinitely on the recipient)",
+                    filename,
+                )
+
             return SendResult(success=True, message_id=msg_id, raw_response=data)
+        except FileNotFoundError as exc:
+            return SendResult(success=False, error=str(exc))
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
             body = exc.response.text if exc.response is not None else ""
@@ -373,6 +479,97 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc), retryable=True)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
+
+    async def _create_attachment_message(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+        caption: str,
+        attachment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create the message that carries *attachment*.
+
+        Routes based on whether the caller supplied a caption:
+          - caption present → ``POST /v5/messages/text`` with
+            ``transcript`` + ``attachments`` (the server requires
+            ``transcript`` to be non-empty on this endpoint).
+          - caption absent → ``POST /v5/messages/attachment``
+            (attachment-only message, no transcript).
+        """
+        if caption:
+            return await self._api.send_text_v5(
+                conversation_id=chat_id,
+                transcript=caption,
+                thread_id=thread_id,
+                attachments=[attachment],
+            )
+        return await self._api.send_attachment_v5(
+            conversation_id=chat_id,
+            attachments=[attachment],
+            thread_id=thread_id,
+        )
+
+    async def _upload_attachment_in_background(
+        self,
+        *,
+        signed_url: str,
+        file_path: str,
+        mime_type: str,
+        message_id: str,
+        attachment_id: str,
+        base_body: Dict[str, Any],
+    ) -> None:
+        """Push the bytes to S3 then flip the attachment status.
+
+        Runs detached from ``send_document``/``send_image`` so the agent
+        gets ``SendResult(success=True)`` immediately — the recipient
+        sees the message bubble appear with an ``Initializing``
+        placeholder and the file fills in once S3 acks. Mirrors how the
+        Flutter client behaves on send.
+
+        On S3 failure we PUT ``status:"Failed"`` so the recipient's UI
+        renders a clear error state rather than a perpetual spinner.
+        Both branches are wrapped in try/except — a transient failure on
+        the status-update PUT must not crash the gateway event loop.
+        """
+        try:
+            await self._api.upload_to_s3(signed_url, file_path, mime_type)
+        except Exception as exc:
+            logger.warning(
+                "carbonvoice: S3 upload failed for %s (msg=%s att=%s): %s",
+                file_path, message_id, attachment_id, exc,
+            )
+            try:
+                await self._api.update_attachment(
+                    message_id,
+                    attachment_id,
+                    {**base_body, "status": "Failed", "percent_complete": 0},
+                )
+            except Exception as inner:
+                logger.warning(
+                    "carbonvoice: update_attachment(Failed) also failed for "
+                    "%s: %s", attachment_id, inner,
+                )
+            return
+
+        try:
+            await self._api.update_attachment(
+                message_id,
+                attachment_id,
+                {**base_body, "status": "Uploaded", "percent_complete": 100},
+            )
+            logger.info(
+                "carbonvoice: attachment uploaded — msg=%s att=%s file=%s",
+                message_id, attachment_id, file_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "carbonvoice: update_attachment(Uploaded) failed for %s: %s — "
+                "S3 upload itself succeeded; recipient may see stale "
+                "'Initializing' status",
+                attachment_id, exc,
+            )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "carbonvoice", "chat_id": chat_id}
