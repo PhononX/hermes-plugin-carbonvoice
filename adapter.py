@@ -377,6 +377,249 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "carbonvoice", "chat_id": chat_id}
 
+    # ── Thread-context fetch (PR 4) ──────────────────────────────────────
+    #
+    # When the agent gets @mentioned in a group thread for the first time
+    # (no Hermes session yet for that thread), we have no history to feed
+    # the LLM — it sees one isolated message and has to guess at context.
+    # We fetch the thread's prior messages via CV's REST API and prepend
+    # them as a ``[Thread context …]`` block to the user's message so
+    # the agent has the prior history from turn 1.
+    #
+    # The "no active session" guard means this only fires on the first
+    # turn in any given thread; every subsequent turn rides on the session
+    # history that Hermes core maintains in SQLite, so there is no
+    # duplication.
+    #
+    # CV has no native "list messages in thread" endpoint today, so we
+    # combine two calls — a lightweight channel index (just ids +
+    # ``parent_message_id``) plus a batched ``by-ids`` fetch — to assemble
+    # the thread's transcript. When cv-api adds a direct thread-listing
+    # endpoint the workaround collapses to one call; see
+    # ``api.list_channel_message_index`` for the full rationale.
+
+    def _has_active_session_for_thread(
+        self,
+        channel_id: str,
+        thread_id: str,
+        user_id: str,
+    ) -> bool:
+        """Return True when a Hermes session already covers this thread.
+
+        Uses ``build_session_key()`` as the single source of truth so the
+        key respects ``group_sessions_per_user`` /
+        ``thread_sessions_per_user`` exactly the way Hermes core does at
+        message-routing time. A drift here would mean we'd inject thread
+        context on a turn where Hermes already has session history,
+        duplicating the parent in every prompt.
+        """
+        session_store = getattr(self, "_session_store", None)
+        if not session_store:
+            return False
+        try:
+            from gateway.session import build_session_key
+
+            store_cfg = getattr(session_store, "config", None)
+            gspu = (
+                getattr(store_cfg, "group_sessions_per_user", True)
+                if store_cfg
+                else True
+            )
+            tspu = (
+                getattr(store_cfg, "thread_sessions_per_user", False)
+                if store_cfg
+                else False
+            )
+
+            source = SessionSource(
+                platform=Platform("carbonvoice"),
+                chat_id=channel_id,
+                chat_type="group",
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=gspu,
+                thread_sessions_per_user=tspu,
+            )
+
+            ensure = getattr(session_store, "_ensure_loaded", None)
+            if callable(ensure):
+                ensure()
+            entries = getattr(session_store, "_entries", None) or {}
+            return session_key in entries
+        except Exception:
+            return False
+
+    async def _fetch_thread_context(
+        self,
+        channel_id: str,
+        thread_id: str,
+        current_msg_id: str,
+        *,
+        limit: int = 30,
+    ) -> str:
+        """Return a formatted ``[Thread context …]`` prefix for *thread_id*.
+
+        Returns ``""`` (empty string) on any failure or when the thread
+        has no prior content — callers should treat empty as "nothing to
+        prepend" and pass the original user text through unchanged.
+
+        Steps:
+          1. Cache hit via :meth:`ConversationTracker.get_cached_thread_context`.
+          2. ``api.list_channel_message_index`` → ids + ``parent_message_id``.
+          3. Client-side filter to thread (root + replies whose
+             ``parent_message_id == thread_id``).
+          4. ``api.get_messages_by_ids_v5`` for the last ``limit``
+             transcripts in chronological order.
+          5. Exclude the current triggering message (it will be delivered
+             as the user message itself) and exclude our own prior bot
+             replies (circular context — feeding them back creates an
+             echo that the LLM tends to repeat).
+          6. Format ``[thread parent] name: text`` for the root and
+             ``name: text`` for replies, wrap in the standard delimiters,
+             cache, return.
+        """
+        if self._api is None or not thread_id:
+            return ""
+
+        cached = self._tracker.get_cached_thread_context(thread_id)
+        if cached is not None:
+            return cached
+
+        try:
+            index = await self._api.list_channel_message_index(
+                channel_id, limit=200, direction="older"
+            )
+        except Exception as exc:
+            logger.debug(
+                "carbonvoice: list_channel_message_index(%s) failed: %s",
+                channel_id, exc,
+            )
+            return ""
+
+        if not index:
+            return ""
+
+        # Pick out items in this thread: the root and its direct replies.
+        # CV is flat (DEVELOPMENT.md §4) so a single equality check on
+        # ``parent_message_id`` covers every sibling — no walk needed.
+        thread_items = []
+        for item in index:
+            mid = first_str(
+                item.get("message_id"), item.get("_id"), item.get("id"),
+            )
+            if not mid:
+                continue
+            parent = first_str(
+                item.get("parent_message_id"),
+                item.get("parent_message_guid"),
+                item.get("thread_id"),
+            )
+            is_root = mid == thread_id
+            is_sibling = parent == thread_id
+            if not (is_root or is_sibling):
+                continue
+            if mid == current_msg_id:
+                continue
+            thread_items.append((mid, item, is_root))
+
+        if not thread_items:
+            # Cache the empty result so we don't refetch on every turn
+            # in an otherwise empty thread.
+            self._tracker.set_cached_thread_context(thread_id, "")
+            return ""
+
+        # Order chronologically. The index endpoint returns ``created_at``
+        # as either ISO or epoch ms depending on call; sort lexically when
+        # string and numerically when number — both give the right order.
+        def _ts(entry):
+            ts = entry[1].get("created_at") or entry[1].get("created") or 0
+            return ts
+        thread_items.sort(key=_ts)
+
+        # Cap to ``limit`` most-recent so a long-running thread doesn't
+        # blow the prompt budget. Keep the root if present so context is
+        # anchored even when the tail is large.
+        if len(thread_items) > limit:
+            head = [t for t in thread_items if t[2]][:1]  # the root, if any
+            tail = [t for t in thread_items if not t[2]][-(limit - len(head)):]
+            thread_items = head + tail
+
+        ids = [mid for mid, _, _ in thread_items]
+        try:
+            full = await self._api.get_messages_by_ids_v5(ids)
+        except Exception as exc:
+            logger.debug(
+                "carbonvoice: get_messages_by_ids_v5 for thread context failed: %s",
+                exc,
+            )
+            return ""
+
+        # Index by id so we can preserve our chronological order.
+        full_by_id = {
+            first_str(m.get("id"), m.get("message_id"), m.get("_id")): m
+            for m in (full or [])
+            if isinstance(m, dict)
+        }
+
+        parts = []
+        for mid, item, is_root in thread_items:
+            msg = full_by_id.get(mid)
+            if not msg:
+                continue
+            text = (extract_transcript(msg) or "").strip()
+            if not text:
+                continue
+            creator = extract_creator_id(msg) or item.get("creator_id") or ""
+            # Skip our own prior bot replies — feeding them back as
+            # "[bot]: …" creates a circular context the LLM tends to echo.
+            # Keep the thread parent even when authored by the bot (e.g.
+            # the thread was opened by a cron post we're now replying to).
+            if (
+                creator
+                and self._self_user_id
+                and creator == self._self_user_id
+                and not is_root
+            ):
+                continue
+            name = creator
+            if creator and self._users is not None:
+                try:
+                    name = await self._users.resolve(creator)
+                except Exception:
+                    name = creator
+            name = name or "unknown"
+            # Strip CV's inline @[name](guid) markup for the same reason
+            # we strip it on inbound — the guids are LLM noise.
+            text = strip_inline_mentions(text)
+            prefix = "[thread parent] " if is_root else ""
+            parts.append(f"{prefix}{name}: {text}")
+
+        if not parts:
+            self._tracker.set_cached_thread_context(thread_id, "")
+            return ""
+
+        content = (
+            "[Thread context — prior messages in this thread "
+            "(not yet in conversation history):]\n"
+            + "\n".join(parts)
+            + "\n[End of thread context]\n\n"
+        )
+        self._tracker.set_cached_thread_context(thread_id, content)
+        # INFO so it shows up in default gateway.log — operators need to
+        # see when context was injected to debug "why did the bot know
+        # that?" / "why did the bot miss that?" questions without flipping
+        # to DEBUG. Volume is bounded: fires at most once per thread per
+        # TTL window (subsequent mentions in the same thread hit the
+        # active-session guard and skip this method entirely).
+        logger.info(
+            "carbonvoice: thread context injected for %s — %d prior message(s), %d chars",
+            thread_id, len(parts), len(content),
+        )
+        return content
+
     # ── Inbound processing ───────────────────────────────────────────────
 
     async def _fetch_missed_messages(self) -> None:
@@ -523,6 +766,30 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # a DM should remain one session per pair, not split per top-level
         # message inside the conversation.
         session_thread_id = thread_id if chat_type == "group" else None
+
+        # Thread-context fetch (PR 4): when this is the first @mention in
+        # a group thread (no Hermes session yet), pull the prior messages
+        # so the agent has context from turn 1. Guard with the
+        # "no active session" check so subsequent turns ride on Hermes'
+        # SQLite session history without re-injecting the parent each
+        # time. DMs skip the fetch — their single session already covers
+        # the conversation, and there are no sibling participants whose
+        # context we'd be missing.
+        if (
+            chat_type == "group"
+            and session_thread_id
+            and creator_id
+            and not self._has_active_session_for_thread(
+                channel_id, session_thread_id, creator_id,
+            )
+        ):
+            context_prefix = await self._fetch_thread_context(
+                channel_id=channel_id,
+                thread_id=session_thread_id,
+                current_msg_id=message_id,
+            )
+            if context_prefix:
+                clean_text = context_prefix + clean_text
 
         source = SessionSource(
             platform=Platform("carbonvoice"),

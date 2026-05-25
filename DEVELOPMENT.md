@@ -117,6 +117,8 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | **Spoken-only mentions undetectable.** A user who records a voice memo *saying* "Hey Hermes" without typing `@` or using the tagging UI produces a transcript with no `@[name](guid)` markup and no entry in `tagged_user_ids`. The mention is invisible to the gate. | Voice users in group channels who don't use the tagging UI can't reach the bot. | No resolution planned for v1 — would require CV to detect mentions in spoken audio server-side. Voice memos *with* UI tagging work today via the `tagged_user_ids` field (deployed Q2 2026). |
 | ~~**No multi-user awareness in group channels.**~~ ✅ **Resolved within threads (Q2 2026 PR 2).** `SessionSource.thread_id` is now populated from `ConversationTracker.thread_id_of(msg)` for groups, so all participants in a thread share one session and Hermes core prefixes each user message with `[sender name]` automatically. The agent can attribute statements across users in the same thread. **Outside threads** (top-level posts in a group), per-user isolation remains the default — set `CARBONVOICE_SHARED_GROUP_SESSIONS=true` to extend sharing to non-threaded conversations as well (useful for bot-room channels). | Bot now sees the full multi-party discussion when participants reply within a thread. | — |
 | **No thread memory.** Every message in a group channel requires re-mention. A user mentioning the bot, then sending a follow-up in the same thread without re-mentioning, gets silence. | Conversational UX in groups is choppy. | Next-branch feature. Track engaged thread roots + outbound message ids in adapter state, pass booleans to the gate. Design sketched in §5. |
+| ~~**No engaged-thread context on first @mention.**~~ ✅ **Resolved (Q2 2026 PR 4).** When the agent is @mentioned in a thread for the first time (no Hermes session yet for that thread), `adapter._fetch_thread_context` pulls the prior messages and prepends them as a `[Thread context …]` block so the LLM has history from turn 1. Cached per-thread (TTL 30 min, LRU 200) so re-mentions in a hot thread don't re-hit the API. Subsequent turns ride on Hermes' SQLite session history. | The first @mention in a long-running thread now carries the prior conversation; no more "wait, what are we talking about?" responses. | — |
+| **No native "list messages in thread" endpoint on cv-api.** PR 4's thread-context fetch combines two REST calls (`GET /messages/<channel_id>/index` for ids + `parent_message_id`, then `POST /v5/messages/by-ids` for transcripts) and filters client-side. Works, but pays the index fetch on every cold cache. | One extra index call per thread per TTL window. Negligible for low-volume workspaces; worth optimizing for high-volume ones. | Backend ask: `GET /v5/messages/<thread_id>/replies?limit=N` or extend `getMessageIdsV5` to accept `thread_id` filter. Collapses the workaround to a single call. |
 | ~~**No deep-thread anchor walking.**~~ ✅ **Not applicable to Carbon Voice.** CV enforces flat replies — the Flutter client's [`Message.getTopLevelGuid()`](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_domain/lib/message/models/message.dart) returns `parent_message_id` (or self if top-level) without walking, and the [send queue](https://github.com/PhononX/carbon-voice-flutter/blob/main/packages/cv_data/lib/message/message_send_queue.dart) explicitly redirects any reply targeting a non-top-level message back to its parent. Backend rejects depth-2+ replies with `400 "You cannot reply to a message that is a reply"`. So `parent_message_id` is always the true thread root — no walking, no cache needed in the plugin. | — | — |
 | **Text-only.** Voice messages are transcribed before delivery; attachments (`audio_url`, `attachments[]`) are not surfaced to the agent. | Agent can't "see" images, original audio, or document content. | Requires implementing `media_urls` / `media_types` in `_process_message`, downloading attachments via Hermes' `cache_*_from_url` helpers. Scope decision pending. |
 | **No streaming replies.** `edit_message()` is not implemented; the agent's reply is delivered as a single complete message after thinking. | Long-running responses feel laggy with no "thinking" indicator. | Requires CV backend support for `PATCH /v3/messages/{id}` (verify) plus `edit_message()` override in the adapter. |
@@ -262,7 +264,7 @@ post-2026-05-25 priorities baked in:
 |---|---|---|---|
 | ~~v5 transport~~ | ~~api.py~~ | ~~PR 3~~ ✅ Shipped | `send_text_v5` / `send_audio_v5` / `send_attachment_v5` + `get_message_v5` / `get_messages_by_ids_v5` in api.py. `adapter.send` migrated; new `send_voice` / `send_image` / `send_document` overrides land via v5 endpoints. CV team's "always reply to thread_id" intent encoded — no client reply-anchor lookup. |
 | `edit_message(chat_id, message_id, content, finalize=)` | base.py:1744 | **blocked on backend** | The big UX gap (chain-of-thought as one growing bubble vs N messages). v5 has no PATCH endpoint and `/v5/messages/stream` is for audio uploads, not text editing. The closest path — `PUT /v3/messages/transcript` — is meant for human voice-transcript corrections and requires shoehorning text into `WordsWithTimeCode` format. Needs a backend `PATCH /v5/messages/{id}` (or equivalent) before this can ship cleanly. |
-| Engaged-thread context via API fetch | (custom — adapter-level) | **PR 4** | When `@mention` arrives, fetch the thread's full message history from `GET /v5/messages/<thread_id>` (or v3 equivalent — "get a message with its replies") and inject as context. Survives restarts, survives TTL, no local buffer needed. |
+| ~~Engaged-thread context via API fetch~~ | ~~(custom — adapter-level)~~ | ~~PR 4~~ ✅ Shipped | `adapter._fetch_thread_context` pulls the thread's prior messages on first `@mention` and prepends as `[Thread context …]` block. Combines `list_channel_message_index` + `get_messages_by_ids_v5` (workaround for the missing thread-listing endpoint — see §4). Cached per-thread (TTL 30 min, LRU 200); subsequent turns ride on Hermes' SQLite session. |
 | `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **PR 5** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
 | `interrupt_session_activity(session_key, chat_id)` | base.py:2502 | medium | Needed for `/stop`, `/new`, `/reset` to cancel an in-flight run. |
 | `delete_message` | base.py:1773 | medium | Enables `EphemeralReply` auto-deletion of system notices. |
@@ -507,19 +509,26 @@ was reversed on 2026-05-25 — see §7.0 for the rationale.
   "in-progress" from "finalized" message states (verify).
 - Docs + CI smoke tests for the new client methods.
 
-**PR 4 — engaged-thread context via API fetch.** After PR 3.
-- On every accepted `@mention` in a group thread, call
-  `GET /v5/messages/<thread_id>` (or v3 equivalent — "get a message
-  with its replies") to fetch the full thread history.
-- Inject the history as context for the agent (format TBD —
-  candidates: prepended to the user message, or via a Hermes core
-  session-store API if one exists by then).
-- Result: bot has full thread context from the first turn, without
-  needing local engagement memory, without losing context on restart
-  or TTL expiry.
-- Acknowledges the "agent has context of all messages since first
-  `@mention`" goal from the 2026-05-25 design discussion in a way
-  that's restart-safe and stateless on the plugin side.
+**PR 4 — engaged-thread context via API fetch.** ✅ Shipped.
+- `_fetch_thread_context` runs only on the first accepted `@mention`
+  in a thread — guarded by `_has_active_session_for_thread` so
+  subsequent turns ride on Hermes' SQLite session and don't re-inject
+  the parent each prompt.
+- CV has no native "list messages in thread" endpoint today, so the
+  fetch combines two calls: `GET /messages/<channel_id>/index` for
+  ids + `parent_message_id`, then `POST /v5/messages/by-ids` for the
+  transcripts. Filters our own bot's prior replies (circular
+  context); keeps the thread root even when authored by a bot.
+- Result formatted as `[thread parent] name: text` / `name: text`
+  lines wrapped in `[Thread context — prior messages …]` /
+  `[End of thread context]` delimiters and prepended to the user's
+  message text.
+- Cached per-thread via `ConversationTracker.set_cached_thread_context`
+  (TTL 30 min, LRU 200). Re-mentions in a hot thread reuse the cache;
+  long-quiet threads refetch on the next mention.
+- Backend ask: a dedicated `GET /v5/messages/<thread_id>/replies`
+  (or `getMessageIdsV5` extended with a `thread_id` filter) would
+  collapse the workaround to a single call. Tracked in §4.
 
 **PR 5 — lifecycle hooks refactor.** Pure technical hygiene.
 - Move `reactions.ack` call to `on_processing_start(event)`.

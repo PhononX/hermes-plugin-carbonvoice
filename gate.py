@@ -1,8 +1,7 @@
 """Mention-aware message gate for the Carbon Voice adapter.
 
-Decides whether an inbound message should reach the agent. Mirrors the
-DM-vs-channel split used by Slack/Discord/Telegram adapters in Hermes
-core: DMs always pass; group channels require an @-mention unless the
+Decides whether an inbound message should reach the agent. DMs always
+pass; group channels require an @-mention of the agent unless the
 channel is on a free-response allowlist (or the global mention
 requirement is disabled).
 
