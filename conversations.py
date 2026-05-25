@@ -32,7 +32,9 @@ the full chain of evidence.
 from __future__ import annotations
 
 import logging
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from .api import CarbonVoiceAPI
@@ -48,6 +50,26 @@ logger = logging.getLogger(__name__)
 #    a full transcript string.
 DEFAULT_MAX_REPLY_ANCHORS = 1000
 DEFAULT_MAX_PARENT_TEXT = 128
+# Thread-context cache (PR 4): per-thread formatted prefix that the adapter
+# prepends on the first @mention so the agent has the prior thread history.
+# 30 min mirrors Slack's conservative default — long enough that a quick
+# follow-up reuses the cached context, short enough that a long-quiet
+# thread fetches fresh on the next mention.
+DEFAULT_MAX_THREAD_CONTEXT = 200
+DEFAULT_THREAD_CONTEXT_TTL_S = 1800
+
+
+@dataclass
+class _ThreadContextEntry:
+    """One cached thread-context fetch.
+
+    ``content`` is the formatted prefix string the adapter will prepend to
+    the inbound message text; ``fetched_at`` is monotonic seconds so the
+    TTL check is robust against wall-clock jumps.
+    """
+
+    content: str
+    fetched_at: float
 
 
 class _LRUDict:
@@ -110,10 +132,14 @@ class ConversationTracker:
         *,
         max_reply_anchors: int = DEFAULT_MAX_REPLY_ANCHORS,
         max_parent_text: int = DEFAULT_MAX_PARENT_TEXT,
+        max_thread_context: int = DEFAULT_MAX_THREAD_CONTEXT,
+        thread_context_ttl_s: int = DEFAULT_THREAD_CONTEXT_TTL_S,
     ):
         self._api = api
         self._reply_anchors = _LRUDict(max_reply_anchors)
         self._parent_text = _LRUDict(max_parent_text)
+        self._thread_context = _LRUDict(max_thread_context)
+        self._thread_context_ttl_s = thread_context_ttl_s
 
     # ── Thread resolution ───────────────────────────────────────────
 
@@ -153,6 +179,47 @@ class ConversationTracker:
         if not thread_id:
             return
         self._reply_anchors._data.pop(thread_id, None)
+
+    # ── Parent transcript cache ─────────────────────────────────────
+
+    # ── Thread context cache (PR 4) ─────────────────────────────────
+
+    def get_cached_thread_context(
+        self, thread_id: Optional[str]
+    ) -> Optional[str]:
+        """Return the cached thread-context prefix for *thread_id*.
+
+        Returns ``None`` if not cached, or if the entry has aged past
+        ``thread_context_ttl_s``. The TTL check uses monotonic time so
+        wall-clock jumps don't make entries spuriously valid/invalid.
+        """
+        if not thread_id:
+            return None
+        entry = self._thread_context.get(thread_id)
+        if entry is None:
+            return None
+        if (time.monotonic() - entry.fetched_at) > self._thread_context_ttl_s:
+            # Expired — drop the entry so the LRU slot frees up next eviction
+            self._thread_context._data.pop(thread_id, None)
+            return None
+        return entry.content
+
+    def set_cached_thread_context(
+        self, thread_id: str, content: str
+    ) -> None:
+        """Store the formatted thread-context prefix for *thread_id*."""
+        if not thread_id:
+            return
+        self._thread_context.set(
+            thread_id,
+            _ThreadContextEntry(content=content, fetched_at=time.monotonic()),
+        )
+
+    def clear_cached_thread_context(self, thread_id: str) -> None:
+        """Drop the cached entry for *thread_id* (forces a refetch next time)."""
+        if not thread_id:
+            return
+        self._thread_context._data.pop(thread_id, None)
 
     # ── Parent transcript cache ─────────────────────────────────────
 
