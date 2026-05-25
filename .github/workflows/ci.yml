@@ -246,5 +246,25 @@ jobs:
           # ``Syntax check all modules`` step and validated end-to-end in
           # local dogfooding before each PR.
 
+          # v5 transport surface: every method declared in api.py exists
+          # on CarbonVoiceAPI. Network calls aren't exercised here (would
+          # require an HTTPX mock or a fake CV server); the goal is to
+          # catch typos / accidental removals during refactors.
+          from carbonvoice.api import CarbonVoiceAPI
+          for method in (
+              'send_message',          # legacy v3 (kept for compat)
+              'send_text_v5',          # v5 outbound text
+              'send_audio_v5',         # v5 outbound audio (multipart)
+              'send_attachment_v5',    # v5 outbound attachments (URL-based)
+              'get_message_v5',        # v5 fetch single (for PR 4)
+              'get_messages_by_ids_v5',# v5 batch fetch (for PR 4)
+              'get_message',           # legacy v3 single fetch (kept)
+              'get_channel',           # channel metadata
+              'whoami', 'fetch_recent', 'fetch_reactions', 'react', 'mark_read',
+              'get_user',
+          ):
+              assert hasattr(CarbonVoiceAPI, method), f'CarbonVoiceAPI is missing {method}'
+          print(f'CarbonVoiceAPI surface: {sum(1 for m in dir(CarbonVoiceAPI) if not m.startswith("_"))} public methods')
+
           print('smoke tests OK')
           PY
