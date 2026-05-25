@@ -60,7 +60,14 @@ class Transport:
         return self._mode
 
     async def start(self) -> None:
-        """Bring the transport up. Tries WS first; falls back to polling."""
+        """Bring the transport up. Tries WS first; falls back to polling.
+
+        When ``python-socketio`` is missing entirely (not just a transient
+        WS failure), the adapter logs a prominent warning with the exact
+        install command so operators understand the cause of the degraded
+        mode — Hermes does not auto-install plugin dependencies (security
+        boundary), so the user must install the dep manually.
+        """
         if SOCKETIO_AVAILABLE:
             try:
                 await self._connect_websocket()
@@ -70,6 +77,14 @@ class Transport:
                     "carbonvoice: WS initial connect failed (%s) — using polling",
                     exc,
                 )
+        else:
+            logger.warning(
+                "carbonvoice: Carbon Voice realtime websocket support is "
+                "unavailable because python-socketio is not installed. "
+                "Falling back to REST polling. To enable websocket mode, "
+                "install python-socketio[asyncio_client] in the Hermes venv: "
+                "python -m pip install 'python-socketio[asyncio_client]>=5'"
+            )
         self._mode = "polling"
         self._start_polling()
         if SOCKETIO_AVAILABLE:
