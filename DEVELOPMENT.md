@@ -191,3 +191,289 @@ Brief notes on the non-obvious choices. ADR-lite format.
 **Decision.** Move the gate evaluation before the visual ack. If the gate rejects, no ack fires.
 
 **Consequence.** Users in group channels who don't mention the bot see no reaction at all (matching their intent: they weren't talking to the bot). Users who do mention the bot see the ack within 100ms followed by the reply. Cleaner signal-to-noise.
+
+---
+
+## 7. Session context — Built-in pattern alignment (next steps)
+
+This section captures the working plan agreed in the design discussion that
+preceded the next development push. It supersedes the earlier high-level
+roadmap in §5 where they overlap; §5 remains as historical reference.
+
+**Goal.** Bring the plugin in line with the conventions used by Hermes' own
+built-in adapters (Slack, Discord, Telegram). Reference points:
+- `gateway/platforms/base.py` in NousResearch/hermes-agent (the
+  `BasePlatformAdapter` contract, ~4100 lines)
+- `gateway/session.py` (`SessionSource`, `build_session_key`,
+  `is_shared_multi_user_session`)
+- <https://hermes-agent.nousresearch.com/docs/user-guide/messaging/>
+
+### 7.1 Cross-reference with `BasePlatformAdapter`
+
+Already aligned:
+- 4 abstract methods implemented (`connect`, `disconnect`, `send`,
+  `get_chat_info`) plus `send_typing` no-op.
+- Composition-over-inheritance pattern (one responsibility per module).
+- DM-vs-group mention split matching Slack/Discord/Telegram.
+- Inline markup stripping (`@[name](guid)` → `@name`), same shape as
+  Slack's `<@U123>` → `@username` pattern.
+- Allowlist + audit log, mirroring `*_ALLOWED_USERS` / `GATEWAY_ALLOW_ALL_USERS`.
+- Cursor-based offline catch-up.
+- Stale-anchor recovery on outbound 400s.
+
+Not yet implemented, ordered by impact-per-effort:
+
+| Method / capability | BasePlatformAdapter site | Priority | Notes |
+|---|---|---|---|
+| `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **short** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
+| `SessionSource.thread_id` populated | session.py:600 (`build_session_key`) | **short** | Without this, group channels stay user-isolated. See §7.3. |
+| `interrupt_session_activity(session_key, chat_id)` | base.py:2502 | medium | Needed for `/stop`, `/new`, `/reset` to cancel an in-flight run. |
+| `edit_message(chat_id, message_id, content, finalize=)` | base.py:1744 | medium | The big UX gap. Required for `GatewayStreamConsumer` to render progressive responses. Depends on CV exposing `PATCH /v3/messages/{id}`. |
+| `delete_message` | base.py:1773 | medium | Enables `EphemeralReply` auto-deletion of system notices. |
+| `MessageEvent.channel_prompt` | base.py:1073 | medium | Per-channel ephemeral system prompts (Discord pattern). |
+| `format_message` | base.py:3985 | low | Override if CV doesn't render markdown — strip `**`/backticks so the LLM's formatting doesn't bleed through. |
+| Media in (`media_urls` / `media_types`) | base.py:1060 | long | Breaks current text-only contract; product decision. |
+| `send_voice`, `send_image`, `send_document`, `send_animation`, `send_image_file` | base.py:2038–2230 | long | CV being voice-first makes `send_voice` particularly high-value. |
+| `play_tts` + auto-TTS plumbing | base.py:2156 | long | Hermes core already gates this via `_should_auto_tts_for_chat`. |
+| `create_handoff_thread` | base.py:1717 | optional | Only if CV grows native sub-threads. |
+| `send_clarify` / `send_slash_confirm` with inline buttons | base.py:1852, 1887 | skip | CV has no native button UI; text fallback works. |
+| `send_draft` / `supports_draft_streaming` | base.py:1471, 1490 | skip | Telegram-specific. |
+
+### 7.2 How Hermes sessions actually work (the mental model)
+
+Sessions are persisted conversations (SQLite at `~/.hermes/state.db`). Each
+inbound message is routed to a session via a deterministic `session_key`
+that **the adapter does not choose directly** — `build_session_key()`
+(`gateway/session.py:600`) composes it from `SessionSource` fields.
+
+Key recipe:
+```
+DM:
+  agent:main:<platform>:dm:<chat_id>
+  agent:main:<platform>:dm:<chat_id>:<thread_id>      # if thread_id present
+
+Group/channel:
+  agent:main:<platform>:<chat_type>:<chat_id>[:<thread_id>][:<user_id>]
+```
+
+Two `gateway.json` flags govern whether `user_id` is appended:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `group_sessions_per_user` | `true` | In groups *without* a thread, each user gets an isolated session. |
+| `thread_sessions_per_user` | `false` | In groups *with* a thread, all participants **share** one session. |
+
+Net result by scenario (defaults):
+
+| Scenario | Resulting key | Shared? |
+|---|---|---|
+| DM | `…:dm:<channel_id>` | n/a |
+| Group, no thread_id | `…:group:<channel_id>:<user_id>` | ❌ per-user |
+| Group, with thread_id | `…:group:<channel_id>:<thread_id>` | ✅ shared |
+
+When the key resolves to a shared session, Hermes core
+(`gateway/run.py:6704`) automatically prefixes every user message with
+`[<user_name>]` before passing to the LLM, so the agent can attribute
+statements ("Alice asked X, Bob added Y…"). The plugin only needs
+`source.user_name` populated — `UserCache` already does this.
+
+### 7.3 Current behavior in this plugin
+
+Today `SessionSource.thread_id` is never set (`adapter.py:380`):
+
+- **DMs:** `…:dm:<channel_id>` — correct, one session per user-bot pair.
+- **Group channels:** `…:group:<channel_id>:<user_id>` — each user has an
+  isolated session in the same channel. The agent cannot reference what
+  other participants said. This is the "no multi-user awareness" limitation
+  listed in §4.
+
+### 7.4 Target behavior
+
+For group channels, compute a "lane anchor" from CV's reply tree and use it
+as `thread_id`:
+
+```python
+# Lane anchor: top-level messages are their own root; replies use the parent.
+# v1 uses the direct parent (acceptable per §4 deep-thread limitation).
+# v2 walks up to the true root with a parent_id → root_id cache.
+thread_id = parent_message_id if parent_message_id else message_id
+
+source = SessionSource(
+    platform=Platform("carbonvoice"),
+    chat_id=channel_id,
+    chat_type=chat_type,                # "dm" or "group"
+    user_id=creator_id,
+    user_name=user_name,
+    thread_id=thread_id,                # ← the new bit
+    message_id=message_id,
+)
+```
+
+This makes group threads behave like Slack/Discord/Telegram threads:
+shared session, per-message sender attribution.
+
+### 7.5 Required infrastructure: `conversations.py` (new module)
+
+Five eyes of mutable state live in the adapter today; some are missing,
+some are misplaced. Consolidate them in a new `ConversationTracker`:
+
+| State axis | Granularity | Lifetime | Current location | Action |
+|---|---|---|---|---|
+| Cursor (`last_seen_at`) | global | persistent (disk) | `state.py` | keep |
+| Self user id | global | process | `adapter.py` | keep |
+| Channel type (DM/group) | per-channel | process | `channels.py` (`ChannelCache`) | keep |
+| Display names | per-user | process | `users.py` (`UserCache`) | keep |
+| Seen messages (dedup) | per-message | TTL ~10m | `dedupe.py` (`SeenCache`) | keep |
+| Outbound reply anchor | **per-thread** | process | `adapter._last_inbound_msg` keyed by `channel_id` ⚠️ | **move + rekey** |
+| Thread root (parent→root) | per-message | process, LRU | — | **add** |
+| Engaged threads | per-thread | TTL ~30m, LRU | — | **add** |
+| Outbound message ids (bot's own) | per-message | LRU ~1000 | — | **add** |
+| Parent transcript cache | per-message | LRU ~128 | — | **add** |
+
+Sketch:
+
+```python
+# conversations.py
+
+class ConversationTracker:
+    """All per-thread conversation memory for the adapter."""
+
+    def __init__(
+        self,
+        *,
+        max_thread_roots: int = 1000,
+        engagement_ttl_s: int = 1800,        # ~30 min, ≈ Hermes idle reset
+        max_outbound_ids: int = 1000,
+        max_parent_text: int = 128,
+    ):
+        ...
+
+    # Thread resolution
+    async def resolve_thread_root(
+        self, msg: dict, api: CarbonVoiceAPI
+    ) -> str: ...
+
+    # Engagement
+    def mark_engaged(self, thread_id: str) -> None: ...
+    def is_engaged(self, thread_id: str) -> bool: ...     # TTL-aware
+    def clear_engagement(self, thread_id: str) -> None: ...
+
+    # Outbound tracking (for is_reply_to_bot)
+    def record_outbound(self, message_id: str) -> None: ...
+    def is_bot_message(self, message_id: str) -> bool: ...
+
+    # Reply anchor (outbound threading) — keyed by thread_id, not channel_id
+    def get_reply_anchor(self, thread_id: str) -> Optional[str]: ...
+    def set_reply_anchor(self, thread_id: str, msg_id: str) -> None: ...
+
+    # Parent text cache
+    async def get_parent_text(
+        self, parent_id: str, api: CarbonVoiceAPI
+    ) -> Optional[str]: ...
+```
+
+### 7.6 Latent bug to fix while we're in there
+
+`adapter._last_inbound_msg: Dict[channel_id → msg_id]` is keyed by
+`channel_id`. Two concurrent threads in the same channel trample each
+other's reply anchor. Rekey to `thread_id` as part of the migration into
+`ConversationTracker`.
+
+### 7.7 State persistence policy
+
+Principle: persist only what is expensive to rebuild **and** affects UX
+during restart.
+
+| State | Persist? | Reason |
+|---|---|---|
+| Cursor | ✅ (already) | Without it we miss or duplicate offline messages. |
+| Self user id, ChannelCache, UserCache | ❌ | Trivially refetchable on connect. |
+| SeenCache | ❌ | Short TTL, refetch is idempotent. |
+| Engaged threads | 🟡 v1 in-memory, revisit | Lose engagement on restart → one extra mention required. Acceptable for v1. |
+| Outbound msg ids | 🟡 v1 in-memory, revisit | Loses "reply-to-bot" detection for pre-restart messages. Acceptable. |
+| Thread roots, parent text | ❌ | LRU caches, refetch is cheap. |
+| Reply anchors | ❌ | First post-restart reply goes top-level. Acceptable. |
+
+If real-world dogfooding shows restart amnesia hurts UX, add persistence
+to `state.py` with the same debounced-flush pattern used by `Cursor`. Do
+not pre-optimize.
+
+### 7.8 Coordination with Hermes core session resets
+
+The plugin's `engaged_threads` and Hermes core's session reset policy
+(`idle` / `daily`) can drift: engagement says "continue without mention"
+but the underlying session has been reset to empty.
+
+Resolution chosen: refresh engagement in `on_processing_complete`. With
+TTL ≈ 30 min (close to typical Hermes idle reset) the drift window is
+small. Accept the rare edge case rather than coupling the plugin to core
+config.
+
+### 7.9 Open design decisions
+
+| Decision | Options | Default chosen | Revisit when |
+|---|---|---|---|
+| Thread root resolution | (a) direct parent, (b) walk-up with cache | **(a) v1** | deep-reply chains become common in dogfood |
+| Engagement TTL | 30m / 1h / 4h / no TTL | **30 min** | observe operator complaints about re-mentioning |
+| Engagement persistence | in-memory / disk | **in-memory** | restart frequency increases |
+| Reply anchor key | channel_id / thread_id | **thread_id** | — (fix the latent bug) |
+| `CARBONVOICE_SHARED_GROUP_SESSIONS` env | yes / no | **yes, opt-in, off by default** | — |
+| Subscribe to core session-reset events | yes / no | **no, accept drift** | core exposes a hook |
+| `CARBONVOICE_STRICT_MENTION` env | yes / no | **yes, opt-in, off by default** | — |
+
+### 7.10 PR sequence
+
+Mechanical first, behavior-changing later. Each PR is independently
+reviewable and shippable.
+
+**PR 1 — refactor, no UX change.**
+- Create `conversations.py` with `ConversationTracker`.
+- Migrate `adapter._last_inbound_msg` → `tracker.reply_anchors` (rekeyed
+  to `thread_id`, fixes latent bug from §7.6).
+- Migrate `adapter._resolve_parent_text` → `tracker.get_parent_text`
+  (parent text LRU cache from §7.5, addresses §5 item #3).
+- Unit tests for the tracker (LRU bounds, TTL eviction).
+
+**PR 2 — session sharing in group channels.**
+- Compute `thread_id = parent_message_id or message_id` in
+  `_process_message`.
+- Pass `thread_id` into `SessionSource`.
+- Add `CARBONVOICE_SHARED_GROUP_SESSIONS` env (global override that flips
+  `group_sessions_per_user=false` for CV only — for bot-room channels).
+- Validate manually with two accounts replying in one thread; confirm
+  Hermes core's `[sender]` prefix appears and the agent attributes.
+
+**PR 3 — thread memory + reply-to-bot.**
+- `tracker.mark_engaged(thread_id)` after a successful dispatch (in the
+  `on_processing_complete` hook).
+- `tracker.record_outbound(msg_id)` after `send()` succeeds.
+- Extend `MentionGate.evaluate(...)` with `is_engaged_thread` and
+  `is_reply_to_bot` inputs (gate stays stateless; adapter passes them in).
+- Add `CARBONVOICE_STRICT_MENTION` env (opt-in, forces re-mention every
+  turn).
+
+**PR 4 — lifecycle hooks refactor.**
+- Move `reactions.ack` call to `on_processing_start(event)`.
+- Move `mark_read` call to `on_processing_complete(event, outcome)`.
+- Optional: tri-state ack reactions (`acknowledged` → swap to `done` /
+  `failed` based on `ProcessingOutcome`).
+- Shrink `_process_message` / `_dispatch` accordingly.
+
+PR 1 and 2 are the foundation; PR 3 is where group-channel UX visibly
+improves; PR 4 is technical hygiene. Beyond PR 4, the medium- and
+long-term items from §7.1 (edit_message, interrupt_session_activity,
+channel_prompt, media) become unblocked.
+
+### 7.11 What to start with on the next session
+
+Begin with **PR 1**. It is pure refactor (no observable behavior change),
+fixes one latent bug (§7.6), and creates the structural home for
+everything in PR 2 and PR 3. Suggested first prompt for a fresh Claude
+session:
+
+> Read `DEVELOPMENT.md` §7 in full, then implement PR 1 from §7.10:
+> create `conversations.py` with `ConversationTracker` (sketch in §7.5),
+> migrate `adapter._last_inbound_msg` and `adapter._resolve_parent_text`
+> into it, rekey reply anchors to `thread_id` (currently `channel_id` —
+> see §7.6), and add unit tests. Do not change any user-visible
+> behavior. Run existing tests and report.
