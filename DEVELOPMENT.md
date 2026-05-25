@@ -194,11 +194,13 @@ Brief notes on the non-obvious choices. ADR-lite format.
 
 ---
 
-## 7. Session context — Built-in pattern alignment (next steps)
+## 7. Session context — Built-in pattern alignment (working plan)
 
-This section captures the working plan agreed in the design discussion that
-preceded the next development push. It supersedes the earlier high-level
-roadmap in §5 where they overlap; §5 remains as historical reference.
+This section captures the working plan that has guided the recent
+development pushes. Sections marked ✅ have shipped (see commit history
+on `main`); the rest is what remains. It supersedes the earlier
+high-level roadmap in §5 where they overlap; §5 remains as historical
+reference.
 
 **Goal.** Bring the plugin in line with the conventions used by Hermes' own
 built-in adapters (Slack, Discord, Telegram). Reference points:
@@ -208,9 +210,36 @@ built-in adapters (Slack, Discord, Telegram). Reference points:
   `is_shared_multi_user_session`)
 - <https://hermes-agent.nousresearch.com/docs/user-guide/messaging/>
 
+### 7.0 Plan revision (2026-05-25)
+
+The original §7.10 plan sequenced PR 3 as "thread memory + reply-to-bot
+shortcuts" before tackling v5 endpoints. After dogfooding PR 1 + 2 and
+checking with the CV backend team, that ordering was reversed:
+
+1. The CV team's guidance ("Just always reply to `thread_id` when wanting
+   to do thread — eliminate the client guessing") is encoded natively in
+   the **v5 transport** (`POST /v5/messages/text` accepts `thread_id`
+   directly). Migrating to v5 *removes* the need for the reply-anchor
+   lookup that PR 1 introduced — `send()` becomes a one-liner pass
+   through.
+2. v5 also exposes `POST /v5/messages/stream`, which unblocks
+   `edit_message()` — the "chain of thought becomes one growing bubble
+   instead of N separate messages" UX win that visibly transforms the
+   product. Higher visible value than thread-memory shortcuts.
+3. The "engaged thread context" goal (bot has context of all messages
+   since first mention in a thread) is *better* solved by fetching the
+   thread on `@mention` from a v5 endpoint than by maintaining a local
+   in-memory buffer — it survives gateway restarts and TTL expiry, and
+   delivers the full thread history including pre-engagement messages.
+
+So PR 3 is now **v5 transport + `edit_message`** (was: "thread memory").
+Engaged-thread context fetching becomes PR 4. The mention-gate
+shortcuts (was PR 3) become PR 5 and are *probably unnecessary* once
+PR 4 lands — re-evaluated then.
+
 ### 7.1 Cross-reference with `BasePlatformAdapter`
 
-Already aligned:
+Already aligned (✅ shipped):
 - 4 abstract methods implemented (`connect`, `disconnect`, `send`,
   `get_chat_info`) plus `send_typing` no-op.
 - Composition-over-inheritance pattern (one responsibility per module).
@@ -219,21 +248,30 @@ Already aligned:
   Slack's `<@U123>` → `@username` pattern.
 - Allowlist + audit log, mirroring `*_ALLOWED_USERS` / `GATEWAY_ALLOW_ALL_USERS`.
 - Cursor-based offline catch-up.
-- Stale-anchor recovery on outbound 400s.
+- Stale-anchor recovery on outbound 400s (PR 2 closed the underlying
+  root cause: `send()` now prefers `tracker.reply_anchors[thread_id]`
+  over Hermes core's raw `reply_to`).
+- `ConversationTracker` consolidates per-thread state (PR 1).
+- `SessionSource.thread_id` populated for groups → shared sessions
+  with `[sender name]` prefixing (PR 2).
 
-Not yet implemented, ordered by impact-per-effort:
+Not yet implemented, ordered by **value-per-effort** with the
+post-2026-05-25 priorities baked in:
 
 | Method / capability | BasePlatformAdapter site | Priority | Notes |
 |---|---|---|---|
-| `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **short** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
-| `SessionSource.thread_id` populated | session.py:600 (`build_session_key`) | **short** | Without this, group channels stay user-isolated. See §7.3. |
+| **v5 transport** — `POST /v5/messages/text` / `/audio` / `/stream` instead of `/v3/messages/start` | api.py | **PR 3** | Adopts CV team's canonical `thread_id` field. Removes need for `reply_anchor` lookup in `send()`. Enables `idempotency_key`. Foundation for `edit_message` and `send_voice`. |
+| `edit_message(chat_id, message_id, content, finalize=)` | base.py:1744 | **PR 3** | The big UX gap. Required for `GatewayStreamConsumer` to render progressive responses. Depends on `POST /v5/messages/stream` (now available). |
+| Engaged-thread context via API fetch | (custom — adapter-level) | **PR 4** | When `@mention` arrives, fetch the thread's full message history from `GET /v5/messages/<thread_id>` (or v3 equivalent — "get a message with its replies") and inject as context. Survives restarts, survives TTL, no local buffer needed. |
+| `on_processing_start` / `on_processing_complete(outcome)` | base.py:2602–2606 | **PR 5** | Pure refactor. Move `reaction.ack` and `mark_read` here. Unblocks tri-state reactions (👀 → ✅/❌). |
 | `interrupt_session_activity(session_key, chat_id)` | base.py:2502 | medium | Needed for `/stop`, `/new`, `/reset` to cancel an in-flight run. |
-| `edit_message(chat_id, message_id, content, finalize=)` | base.py:1744 | medium | The big UX gap. Required for `GatewayStreamConsumer` to render progressive responses. Depends on CV exposing `PATCH /v3/messages/{id}`. |
 | `delete_message` | base.py:1773 | medium | Enables `EphemeralReply` auto-deletion of system notices. |
 | `MessageEvent.channel_prompt` | base.py:1073 | medium | Per-channel ephemeral system prompts (Discord pattern). |
+| Thread memory + reply-to-bot shortcuts (was PR 3) | gate.py + tracker | **deferred → PR 6 (probably unnecessary after PR 4)** | Once PR 4 fetches thread history on every `@mention`, the engagement-bypass shortcut adds little value. Revisit after PR 4 dogfooding. |
 | `format_message` | base.py:3985 | low | Override if CV doesn't render markdown — strip `**`/backticks so the LLM's formatting doesn't bleed through. |
 | Media in (`media_urls` / `media_types`) | base.py:1060 | long | Breaks current text-only contract; product decision. |
-| `send_voice`, `send_image`, `send_document`, `send_animation`, `send_image_file` | base.py:2038–2230 | long | CV being voice-first makes `send_voice` particularly high-value. |
+| `send_voice` (via v5 audio endpoint) | base.py:2038 | long | CV being voice-first makes `send_voice` particularly high-value. Lands cheaply once v5 transport is in (PR 3). |
+| `send_image`, `send_document`, `send_animation`, `send_image_file` | base.py:2110–2230 | long | Less critical for CV's text-first agent UX. |
 | `play_tts` + auto-TTS plumbing | base.py:2156 | long | Hermes core already gates this via `_should_auto_tts_for_chat`. |
 | `create_handoff_thread` | base.py:1717 | optional | Only if CV grows native sub-threads. |
 | `send_clarify` / `send_slash_confirm` with inline buttons | base.py:1852, 1887 | skip | CV has no native button UI; text fallback works. |
@@ -426,57 +464,92 @@ config.
 
 ### 7.10 PR sequence
 
-Mechanical first, behavior-changing later. Each PR is independently
-reviewable and shippable.
+Foundation first, then the visibly-transformative UX changes, then
+nice-to-haves. The original §7.10 sequencing (thread memory before v5)
+was reversed on 2026-05-25 — see §7.0 for the rationale.
 
-**PR 1 — refactor, no UX change.**
-- Create `conversations.py` with `ConversationTracker`.
-- Migrate `adapter._last_inbound_msg` → `tracker.reply_anchors` (rekeyed
-  to `thread_id`, fixes latent bug from §7.6).
-- Migrate `adapter._resolve_parent_text` → `tracker.get_parent_text`
-  (parent text LRU cache from §7.5, addresses §5 item #3).
-- Unit tests for the tracker (LRU bounds, TTL eviction).
+**PR 1 — refactor, no UX change.** ✅ Shipped (#6).
+- Created `conversations.py` with `ConversationTracker`.
+- Migrated `adapter._last_inbound_msg` → `tracker.reply_anchors`
+  (rekeyed to `thread_id`).
+- Migrated `adapter._resolve_parent_text` → `tracker.get_parent_text`
+  with LRU cache.
+- Unit tests for LRU bounds, thread_id_of, reply anchors, parent text.
 
-**PR 2 — session sharing in group channels.**
-- Compute `thread_id = parent_message_id or message_id` in
+**PR 2 — session sharing in group channels.** ✅ Shipped (#7).
+- Computed `thread_id = parent_message_id or message_id` in
   `_process_message`.
-- Pass `thread_id` into `SessionSource`.
-- Add `CARBONVOICE_SHARED_GROUP_SESSIONS` env (global override that flips
-  `group_sessions_per_user=false` for CV only — for bot-room channels).
-- Validate manually with two accounts replying in one thread; confirm
-  Hermes core's `[sender]` prefix appears and the agent attributes.
+- Passed `thread_id` into `SessionSource` for groups (DMs keep
+  `thread_id=None` to preserve one-session-per-pair).
+- Read `metadata['thread_id']` in `send()`; prefer
+  `tracker.get_reply_anchor()` over Hermes core's raw `reply_to`
+  (which is `event.message_id` and may itself be a reply — that was
+  the bug that caused final responses to leak outside the thread).
+- Added `CARBONVOICE_SHARED_GROUP_SESSIONS` env (global override that
+  flips `group_sessions_per_user=false` for CV — for bot-room
+  channels).
+- §7.6 latent bug closed end-to-end.
 
-**PR 3 — thread memory + reply-to-bot.**
-- `tracker.mark_engaged(thread_id)` after a successful dispatch (in the
-  `on_processing_complete` hook).
-- `tracker.record_outbound(msg_id)` after `send()` succeeds.
-- Extend `MentionGate.evaluate(...)` with `is_engaged_thread` and
-  `is_reply_to_bot` inputs (gate stays stateless; adapter passes them in).
-- Add `CARBONVOICE_STRICT_MENTION` env (opt-in, forces re-mention every
-  turn).
+**PR 3 — v5 transport + `edit_message`.** Next.
+- Replace `POST /v3/messages/start` with `POST /v5/messages/text` in
+  `api.py`. The new endpoint accepts `thread_id` directly, no
+  `reply_to_message_id` mapping required. Removes the `send()`
+  reply-anchor lookup that PR 1 introduced (kept for v3 compat only).
+- Adopt `idempotency_key` (renamed from `unique_client_id`).
+- Add `POST /v5/messages/audio` and `POST /v5/messages/stream` clients
+  for follow-up `send_voice` / `edit_message` work.
+- Implement `edit_message(chat_id, message_id, content, finalize=)`
+  using the streaming endpoint. With this, Hermes core's
+  `GatewayStreamConsumer` can render the agent's response as one
+  growing bubble instead of N separate messages — the largest visible
+  UX win on the roadmap.
+- Set `REQUIRES_EDIT_FINALIZE` if CV's stream endpoint distinguishes
+  "in-progress" from "finalized" message states (verify).
+- Docs + CI smoke tests for the new client methods.
 
-**PR 4 — lifecycle hooks refactor.**
+**PR 4 — engaged-thread context via API fetch.** After PR 3.
+- On every accepted `@mention` in a group thread, call
+  `GET /v5/messages/<thread_id>` (or v3 equivalent — "get a message
+  with its replies") to fetch the full thread history.
+- Inject the history as context for the agent (format TBD —
+  candidates: prepended to the user message, or via a Hermes core
+  session-store API if one exists by then).
+- Result: bot has full thread context from the first turn, without
+  needing local engagement memory, without losing context on restart
+  or TTL expiry.
+- Acknowledges the "agent has context of all messages since first
+  `@mention`" goal from the 2026-05-25 design discussion in a way
+  that's restart-safe and stateless on the plugin side.
+
+**PR 5 — lifecycle hooks refactor.** Pure technical hygiene.
 - Move `reactions.ack` call to `on_processing_start(event)`.
 - Move `mark_read` call to `on_processing_complete(event, outcome)`.
 - Optional: tri-state ack reactions (`acknowledged` → swap to `done` /
   `failed` based on `ProcessingOutcome`).
 - Shrink `_process_message` / `_dispatch` accordingly.
 
-PR 1 and 2 are the foundation; PR 3 is where group-channel UX visibly
-improves; PR 4 is technical hygiene. Beyond PR 4, the medium- and
-long-term items from §7.1 (edit_message, interrupt_session_activity,
-channel_prompt, media) become unblocked.
+**PR 6 — thread memory + reply-to-bot shortcuts.** Deferred,
+probably unnecessary after PR 4. Original PR 3 from the pre-revision
+plan: `tracker.mark_engaged` / `is_engaged` / `record_outbound`,
+`MentionGate.evaluate` gets `is_engaged_thread` / `is_reply_to_bot`
+inputs, `CARBONVOICE_STRICT_MENTION` env. Re-evaluate after PR 4
+dogfooding — if `@mention`-with-thread-context already covers the
+"natural conversation" use case, this PR is dropped.
 
 ### 7.11 What to start with on the next session
 
-Begin with **PR 1**. It is pure refactor (no observable behavior change),
-fixes one latent bug (§7.6), and creates the structural home for
-everything in PR 2 and PR 3. Suggested first prompt for a fresh Claude
-session:
+Begin with **PR 3** from the revised §7.10 above: v5 transport +
+`edit_message`. The infrastructure for thread_id is already in place
+from PR 2; PR 3 swaps the wire format and unlocks streaming.
 
-> Read `DEVELOPMENT.md` §7 in full, then implement PR 1 from §7.10:
-> create `conversations.py` with `ConversationTracker` (sketch in §7.5),
-> migrate `adapter._last_inbound_msg` and `adapter._resolve_parent_text`
-> into it, rekey reply anchors to `thread_id` (currently `channel_id` —
-> see §7.6), and add unit tests. Do not change any user-visible
-> behavior. Run existing tests and report.
+Suggested first prompt for a fresh Claude session:
+
+> Read `DEVELOPMENT.md` §7 in full (especially §7.0 for the revision
+> context), then implement PR 3 from §7.10: migrate `api.py` from
+> `POST /v3/messages/start` to `POST /v5/messages/text` with
+> `thread_id` and `idempotency_key`, then implement `edit_message`
+> using `POST /v5/messages/stream`. Validate manually that a streamed
+> agent response renders as one growing bubble instead of N separate
+> messages. Reference: the cv-api v5 controller is at
+> `src/message/message.controllerv5.ts`; relevant DTOs at
+> `src/message/dto/v5/`.
