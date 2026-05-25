@@ -137,20 +137,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # DEVELOPMENT.md §7.5 for the design.
         self._tracker = ConversationTracker(self._api)
 
-        # Transitional ``chat_id → most-recent thread_id`` index used by
-        # ``send()`` to look up the right reply anchor while no caller has
-        # ``metadata['thread_id']`` populated. PR 2 wires
-        # ``SessionSource.thread_id`` and Hermes core will then pass
-        # ``thread_id`` through ``metadata`` (see
-        # ``gateway/platforms/base.py::_thread_metadata_for_source``); at
-        # that point this index can be dropped. Keeping it preserves the
-        # exact pre-tracker behavior for outbound threading while the
-        # tracker already stores per-thread anchors correctly — the
-        # latent ``§7.6`` bug is structurally fixed (anchors no longer
-        # trample), but the *read path* still resolves via channel until
-        # PR 2 closes the loop.
-        self._chat_thread_index: Dict[str, str] = {}
-
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
@@ -213,18 +199,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         # Resolve the reply anchor. Preference order:
         #   1. Explicit ``reply_to`` from the caller (rare).
-        #   2. ``metadata['thread_id']`` — populated by Hermes core once
-        #      PR 2 wires ``SessionSource.thread_id`` (see
-        #      ``gateway/platforms/base.py::_thread_metadata_for_source``).
-        #   3. ``_chat_thread_index[chat_id]`` — the transitional
-        #      most-recent-thread-per-channel index that preserves the
-        #      pre-tracker single-thread-per-channel behavior. Drops out
-        #      in PR 2 when (2) is reliable.
+        #   2. ``metadata['thread_id']`` — populated by Hermes core via
+        #      ``gateway/platforms/base.py::_thread_metadata_for_source``
+        #      from ``SessionSource.thread_id``. The tracker's per-thread
+        #      anchor closes the §7.6 latent bug end-to-end: parallel
+        #      threads in the same channel now resolve their own
+        #      anchors instead of trampling on a shared channel-keyed
+        #      slot.
         reply_target = reply_to
         if not reply_target:
-            thread_hint = (metadata or {}).get("thread_id") or self._chat_thread_index.get(chat_id)
-            if thread_hint:
-                reply_target = self._tracker.get_reply_anchor(thread_hint)
+            thread_id = (metadata or {}).get("thread_id")
+            if thread_id:
+                reply_target = self._tracker.get_reply_anchor(thread_id)
 
         try:
             data = await self._api.send_message(chat_id, content, reply_to=reply_target)
@@ -247,11 +233,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                     "carbonvoice: stale reply anchor %s — retrying as top-level",
                     reply_target,
                 )
-                # Clear any tracker entries pointing at the stale anchor and
-                # drop the channel index if it was the trigger.
+                # Drop the tracker entry pointing at the stale anchor
+                # so the next send() falls through to a top-level post.
                 self._tracker.clear_reply_anchor(reply_target)
-                if self._chat_thread_index.get(chat_id) == reply_target:
-                    self._chat_thread_index.pop(chat_id, None)
                 try:
                     data = await self._api.send_message(chat_id, content, reply_to=None)
                     msg_id = first_str(data.get("message_id"), data.get("id"))
@@ -389,18 +373,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # under the correct root. Carbon Voice enforces flat replies (see
         # DEVELOPMENT.md §4), so ``parent_message_id`` is always the true
         # root — no walking required. The tracker stores the anchor keyed
-        # by ``thread_id`` (fixes the latent §7.6 bug: concurrent threads
-        # in the same channel no longer trample each other's anchor at
-        # the storage layer). The ``_chat_thread_index`` write preserves
-        # the read-side behavior until PR 2 wires ``metadata['thread_id']``
-        # into ``send()`` — see the index docstring.
+        # by ``thread_id``, and ``send()`` reads ``metadata['thread_id']``
+        # populated by Hermes core from ``SessionSource.thread_id`` — so
+        # concurrent threads in the same channel each resolve their own
+        # anchor (closes the §7.6 latent bug end-to-end).
         parent = first_str(
             msg.get("parent_message_id"), msg.get("parent_message_guid")
         )
         thread_id = ConversationTracker.thread_id_of(msg)
         if thread_id:
             self._tracker.set_reply_anchor(thread_id, thread_id)
-            self._chat_thread_index[channel_id] = thread_id
 
         user_name = ""
         if creator_id and self._users is not None:
