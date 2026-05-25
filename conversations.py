@@ -52,9 +52,9 @@ DEFAULT_MAX_REPLY_ANCHORS = 1000
 DEFAULT_MAX_PARENT_TEXT = 128
 # Thread-context cache (PR 4): per-thread formatted prefix that the adapter
 # prepends on the first @mention so the agent has the prior thread history.
-# 30 min mirrors Slack's conservative default — long enough that a quick
-# follow-up reuses the cached context, short enough that a long-quiet
-# thread fetches fresh on the next mention.
+# 30-minute TTL is the working balance — long enough that a quick follow-up
+# reuses the cached context (avoiding a second index + by-ids fetch), short
+# enough that a long-quiet thread refetches before injecting stale state.
 DEFAULT_MAX_THREAD_CONTEXT = 200
 DEFAULT_THREAD_CONTEXT_TTL_S = 1800
 

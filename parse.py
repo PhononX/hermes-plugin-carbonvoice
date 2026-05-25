@@ -126,9 +126,9 @@ def strip_inline_mentions(text: Optional[str]) -> str:
     """Replace ``@[name](guid)`` with a bare ``@name`` for cleaner agent input.
 
     The agent doesn't need to see the guid — it adds noise to the LLM
-    prompt and can confuse instruction-following. Slack and Discord
-    adapters do the equivalent: strip the bot mention marker before
-    forwarding text to the model.
+    prompt and can confuse instruction-following. The bare ``@name`` is
+    what the agent should see; the original guid stays out of the model
+    context.
     """
     if not text:
         return text or ""
