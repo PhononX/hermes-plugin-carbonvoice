@@ -415,6 +415,15 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # can confuse instruction following.
         clean_text = strip_inline_mentions(transcript)
 
+        # Session sharing in groups: pass the thread root as
+        # ``SessionSource.thread_id`` so Hermes core composes a shared
+        # session key (``agent:main:carbonvoice:group:<chat_id>:<thread_id>``)
+        # and prefixes each user message with ``[sender name]`` for
+        # multi-user attribution. DMs intentionally keep ``thread_id=None``:
+        # a DM should remain one session per pair, not split per top-level
+        # message inside the conversation.
+        session_thread_id = thread_id if chat_type == "group" else None
+
         source = SessionSource(
             platform=Platform("carbonvoice"),
             chat_id=channel_id,
@@ -423,6 +432,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             user_id=creator_id or "",
             user_name=user_name or creator_id or "",
             message_id=message_id,
+            thread_id=session_thread_id,
         )
         event = MessageEvent(
             text=clean_text,
