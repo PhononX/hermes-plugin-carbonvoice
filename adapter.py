@@ -48,6 +48,7 @@ from gateway.session import SessionSource
 from .api import CarbonVoiceAPI
 from .audit import AllowlistGate, IgnoredSenderLog, default_ignored_log_path
 from .channels import ChannelCache
+from .conversations import ConversationTracker
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
@@ -65,6 +66,9 @@ from .parse import (
     now_iso,
     strip_inline_mentions,
 )
+# extract_transcript is also re-exported via parse for the parent-text path
+# (now handled by ConversationTracker, but the import here is kept so
+# extract_transcript stays available for any future inline use).
 from .reactions import ReactionService
 from .state import Cursor, default_state_path
 from .transport import Transport
@@ -128,11 +132,24 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             IgnoredSenderLog(ignored_log_path, self._users) if self._users else None
         )
 
-        # Maps channel_id → "reply anchor" (parent_message_id or top-level
-        # message_id). Used to thread our outbound replies under the latest
-        # inbound message. We store the anchor rather than the raw message_id
-        # because Carbon Voice rejects reply_to pointing at a reply.
-        self._last_inbound_msg: Dict[str, str] = {}
+        # Per-thread reply anchors + parent-text cache + (eventually)
+        # engagement / outbound tracking. See conversations.py and
+        # DEVELOPMENT.md §7.5 for the design.
+        self._tracker = ConversationTracker(self._api)
+
+        # Transitional ``chat_id → most-recent thread_id`` index used by
+        # ``send()`` to look up the right reply anchor while no caller has
+        # ``metadata['thread_id']`` populated. PR 2 wires
+        # ``SessionSource.thread_id`` and Hermes core will then pass
+        # ``thread_id`` through ``metadata`` (see
+        # ``gateway/platforms/base.py::_thread_metadata_for_source``); at
+        # that point this index can be dropped. Keeping it preserves the
+        # exact pre-tracker behavior for outbound threading while the
+        # tracker already stores per-thread anchors correctly — the
+        # latent ``§7.6`` bug is structurally fixed (anchors no longer
+        # trample), but the *read path* still resolves via channel until
+        # PR 2 closes the loop.
+        self._chat_thread_index: Dict[str, str] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -194,7 +211,20 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        reply_target = reply_to or self._last_inbound_msg.get(chat_id)
+        # Resolve the reply anchor. Preference order:
+        #   1. Explicit ``reply_to`` from the caller (rare).
+        #   2. ``metadata['thread_id']`` — populated by Hermes core once
+        #      PR 2 wires ``SessionSource.thread_id`` (see
+        #      ``gateway/platforms/base.py::_thread_metadata_for_source``).
+        #   3. ``_chat_thread_index[chat_id]`` — the transitional
+        #      most-recent-thread-per-channel index that preserves the
+        #      pre-tracker single-thread-per-channel behavior. Drops out
+        #      in PR 2 when (2) is reliable.
+        reply_target = reply_to
+        if not reply_target:
+            thread_hint = (metadata or {}).get("thread_id") or self._chat_thread_index.get(chat_id)
+            if thread_hint:
+                reply_target = self._tracker.get_reply_anchor(thread_hint)
 
         try:
             data = await self._api.send_message(chat_id, content, reply_to=reply_target)
@@ -217,8 +247,11 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                     "carbonvoice: stale reply anchor %s — retrying as top-level",
                     reply_target,
                 )
-                if self._last_inbound_msg.get(chat_id) == reply_target:
-                    self._last_inbound_msg.pop(chat_id, None)
+                # Clear any tracker entries pointing at the stale anchor and
+                # drop the channel index if it was the trigger.
+                self._tracker.clear_reply_anchor(reply_target)
+                if self._chat_thread_index.get(chat_id) == reply_target:
+                    self._chat_thread_index.pop(chat_id, None)
                 try:
                     data = await self._api.send_message(chat_id, content, reply_to=None)
                     msg_id = first_str(data.get("message_id"), data.get("id"))
@@ -351,18 +384,23 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._reactions is not None:
             self._reactions.ack(message_id)
 
-        # Lane anchor: ONLY top-level messages (no parent) define the
-        # thread we'll reply under. Carbon Voice's `parent_message_id` is
-        # the direct parent in the tree, not the lane anchor — so if an
-        # inbound reply's parent is itself a Hermes reply, threading our
-        # next response under that parent gets us a CV 400 ("cannot reply
-        # to a message that is a reply"). Keep whatever anchor we had;
-        # the next top-level message overwrites it.
+        # Lane anchor: compute the thread root for this inbound message
+        # and record it in the tracker so the next outbound reply threads
+        # under the correct root. Carbon Voice enforces flat replies (see
+        # DEVELOPMENT.md §4), so ``parent_message_id`` is always the true
+        # root — no walking required. The tracker stores the anchor keyed
+        # by ``thread_id`` (fixes the latent §7.6 bug: concurrent threads
+        # in the same channel no longer trample each other's anchor at
+        # the storage layer). The ``_chat_thread_index`` write preserves
+        # the read-side behavior until PR 2 wires ``metadata['thread_id']``
+        # into ``send()`` — see the index docstring.
         parent = first_str(
             msg.get("parent_message_id"), msg.get("parent_message_guid")
         )
-        if parent is None:
-            self._last_inbound_msg[channel_id] = message_id
+        thread_id = ConversationTracker.thread_id_of(msg)
+        if thread_id:
+            self._tracker.set_reply_anchor(thread_id, thread_id)
+            self._chat_thread_index[channel_id] = thread_id
 
         user_name = ""
         if creator_id and self._users is not None:
@@ -370,7 +408,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         elif creator_id:
             user_name = creator_id
 
-        reply_to_text = await self._resolve_parent_text(parent)
+        reply_to_text = await self._tracker.get_parent_text(parent)
 
         # Strip CV's inline @[name](guid) markup so the agent sees
         # readable text — the guid in the original is LLM noise that
@@ -400,28 +438,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # the poll/WS loop while the agent thinks.
         asyncio.create_task(self._dispatch(event))
         return True
-
-    async def _resolve_parent_text(self, parent_id: Optional[str]) -> Optional[str]:
-        """Fetch a parent message's transcript so the agent sees thread context.
-
-        Returns ``None`` on a missing id, a failed lookup, or an empty
-        transcript — Hermes treats ``None`` as "no reply context", which
-        matches the prior behavior. Failures are logged at debug so a flaky
-        parent endpoint does not spam the operator's logs.
-        """
-        if not parent_id or self._api is None:
-            return None
-        try:
-            parent_msg = await self._api.get_message(parent_id)
-        except Exception as exc:
-            logger.debug(
-                "carbonvoice: get_message(%s) failed: %s", parent_id, exc
-            )
-            return None
-        if not parent_msg:
-            return None
-        text = extract_transcript(parent_msg)
-        return text or None
 
     async def _dispatch(self, event: MessageEvent) -> None:
         try:

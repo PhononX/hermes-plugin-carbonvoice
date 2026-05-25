@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels', 'gate']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -186,6 +186,57 @@ jobs:
           assert ge._ignored_channels == {'mute'}
           for k in ['CARBONVOICE_REQUIRE_MENTION', 'CARBONVOICE_FREE_RESPONSE_CHANNELS', 'CARBONVOICE_IGNORED_CHANNELS']:
               os.environ.pop(k, None)
+
+          # ConversationTracker: LRU bounds + recency
+          from carbonvoice.conversations import ConversationTracker, _LRUDict
+          lru = _LRUDict(3)
+          lru.set('a', 1); lru.set('b', 2); lru.set('c', 3)
+          assert len(lru) == 3
+          lru.set('d', 4)                  # evicts 'a' (oldest)
+          assert lru.get('a') is None and lru.get('d') == 4 and len(lru) == 3
+          lru.get('b')                     # bumps 'b' to most-recent
+          lru.set('e', 5)                  # evicts 'c' (now oldest after 'b' bump)
+          assert lru.get('c') is None and lru.get('b') == 2 and lru.get('e') == 5
+
+          # thread_id_of: top-level → own id; reply → parent id;
+          # fallback to _id / parent_message_guid; empty payload → None
+          assert ConversationTracker.thread_id_of({'message_id': 'm1'}) == 'm1'
+          assert ConversationTracker.thread_id_of({'message_id': 'm2', 'parent_message_id': 'r1'}) == 'r1'
+          assert ConversationTracker.thread_id_of({'_id': 'm3'}) == 'm3'
+          assert ConversationTracker.thread_id_of({'parent_message_guid': 'rg', 'message_id': 'm4'}) == 'rg'
+          assert ConversationTracker.thread_id_of({}) is None
+
+          # reply_anchors: thread-keyed, idempotent, ignores empty inputs
+          t = ConversationTracker(api=None, max_reply_anchors=2, max_parent_text=2)
+          t.set_reply_anchor('thread1', 'msg1')
+          assert t.get_reply_anchor('thread1') == 'msg1'
+          assert t.get_reply_anchor('missing') is None
+          assert t.get_reply_anchor(None) is None
+          t.set_reply_anchor('', 'msg2')             # empty id silently ignored
+          t.set_reply_anchor('thread1', '')          # empty msg silently ignored, anchor stays
+          assert t.get_reply_anchor('thread1') == 'msg1'
+          t.clear_reply_anchor('thread1')
+          assert t.get_reply_anchor('thread1') is None
+
+          # parent_text cache: hits avoid re-fetch, None payloads cached too
+          import asyncio
+          class _FakeAPI:
+              def __init__(self): self.calls = 0
+              async def get_message(self, mid):
+                  self.calls += 1
+                  return {'transcript_txt': f'parent of {mid}'} if mid == 'with-text' else None
+          async def _tracker_async():
+              api = _FakeAPI()
+              t = ConversationTracker(api=api)
+              assert await t.get_parent_text('with-text') == 'parent of with-text'
+              assert await t.get_parent_text('with-text') == 'parent of with-text'   # cache hit
+              assert api.calls == 1
+              assert await t.get_parent_text('absent') is None
+              assert await t.get_parent_text('absent') is None                       # negative cache
+              assert api.calls == 2
+              assert await t.get_parent_text(None) is None and await t.get_parent_text('') is None
+              assert api.calls == 2
+          asyncio.run(_tracker_async())
 
           print('smoke tests OK')
           PY
