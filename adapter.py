@@ -239,15 +239,24 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     async def send_voice(
         self,
         chat_id: str,
-        path: str,
+        audio_path: str,
+        caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         """Send a voice memo via ``POST /v5/messages/audio`` (multipart).
 
-        ``path`` is a local audio file. CV transcribes it server-side and
-        threads the resulting message using ``thread_id`` from metadata
-        (same resolution rules as :meth:`send`).
+        ``audio_path`` is a local audio file. CV transcribes it
+        server-side and threads the resulting message using ``thread_id``
+        from metadata (same resolution rules as :meth:`send`).
+
+        Parameter names match :class:`BasePlatformAdapter.send_voice` —
+        Hermes core's media dispatch (``base.py:3640``) invokes us with
+        the keyword ``audio_path=``, so renaming this would break the
+        agent's "MEDIA:/foo.mp3 in reply" flow. ``caption`` is accepted
+        for signature compatibility but currently ignored (CV's audio
+        endpoint doesn't take a caption — the transcript IS the caption).
         """
         if self._api is None:
             return SendResult(success=False, error="adapter not connected")
@@ -255,7 +264,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         try:
             data = await self._api.send_audio_v5(
                 conversation_id=chat_id,
-                audio_path=path,
+                audio_path=audio_path,
                 thread_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
@@ -299,13 +308,43 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
-    async def send_document(
+    async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Attach a local image file (``.jpg``, ``.png``, ``.webp``, ...).
+
+        Hermes core's media dispatch wraps local image paths as
+        ``file://...`` URIs and routes them through
+        :meth:`BasePlatformAdapter.send_multiple_images`, whose default
+        implementation calls :meth:`send_image_file` per item. Without
+        this override the agent's "MEDIA:/foo.png" flow would fall back
+        to "🖼️ Image: /foo.png" plain-text from the base class — useless
+        on CV. Routes through the same signed-URL flow as
+        :meth:`send_document`; the file just happens to be an image.
+        """
+        return await self._send_file_or_link(
+            chat_id=chat_id,
+            path_or_url=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         """Attach a document (any non-image file) to the conversation.
 
@@ -314,11 +353,19 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         in the Hermes core method dispatch. Use this for ``.md``, PDFs,
         archives, audio clips not meant as voice memos, etc. For voice
         memos (transcribed server-side) use :meth:`send_voice`.
+
+        Parameter names match :class:`BasePlatformAdapter.send_document`
+        so Hermes core's media dispatch (``base.py:3652``) reaches us
+        with the right keywords. ``file_name``, if provided, overrides
+        the on-disk basename when building the attachment payload — e.g.
+        for renaming ``/tmp/tmpXYZ`` to ``report.md`` on the recipient
+        side.
         """
         return await self._send_file_or_link(
             chat_id=chat_id,
-            path_or_url=path,
+            path_or_url=file_path,
             caption=caption,
+            file_name=file_name,
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -362,6 +409,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        file_name: Optional[str] = None,
     ) -> SendResult:
         if self._api is None:
             return SendResult(success=False, error="adapter not connected")
@@ -391,7 +439,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                     success=False, error=f"file not found: {path}",
                 )
             mime_type = self._guess_mime(path)
-            filename = path.name
+            # Caller may override the basename so a temp path like
+            # ``/tmp/tmpXYZ`` shows up as ``report.md`` on the recipient.
+            filename = file_name or path.name
 
             urls = await self._api.get_signed_upload_urls(
                 [{"filename": filename, "mimetype": mime_type}],
