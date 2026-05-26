@@ -147,6 +147,31 @@ Carbon Voice's Flutter client embeds mentions in the transcript as `@[Display Na
 
 > ⚠️ **Voice-only messages:** mentions made by speaking the agent's name without typing `@` will not be detected, because the transcript won't contain the structured marker. To mention the agent from a voice memo, type the `@`-mention in the message caption or use the tagging UI before recording.
 
+### Voice replies (auto-TTS)
+
+Carbon Voice is voice-first, so the plugin can run the agent's text replies through Hermes' TTS pipeline and ship them as voice memos. The recipient sees a play button with the transcript inline (Carbon Voice transcribes the audio server-side), mirroring how a human responds on the platform.
+
+Three pieces have to line up for this to fire:
+
+1. **`CARBONVOICE_VOICE_OUT=true`** in `~/.hermes/.env` — tells the plugin to mark every inbound as `MessageType.VOICE` so Hermes core's auto-TTS gate accepts it.
+2. **`voice.auto_tts: true`** in `~/.hermes/config.yaml` — opts the gateway into auto-TTS globally (Hermes core default is off).
+3. **A configured TTS provider** in `config.yaml` under `tts.provider`. The default is `edge` (Microsoft Edge TTS — free, no API key). Other supported providers: `elevenlabs`, `openai`, `xai`, `mistral`, `neutts`.
+
+Example `config.yaml` snippet for Spanish voice via `edge`:
+
+```yaml
+voice:
+  auto_tts: true
+tts:
+  provider: edge
+  edge:
+    voice: es-ES-AlvaroNeural   # or es-MX-DaliaNeural, es-AR-ElenaNeural, …
+```
+
+With the three pieces in place, every text reply from the agent is automatically converted to audio and sent through the v5 audio endpoint. Leave `CARBONVOICE_VOICE_OUT` unset (default) to keep the original text-reply behavior.
+
+The bundled `platform_hint` reminds the agent that its replies will be spoken when voice-out is active — short sentences, no markdown tables, spelled-out symbols. The agent should attach long structured artifacts (code, JSON, tables) as files via `MEDIA:<path>` so the voice memo stays short and the artifact remains downloadable.
+
 ## Architecture
 
 ```
