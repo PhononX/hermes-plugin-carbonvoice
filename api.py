@@ -133,12 +133,21 @@ class CarbonVoiceAPI:
         transcript: str,
         thread_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """POST /v5/messages/text — create a text message in a conversation.
 
         Returns the created MessageV5 dict on 2xx. ``thread_id`` is the
         preferred field for threading (see module docstring); pass
         ``None`` for a new top-level post.
+
+        ``attachments`` is an optional list of
+        ``V5RequestAttachmentPayload`` dicts (same shape used by
+        :meth:`send_attachment_v5`). When the agent wants text + an
+        attached file in a single bubble (e.g. "here's the report" + a
+        .md file), pass both fields together — the server enforces a
+        non-empty ``transcript`` on this route, so use
+        :meth:`send_attachment_v5` for the attachment-only case.
         """
         client = self._require_client()
         body: Dict[str, Any] = {
@@ -148,6 +157,8 @@ class CarbonVoiceAPI:
         }
         if thread_id:
             body["thread_id"] = str(thread_id)
+        if attachments:
+            body["attachments"] = attachments
         resp = await client.post("/v5/messages/text", json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
@@ -226,6 +237,105 @@ class CarbonVoiceAPI:
         resp = await client.post("/v5/messages/attachment", json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
+
+    # ── Local-file attachment flow (v3 signed-URL + S3 + status) ────────
+    #
+    # CV's v5 attachment endpoint is URL-based — it expects ``link`` to
+    # point to an already-hosted file. To send a *local* file (the
+    # agent's generated .md, an audio clip, a PDF) we follow the same
+    # four-step pattern the Flutter client uses:
+    #
+    #   1. ``get_signed_upload_urls`` → pre-signed S3 PUT URLs
+    #   2. ``upload_to_s3``           → PUT the raw bytes (no Bearer)
+    #   3. ``send_text_v5`` /
+    #      ``send_attachment_v5``     → create the message with
+    #                                    ``type: "file"`` referencing the
+    #                                    canonical S3 URL (the signed URL
+    #                                    minus its query string)
+    #   4. ``update_attachment``      → flip status from ``Initializing``
+    #                                    to ``Uploaded`` / ``Failed`` so
+    #                                    the recipient's UI reflects
+    #                                    completion
+    #
+    # The PR #251 backend change (commit d209c472) exposes ``status`` and
+    # ``percent_complete`` on the attachment response, which is what
+    # makes step 4 visible to clients.
+
+    async def get_signed_upload_urls(
+        self,
+        files: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        """POST /v3/attachments/signedurl — get pre-signed S3 upload URLs.
+
+        ``files`` is a list of ``{"filename": ..., "mimetype": ...}``
+        dicts (the server's ``CreateAttachmentUrls`` DTO). Returns the
+        ``AttachmentUrl`` list ``[{"url", "filename", "mimetype"}, ...]``
+        in the same order, where each ``url`` is a short-lived S3
+        pre-signed PUT URL. The canonical attachment ``link`` we hand
+        back to CV is this URL with the query string stripped (the
+        bucket's ACL is public-read for the rendered path).
+        """
+        if not files:
+            return []
+        client = self._require_client()
+        resp = await client.post(
+            "/v3/attachments/signedurl",
+            json={"files": files},
+            headers={"x-api-version": "3"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    async def upload_to_s3(
+        self,
+        signed_url: str,
+        file_path: str,
+        mime_type: str,
+    ) -> None:
+        """PUT the file at *file_path* to *signed_url* directly.
+
+        The signed URL embeds its own AWS credentials in the query
+        string, so we must NOT send our ``Authorization: Bearer …``
+        header on this request — that's why we go via a one-shot
+        ``httpx.AsyncClient`` instead of ``self._client``. Raises on
+        non-2xx so the caller can flip the attachment status to
+        ``Failed``.
+        """
+        from pathlib import Path as _Path
+
+        path = _Path(file_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"file not found: {path}")
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as plain:
+            with path.open("rb") as fh:
+                resp = await plain.put(
+                    signed_url,
+                    content=fh.read(),
+                    headers={"Content-Type": mime_type},
+                )
+        resp.raise_for_status()
+
+    async def update_attachment(
+        self,
+        message_id: str,
+        attachment_id: str,
+        body: Dict[str, Any],
+    ) -> None:
+        """PUT /messages/{message_id}/attachment/{attachment_id}.
+
+        Used to flip ``status`` (``Initializing`` → ``Uploading`` →
+        ``Uploaded`` / ``Failed``) and ``percent_complete`` on an
+        attachment after the S3 upload settles. ``body`` should carry
+        the full attachment row the server expects — ``type``, ``link``,
+        ``filename``, ``mime_type``, ``status``, ``percent_complete``.
+        """
+        client = self._require_client()
+        resp = await client.put(
+            f"/messages/{message_id}/attachment/{attachment_id}",
+            json=body,
+        )
+        resp.raise_for_status()
 
     async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
         """GET /v5/messages/{id} — returns the MessageV5 dict or None on 4xx.

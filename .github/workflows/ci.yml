@@ -259,6 +259,9 @@ jobs:
               'get_message_v5',        # v5 fetch single
               'get_messages_by_ids_v5',# v5 batch fetch (PR 4 thread context)
               'list_channel_message_index',  # v3 channel index (PR 4)
+              'get_signed_upload_urls',# v3 signed-URL fetch (PR 5)
+              'upload_to_s3',          # direct S3 PUT (PR 5)
+              'update_attachment',     # attachment status flip (PR 5)
               'get_message',           # legacy v3 single fetch (kept)
               'get_channel',           # channel metadata
               'whoami', 'fetch_recent', 'fetch_reactions', 'react', 'mark_read',
@@ -293,6 +296,32 @@ jobs:
           tc_ttl.set_cached_thread_context('x', 'v')
           _time.sleep(0.01)
           assert tc_ttl.get_cached_thread_context('x') is None
+
+          # PR 5 — send_text_v5 now accepts an optional attachments param so
+          # the agent can ship "here's the report" + the .md/PDF in a single
+          # bubble. Defaults still work for plain text — guards against a
+          # future refactor flipping the param to required.
+          import inspect
+          sig = inspect.signature(CarbonVoiceAPI.send_text_v5)
+          assert 'attachments' in sig.parameters, \
+              'send_text_v5 missing attachments param (PR 5)'
+          assert sig.parameters['attachments'].default is None, \
+              'send_text_v5.attachments must default to None (plain-text path)'
+
+          # PR 5 — adapter is_url / mime guesser helpers. Can't import
+          # CarbonVoiceAdapter here (it pulls gateway.*) but we can reach
+          # into the module via importlib without instantiating it.
+          # Use a fresh module spec to avoid polluting carbonvoice.* with
+          # the gateway-dependent adapter import. Just verify the helpers
+          # are present by reading the file source.
+          import pathlib as _pl
+          adapter_src = (_pl.Path('adapter.py')).read_text()
+          for marker in ('def _is_url(', 'def _guess_mime(',
+                         'def _send_file_or_link(',
+                         'def _create_attachment_message(',
+                         'def _upload_attachment_in_background('):
+              assert marker in adapter_src, f'adapter.py missing: {marker}'
+          print('adapter.py attachment helpers: present')
 
           print('smoke tests OK')
           PY
