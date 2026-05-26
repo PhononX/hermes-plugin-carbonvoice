@@ -83,6 +83,28 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
+    # Voice-out integration with Hermes core's auto-TTS pipeline.
+    #
+    # When core generates a TTS audio for the agent's reply and ships it
+    # via ``send_voice`` → ``/v5/messages/audio``, Carbon Voice runs
+    # server-side STT and renders the resulting message as a voice-memo
+    # bubble with the transcript inline. That means the spoken text IS
+    # the visible text — sending the same content again as a text bubble
+    # is pure duplication.
+    #
+    # ``voice_out_carries_text = True`` tells Hermes core (see
+    # ``gateway/platforms/base.py``'s ``_tts_caption_delivered`` check)
+    # to suppress the follow-up text send when auto-TTS succeeded.
+    # Conceptually it's the CV analog of Telegram's caption field on
+    # voice messages — different mechanism (STT vs caption), same UX
+    # contract (one bubble, text + audio together).
+    #
+    # The base class default is False, so adapters that don't override
+    # this are unaffected. Requires the patched base.py from PR 6 (and
+    # the parallel upstream PR) — without it the attribute is read but
+    # ignored, and we ship a duplicate text bubble.
+    voice_out_carries_text = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("carbonvoice"))
         extra = config.extra or {}
