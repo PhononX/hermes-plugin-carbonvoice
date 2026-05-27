@@ -210,6 +210,24 @@ CARBONVOICE_VOICE_OUT=false
 
 Then `hermes gateway restart`. Existing deployments that never opt in stay text-only.
 
+### Multimodal input (images)
+
+Carbon Voice users can attach images to a message via the standard CV UI — photos, screenshots, logos, diagrams. The plugin downloads each inbound image to `~/.hermes/image_cache/` and hands it to the agent via Hermes core's multimodal pipeline, so Claude vision (or any vision-capable model) sees the bytes natively and can describe / analyze the picture.
+
+| Attachment type | Status |
+|---|---|
+| `image/*` (jpg, png, webp, gif, …) | ✅ Supported — downloaded + passed to vision |
+| `type:"link"` (CV's share-link UI) | ✅ Supported — URL prepended to the message text so the agent fetches it with its own browser / web tools |
+| Everything else (PDFs, text files, audio, binaries) | ⚠️ Logged at WARNING and skipped — the text part of the message still reaches the agent |
+
+**Why not PDFs / text files yet?** Hermes core doesn't ship a native document-extraction pipeline. If the plugin handed the agent a `file://...pdf` path, the agent would fall through to `read_file` (returns binary garbage), then try to invoke `terminal` / `execute_code` to run `pdftotext` or `pypdf` — which triggers a permission prompt on the operator side instead of returning a useful answer. Skipping PDFs cleanly is a better default than producing that confusing UX. Document support is queued for a follow-up PR that extracts text in the adapter and prepends it to the agent's message context.
+
+**Voice memos** remain transcript-only. CV transcribes the audio server-side before delivery, so the agent reads the transcribed text via the normal message body; the `audio_models[]` raw audio file isn't pulled into the agent context.
+
+**Authentication:** CV's S3 URLs are auth-gated, so the plugin resolves a short-lived signed download URL via `GET /attachments/signedurl/:attachment_id` per attachment before fetching the bytes. No operator action required — uses the same `CARBONVOICE_PAT` you already configured.
+
+**Size cap:** Set via `CARBONVOICE_MAX_ATTACHMENT_MB` (default `10`). Anything larger is dropped with a log line so the agent doesn't blow through vision-API token budgets on a 50 MB screenshot. Raise the cap for specialized workflows.
+
 #### Upstream dependency (Hermes core)
 
 Voice-out lands cleanly only when Hermes core honors two contracts the plugin relies on:

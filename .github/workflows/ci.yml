@@ -323,6 +323,66 @@ jobs:
               assert marker in adapter_src, f'adapter.py missing: {marker}'
           print('adapter.py attachment helpers: present')
 
+          # PR 7 — inbound multimodal. parse.extract_attachments
+          # should round-trip the exact payload shape we captured from
+          # a real CV inbound (image attachment with a UUID filename
+          # and a status:Uploaded marker). The smoke locks the field
+          # names (``_id`` and ``link``, not the v5-outgoing ``url``)
+          # against a future CV schema drift quietly returning empty.
+          from carbonvoice.parse import extract_attachments
+          real_inbound = {
+              "message_id": "c31993e0-595d-11f1-bcf2-1dbc644879fd",
+              "attachments": [{
+                  "_id": "6a1631eb6cc843d778fd40f6",
+                  "creator_id": "Fmx4ddC6EZT3ugls",
+                  "type": "file",
+                  "link": "https://pxmessages.s3.us-east-2.amazonaws.com/uploaded-files/.../foo.png",
+                  "filename": "foo.png",
+                  "mime_type": "image/png",
+                  "length_in_bytes": None,
+                  "status": "Uploaded",
+              }],
+          }
+          out = extract_attachments(real_inbound)
+          assert len(out) == 1, f"expected 1 attachment, got {len(out)}"
+          att = out[0]
+          assert att["_id"] == "6a1631eb6cc843d778fd40f6"
+          assert att["mime_type"] == "image/png"
+          assert att["link"].startswith("https://"), "link field must propagate"
+          # Defensive cases
+          assert extract_attachments({}) == []
+          assert extract_attachments({"attachments": None}) == []
+          assert extract_attachments({"attachments": [{}]}) == [], \
+              "entries with neither _id nor link must be dropped"
+          print('extract_attachments: round-trips real payload + defensive cases')
+
+          # PR 7 — api primitives for inbound download
+          for method in ('get_attachment_download_url', 'download_attachment'):
+              assert hasattr(CarbonVoiceAPI, method), \
+                  f'CarbonVoiceAPI missing {method} (PR 7)'
+          print('CarbonVoiceAPI: inbound download primitives present')
+
+          # PR 7 — adapter wires the media collector before MessageEvent
+          assert 'def _collect_inbound_media(' in adapter_src, \
+              'adapter.py missing _collect_inbound_media (PR 7)'
+          assert 'extract_attachments' in adapter_src, \
+              'adapter.py must import extract_attachments (PR 7)'
+          assert 'media_urls=media_urls' in adapter_src, \
+              'adapter.py _process_message must wire media_urls into MessageEvent'
+          assert 'media_types=media_types' in adapter_src, \
+              'adapter.py _process_message must wire media_types into MessageEvent'
+          assert 'self._max_attachment_bytes' in adapter_src, \
+              'adapter.py must enforce max_attachment_bytes (size cap)'
+          # Link attachment handling: type:"link" → prepend URL to text
+          # instead of trying to download (it's not a file). Locks the
+          # contract so a future refactor doesn't drop the third tuple
+          # element silently.
+          assert 'link_urls' in adapter_src, \
+              'adapter.py _collect_inbound_media must surface link attachments'
+          assert '[Attached link:' in adapter_src, \
+              'adapter.py must prepend link URLs to clean_text as "[Attached link: <url>]"'
+          print('adapter inbound media wiring: present (images + links)')
+
           # PR 6 — voice-out gate. setup.py can't be imported here (it
           # pulls gateway.*), so we source-grep both files for the
           # required wiring. Three assertions:

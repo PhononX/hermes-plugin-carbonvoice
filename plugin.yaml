@@ -92,3 +92,7 @@ optional_env:
     description: "When true, the agent's text replies are auto-converted to voice memos via Hermes' TTS pipeline and shipped to Carbon Voice's /v5/messages/audio endpoint (server-side STT then re-displays them with transcript). Default false (text replies). Requires voice.auto_tts: true in ~/.hermes/config.yaml plus a TTS provider configured (edge works key-less)."
     prompt: "Always reply with voice memos? (true/false)"
     password: false
+  - name: CARBONVOICE_MAX_ATTACHMENT_MB
+    description: "Maximum size (MB) for inbound attachments the plugin will download and forward to the agent's multimodal pipeline. Images, PDFs, and text files under the cap are downloaded to ~/.hermes/{image,document}_cache and exposed via MessageEvent.media_urls so the agent can see/read them. Anything larger is logged as a WARNING and skipped (the text part of the message still reaches the agent). Default 10 MB."
+    prompt: "Max inbound attachment size in MB"
+    password: false

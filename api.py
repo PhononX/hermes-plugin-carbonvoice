@@ -337,6 +337,95 @@ class CarbonVoiceAPI:
         )
         resp.raise_for_status()
 
+    # ── Inbound attachment download (PR 7) ──────────────────────────────
+    #
+    # CV's inbound messages carry ``attachments[]`` entries whose
+    # ``link`` is the canonical S3 URL — but that URL requires AWS
+    # auth (returns 403 to unauthenticated requests). To consume the
+    # file we ask CV for a short-lived pre-signed GET URL via
+    # ``GET /attachments/signedurl/:attachment_id`` (authenticated with
+    # our Bearer), then download the bytes from S3 with no auth header
+    # (the signature lives in the query string).
+
+    async def get_attachment_download_url(self, attachment_id: str) -> str:
+        """GET /attachments/signedurl/:attachment_id — pre-signed S3 GET URL.
+
+        Returns the URL as a plain string (CV's controller returns the
+        URL as the bare response body, no JSON envelope). The signature
+        in the query string makes the URL self-authenticating for the
+        S3 GET that follows; do NOT send our Bearer header on that
+        request (S3 would 400 on the unexpected auth).
+        """
+        client = self._require_client()
+        resp = await client.get(f"/attachments/signedurl/{attachment_id}")
+        resp.raise_for_status()
+        # CV returns the URL either as a plain string or wrapped in
+        # quotes (JSON string). Strip leading/trailing quotes either way.
+        url = resp.text.strip()
+        if len(url) >= 2 and url[0] == url[-1] and url[0] in ('"', "'"):
+            url = url[1:-1]
+        return url
+
+    async def download_attachment(
+        self,
+        attachment_id: str,
+        dest_dir: "Path",
+        *,
+        filename: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> "Path":
+        """Resolve the attachment's signed URL and stream bytes to disk.
+
+        ``dest_dir`` is created if missing. ``filename`` overrides the
+        on-disk name (default: the attachment_id with no extension —
+        callers that know the filename should pass it). ``max_bytes``
+        rejects responses whose ``Content-Length`` exceeds the cap so
+        we don't bloat the agent context with multi-MB uploads.
+
+        Raises:
+            ValueError: if ``max_bytes`` is set and the response is
+                larger.
+            httpx.HTTPStatusError: on the signed-URL fetch or the S3
+                download.
+        """
+        from pathlib import Path as _Path
+
+        dest_dir = _Path(dest_dir).expanduser()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_name = filename or f"{attachment_id}.bin"
+        out_path = dest_dir / out_name
+
+        signed_url = await self.get_attachment_download_url(attachment_id)
+
+        # S3 GET — use a fresh client without our Bearer header, since
+        # the signed URL carries its own credentials in the query.
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as plain:
+            async with plain.stream("GET", signed_url) as resp:
+                resp.raise_for_status()
+                if max_bytes is not None:
+                    cl = resp.headers.get("content-length")
+                    if cl and int(cl) > max_bytes:
+                        raise ValueError(
+                            f"attachment {attachment_id} too large: "
+                            f"{cl} bytes > limit {max_bytes}"
+                        )
+                with out_path.open("wb") as fh:
+                    written = 0
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+                        written += len(chunk)
+                        if max_bytes is not None and written > max_bytes:
+                            # Truncate + raise — partial file gets
+                            # cleaned up by the caller's exception
+                            # handler when it falls out of scope.
+                            fh.close()
+                            out_path.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"attachment {attachment_id} exceeded "
+                                f"limit {max_bytes} mid-stream"
+                            )
+        return out_path
+
     async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
         """GET /v5/messages/{id} — returns the MessageV5 dict or None on 4xx.
 
