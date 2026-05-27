@@ -90,6 +90,24 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         "disable_ack_reaction": _bool_env("CARBONVOICE_DISABLE_ACK_REACTION"),
         "disable_mark_read": _bool_env("CARBONVOICE_DISABLE_MARK_READ"),
         "ignored_senders_log": os.getenv("CARBONVOICE_IGNORED_SENDERS_LOG") or None,
+        # When true, every inbound MessageEvent is marked as
+        # ``MessageType.VOICE`` regardless of whether the user typed or
+        # spoke. This unlocks Hermes core's auto-TTS path
+        # (``base.py:3493``) and the ``voice_mode`` dispatch
+        # (``run.py:11142``), so the agent's text reply is auto-
+        # converted to audio and sent via :meth:`send_voice` →
+        # ``/v5/messages/audio``. Carbon Voice transcribes the audio
+        # server-side, so the recipient sees a voice memo bubble with
+        # transcript — the symmetric voice-first experience expected on
+        # this platform.
+        #
+        # Required companion config on the operator side:
+        #   - ``voice.auto_tts: true`` in ``config.yaml`` (or use
+        #     ``/voice on`` per chat if Hermes core ever wires slash
+        #     commands for CV)
+        #   - A configured TTS provider in ``config.yaml`` under
+        #     ``tts.provider`` (``edge`` works with no API key)
+        "voice_out": _bool_env("CARBONVOICE_VOICE_OUT"),
     }
 
     # CARBONVOICE_SHARED_GROUP_SESSIONS=true → flip
@@ -205,12 +223,36 @@ def register(ctx) -> None:
             "- DO NOT just describe the file's path in prose ('the file is "
             "at /tmp/foo.md'); that ships as plain text, not an attachment. "
             "You must emit the literal `MEDIA:/tmp/foo.md` line.\n\n"
+            "## Voice-out (auto-TTS)\n"
+            "If the operator has enabled voice-out for this conversation "
+            "(env ``CARBONVOICE_VOICE_OUT=true`` + ``voice.auto_tts: true`` "
+            "in config), Hermes core automatically converts your text "
+            "reply into a voice memo via a TTS provider and ships it via "
+            "the audio endpoint — Carbon Voice then transcribes the audio "
+            "server-side so the user sees a voice-memo bubble with the "
+            "transcript inline. You don't need to call any TTS tool or "
+            "emit MEDIA: for an audio path — just write your reply as "
+            "text and Hermes handles the conversion.\n\n"
+            "When voice-out is active, optimize the reply for spoken "
+            "delivery:\n"
+            "- Conversational tone, short sentences\n"
+            "- Avoid markdown that doesn't translate to speech (no "
+            "bullet lists with bare ``-``, no tables, no code fences — "
+            "they'll be read aloud verbatim and sound awful)\n"
+            "- Spell out symbols you'd expect read literally (use "
+            "\"and\" instead of ``&``, \"percent\" instead of ``%``)\n"
+            "- Keep under ~30 seconds of audio (~120 words) unless the "
+            "user explicitly asked for a long answer; long voice memos "
+            "are skimmed, not listened to\n\n"
+            "If you specifically need to send code, JSON, a table, or "
+            "any structured artifact in this conversation, attach it as "
+            "a file via the MEDIA: directive instead — that keeps the "
+            "voice-memo bubble short and the artifact downloadable.\n\n"
             "## Other notes\n"
-            "Carbon Voice transcribes inbound voice → text before delivery, "
-            "and your text replies are rendered as messages (Carbon Voice "
-            "handles any TTS playback on the user side). Plain text and "
-            "lightweight markdown render best — avoid complex tables, "
-            "multi-column layouts, or raw HTML. Keep responses "
-            "conversational and concise."
+            "Carbon Voice transcribes inbound voice → text before "
+            "delivery. Plain text and lightweight markdown render best "
+            "for text-mode replies — avoid complex tables, multi-column "
+            "layouts, or raw HTML. Keep responses conversational and "
+            "concise either way."
         ),
     )

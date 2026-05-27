@@ -83,6 +83,28 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
+    # Voice-out integration with Hermes core's auto-TTS pipeline.
+    #
+    # When core generates a TTS audio for the agent's reply and ships it
+    # via ``send_voice`` → ``/v5/messages/audio``, Carbon Voice runs
+    # server-side STT and renders the resulting message as a voice-memo
+    # bubble with the transcript inline. That means the spoken text IS
+    # the visible text — sending the same content again as a text bubble
+    # is pure duplication.
+    #
+    # ``voice_out_carries_text = True`` tells Hermes core (see
+    # ``gateway/platforms/base.py``'s ``_tts_caption_delivered`` check)
+    # to suppress the follow-up text send when auto-TTS succeeded.
+    # Conceptually it's the CV analog of Telegram's caption field on
+    # voice messages — different mechanism (STT vs caption), same UX
+    # contract (one bubble, text + audio together).
+    #
+    # The base class default is False, so adapters that don't override
+    # this are unaffected. Requires the patched base.py from PR 6 (and
+    # the parallel upstream PR) — without it the attribute is read but
+    # ignored, and we ship a duplicate text bubble.
+    voice_out_carries_text = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("carbonvoice"))
         extra = config.extra or {}
@@ -105,6 +127,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         self._creator_id: Optional[str] = extra.get("creator_id") or None
         self._self_user_id: Optional[str] = None
         self._mark_read_enabled: bool = not bool(extra.get("disable_mark_read"))
+        # Voice-out: when true, every inbound MessageEvent is marked
+        # ``MessageType.VOICE`` so Hermes core's auto-TTS pipeline
+        # (``base.py:3493``) converts the agent's text reply to audio
+        # and ships it via :meth:`send_voice` → ``/v5/messages/audio``.
+        # Requires ``voice.auto_tts: true`` and a TTS provider in
+        # ``config.yaml`` to actually fire — without those, marking
+        # VOICE is a no-op (the gate's other conditions still fail).
+        # Default ``False`` to preserve text-out for existing
+        # deployments that haven't opted in.
+        self._voice_out: bool = bool(extra.get("voice_out"))
 
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
@@ -1048,9 +1080,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             message_id=message_id,
             thread_id=session_thread_id,
         )
+        # Mark VOICE when ``CARBONVOICE_VOICE_OUT=true`` so Hermes core's
+        # auto-TTS gate (``base.py:3493``) accepts this event for voice-
+        # mode dispatch. CV doesn't distinguish text-typed vs voice-
+        # transcribed at the outbound layer (everything ends up as
+        # either a text bubble or a voice memo bubble), so applying
+        # VOICE to every inbound is the right abstraction for a
+        # voice-first platform — the operator opts in once and gets a
+        # consistent symmetric experience.
+        msg_type = MessageType.VOICE if self._voice_out else MessageType.TEXT
         event = MessageEvent(
             text=clean_text,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             raw_message=msg,
             message_id=message_id,

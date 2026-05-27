@@ -147,6 +147,78 @@ Carbon Voice's Flutter client embeds mentions in the transcript as `@[Display Na
 
 > ⚠️ **Voice-only messages:** mentions made by speaking the agent's name without typing `@` will not be detected, because the transcript won't contain the structured marker. To mention the agent from a voice memo, type the `@`-mention in the message caption or use the tagging UI before recording.
 
+### Voice replies (auto-TTS)
+
+Carbon Voice is voice-first, so the plugin can run the agent's text replies through Hermes' TTS pipeline and ship them as voice memos. The recipient sees a single bubble — a play button with the transcript inline (Carbon Voice transcribes the audio server-side) — threaded as a reply to the original message, mirroring how a human responds on the platform.
+
+#### Setup checklist (three pieces, all required)
+
+| # | Where | Setting | Purpose |
+|---|---|---|---|
+| 1 | `~/.hermes/.env` | `CARBONVOICE_VOICE_OUT=true` | The plugin marks every inbound as `MessageType.VOICE` so Hermes core's auto-TTS gate accepts the event. |
+| 2 | `~/.hermes/config.yaml` | `voice.auto_tts: true` | Opts the gateway into the TTS pipeline globally. Hermes core default is `false`. |
+| 3 | `~/.hermes/config.yaml` | `tts.provider: <name>` | TTS engine that synthesizes the audio. `edge` (Microsoft Edge TTS) is the default — free, no API key. Alternatives: `elevenlabs`, `openai`, `xai`, `mistral`, `neutts` — each needs its own API key in `.env`. |
+
+Then restart: `hermes gateway restart`.
+
+#### Worked example: Spanish voice with the free `edge` provider
+
+`~/.hermes/.env` (append):
+```bash
+CARBONVOICE_VOICE_OUT=true
+```
+
+`~/.hermes/config.yaml` (edit the existing `voice:` and `tts:` blocks):
+```yaml
+voice:
+  auto_tts: true              # was: false
+  # …rest of voice config…
+
+tts:
+  provider: edge              # already the default
+  edge:
+    voice: es-MX-DaliaNeural  # mexican female; pick any edge voice
+  # …other providers…
+```
+
+Edge voices in Spanish worth trying: `es-MX-DaliaNeural` (MX female), `es-MX-JorgeNeural` (MX male), `es-AR-ElenaNeural` (AR female), `es-AR-TomasNeural` (AR male), `es-ES-AlvaroNeural` (Castilian male). English default is `en-US-AriaNeural`.
+
+#### What the user sees
+
+With the three pieces in place, every text reply from the agent is auto-converted to audio and shipped through `POST /v5/messages/audio`. The recipient sees one bubble (voice memo + CV's server-side transcript, threaded under their original message). Behind the scenes:
+
+```
+agent text reply
+    ↓
+Hermes core auto-TTS  →  /tmp/tts_xxx.mp3 (via edge / elevenlabs / …)
+    ↓
+adapter.send_voice    →  POST /v5/messages/audio (multipart)
+    ↓
+CV backend runs STT   →  voice memo bubble with transcript inline
+```
+
+The bundled `platform_hint` reminds the agent that its replies will be spoken when voice-out is active — short sentences, no markdown tables, spelled-out symbols, ~30s ceiling. Long structured artifacts (code, JSON, tables) should be attached as files via `MEDIA:<path>` so the voice memo stays short and the artifact remains downloadable.
+
+#### Turning it off
+
+Any of the three flags reverts the behavior. The fastest is unsetting the env var:
+
+```bash
+# in ~/.hermes/.env
+CARBONVOICE_VOICE_OUT=false
+```
+
+Then `hermes gateway restart`. Existing deployments that never opt in stay text-only.
+
+#### Upstream dependency (Hermes core)
+
+Voice-out lands cleanly only when Hermes core honors two contracts the plugin relies on:
+
+- `play_tts(...)` must propagate `reply_to` so the TTS audio threads under the user's message (instead of arriving as a top-level post).
+- Hermes core's `_tts_caption_delivered` check must accept `adapter.voice_out_carries_text = True` to suppress the duplicate text bubble — CV's server-side STT already provides the transcript inside the voice-memo bubble, so sending the same text again as a separate bubble is pure noise.
+
+Both contracts are pending upstream review (PR against `NousResearch/hermes-agent`). Until that PR merges, run the patched `base.py` locally — without it, voice-out still produces audio but you'll see duplicate text bubbles and top-level (non-threaded) replies. The plugin itself works correctly regardless.
+
 ## Architecture
 
 ```

@@ -323,5 +323,27 @@ jobs:
               assert marker in adapter_src, f'adapter.py missing: {marker}'
           print('adapter.py attachment helpers: present')
 
+          # PR 6 — voice-out gate. setup.py can't be imported here (it
+          # pulls gateway.*), so we source-grep both files for the
+          # required wiring. Three assertions:
+          #   1. setup.py reads CARBONVOICE_VOICE_OUT via _bool_env and
+          #      stuffs it into the seed dict
+          #   2. adapter.__init__ reads extra['voice_out'] into
+          #      self._voice_out
+          #   3. _process_message routes through MessageType.VOICE when
+          #      self._voice_out is true (instead of always TEXT)
+          setup_src = (_pl.Path('setup.py')).read_text()
+          assert "_bool_env(\"CARBONVOICE_VOICE_OUT\")" in setup_src, \
+              'setup.py missing _bool_env("CARBONVOICE_VOICE_OUT") seed'
+          assert "\"voice_out\":" in setup_src, \
+              'setup.py missing "voice_out" seed key'
+          assert "self._voice_out" in adapter_src, \
+              'adapter.py missing self._voice_out field'
+          assert "extra.get(\"voice_out\")" in adapter_src, \
+              'adapter.py not reading voice_out from extra'
+          assert "MessageType.VOICE if self._voice_out else MessageType.TEXT" in adapter_src, \
+              'adapter.py _process_message must branch on self._voice_out to set MessageType'
+          print('voice-out gate (PR 6): wired')
+
           print('smoke tests OK')
           PY
