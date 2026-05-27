@@ -86,6 +86,49 @@ def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
 
 
+def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return normalized inbound attachments as a list of dicts.
+
+    Walks ``msg['attachments']`` and returns one dict per attachment
+    with these keys (mirrors the field names CV uses on the wire):
+
+        - ``_id``: server-assigned attachment id (used by
+          :meth:`CarbonVoiceAPI.get_attachment_download_url` to resolve
+          a pre-signed S3 GET URL)
+        - ``link``: canonical S3 URL (auth-gated — don't try to GET it
+          without going through the signedurl endpoint first)
+        - ``filename``: as uploaded; often a UUID, not a friendly name
+        - ``mime_type``: e.g. ``"image/png"``, ``"application/pdf"``
+        - ``length_in_bytes``: int or None (CV sometimes leaves it null)
+        - ``type``: typically ``"file"``; other AttachmentType values
+          (``link``, ``location``, ...) are rare on inbound
+
+    Entries missing both ``_id`` and ``link`` are dropped (defensive —
+    CV's responses occasionally include legacy/null rows). Voice memos
+    are NOT included here; their audio + transcript live in
+    ``audio_models[]`` and ``text_models[]`` respectively, surfaced via
+    :func:`extract_transcript` and inbound media handling on the audio
+    side (separate path, future PR).
+    """
+    out: List[Dict[str, Any]] = []
+    for att in (msg.get("attachments") or []):
+        if not isinstance(att, dict):
+            continue
+        aid = first_str(att.get("_id"), att.get("id"))
+        link = first_str(att.get("link"), att.get("url"))
+        if not aid and not link:
+            continue
+        out.append({
+            "_id": aid or "",
+            "link": link or "",
+            "filename": att.get("filename") or "",
+            "mime_type": att.get("mime_type") or "",
+            "length_in_bytes": att.get("length_in_bytes"),
+            "type": att.get("type") or "file",
+        })
+    return out
+
+
 def extract_inline_mentions(text: Optional[str]) -> List[Tuple[str, str]]:
     """Return ``(display_name, user_guid)`` pairs from CV's inline syntax.
 

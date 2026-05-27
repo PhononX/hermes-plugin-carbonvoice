@@ -108,6 +108,15 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         #   - A configured TTS provider in ``config.yaml`` under
         #     ``tts.provider`` (``edge`` works with no API key)
         "voice_out": _bool_env("CARBONVOICE_VOICE_OUT"),
+        # PR 7 — inbound multimodal: max attachment size (MB) the
+        # adapter will download from CV and forward to Hermes core's
+        # multimodal pipeline. Anything larger is logged and skipped
+        # (the agent still sees the text part of the message; only the
+        # attachment is dropped). Default 10 MB balances Claude /
+        # OpenAI vision recommendations against typical CV usage.
+        "max_attachment_mb": int(
+            os.getenv("CARBONVOICE_MAX_ATTACHMENT_MB") or "10"
+        ),
     }
 
     # CARBONVOICE_SHARED_GROUP_SESSIONS=true → flip
@@ -248,6 +257,32 @@ def register(ctx) -> None:
             "any structured artifact in this conversation, attach it as "
             "a file via the MEDIA: directive instead — that keeps the "
             "voice-memo bubble short and the artifact downloadable.\n\n"
+            "## Inbound attachments (multimodal)\n"
+            "Two attachment types are wired through to you:\n"
+            "- **Images** (.jpg/.png/.webp/...): downloaded and "
+            "surfaced via Claude vision — reference what you see "
+            "naturally (\"in the screenshot you sent\", \"the photo "
+            "shows...\") without asking the user to describe it.\n"
+            "- **Links** (CV's link-share UI): the URL is prepended "
+            "to the user's message text as a line like ``[Attached "
+            "link: https://...]``. Use your existing browser / fetch "
+            "tools (``browser_navigate``, ``fetch_url``, etc.) to "
+            "open it the same way you would for any URL the user "
+            "types inline.\n\n"
+            "Other attachment types are NOT delivered to you in this "
+            "plugin version: PDFs, text files, code files, archives, "
+            "and audio attachments arrive only as a notice in the "
+            "logs — the text part of the user's message still reaches "
+            "you, but the file contents do not. If the user attaches "
+            "something other than an image / link and asks about its "
+            "contents, tell them honestly that you only received the "
+            "image / link / text and don't have the file body. Do NOT "
+            "reach for ``terminal``, ``execute_code``, or ``read_file`` "
+            "to try to extract the file yourself — those tools require "
+            "operator approval and produce a worse UX than just "
+            "being upfront about the limitation.\n\n"
+            "Voice memos arrive as transcript (server-side STT by CV) "
+            "in the text channel as usual.\n\n"
             "## Other notes\n"
             "Carbon Voice transcribes inbound voice → text before "
             "delivery. Plain text and lightweight markdown render best "

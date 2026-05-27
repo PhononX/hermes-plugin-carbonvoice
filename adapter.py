@@ -59,6 +59,7 @@ from .constants import (
 from .dedupe import SeenCache
 from .gate import MentionGate
 from .parse import (
+    extract_attachments,
     extract_channel_id,
     extract_creator_id,
     extract_message_id,
@@ -137,6 +138,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # Default ``False`` to preserve text-out for existing
         # deployments that haven't opted in.
         self._voice_out: bool = bool(extra.get("voice_out"))
+        # Inbound multimodal (PR 7): per-attachment byte cap. CV's S3
+        # URLs can hand back arbitrarily large files, and Hermes core's
+        # vision / document pipeline pays per token for image bytes and
+        # extracted text — a 50MB PDF blowing through the size limit
+        # crashes the agent's API call. Default 10 MB matches what
+        # Claude / OpenAI vision recommend; operators can raise it for
+        # specialized use cases via ``CARBONVOICE_MAX_ATTACHMENT_MB``.
+        self._max_attachment_bytes: int = int(
+            extra.get("max_attachment_mb") or 10
+        ) * 1024 * 1024
 
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
@@ -932,6 +943,150 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # avoids missing concurrent writes that landed during the call.
         self._cursor.advance(request_started_at)
 
+    # ── Inbound multimodal (PR 7) ────────────────────────────────────────
+    #
+    # CV inbound payloads carry ``attachments[]`` whose ``link`` is the
+    # canonical S3 URL — auth-gated, returns 403 to unauthenticated
+    # requests. To consume them we resolve a signed S3 GET URL via
+    # ``GET /attachments/signedurl/:_id`` (authenticated with our PAT),
+    # download the bytes to ``IMAGE_CACHE_DIR``, and return ``file://``
+    # URIs for Hermes core to inject into the agent's multimodal
+    # context (Claude vision sees the bytes inline).
+    #
+    # Scope for v1: ``image/*`` only. Other mime types (PDFs,
+    # ``text/*``, binaries) are dropped with a WARNING because Hermes
+    # core has no native document-extraction pipeline today. Without
+    # one, the agent receives a ``file://...pdf`` path it can't
+    # natively read — it reaches for ``read_file`` (returns binary
+    # garbage), then ``terminal`` (asks the operator to approve
+    # ``pdftotext`` / similar), then ``execute_code`` (tries Python
+    # parsers that may not be installed). Net UX: the user gets a
+    # permission prompt instead of an answer. Better to skip cleanly
+    # and document the gap.
+    #
+    # Document support is queued for a follow-up PR that adds an
+    # extraction pass (likely via ``pypdf`` + ``markdown`` / ``html``
+    # parsers) and prepends the extracted text into the agent's
+    # message context the same way thread context is prepended today.
+    # Audio attachments live in ``audio_models[]``, not
+    # ``attachments[]``; the transcript is already extracted via
+    # :func:`extract_transcript`.
+
+    async def _collect_inbound_media(
+        self, msg: Dict[str, Any]
+    ) -> "tuple[list[str], list[str], list[str]]":
+        """Process inbound attachments and return three lists:
+
+          - ``media_urls``  — ``file://`` URIs of downloaded image
+            files, ready for ``MessageEvent.media_urls``
+          - ``media_types`` — parallel list of mime types
+          - ``link_urls``   — bare URLs from ``type:"link"``
+            attachments (CV's link-sharing UI flow), to be prepended
+            to the agent's message text so it sees them the same way
+            it would see a URL the user typed inline
+
+        ``type:"link"`` entries are not downloaded — they don't
+        reference uploaded files, they're URLs to external resources.
+        Threading them into the text channel lets the agent reach for
+        its own browser / fetch tools the same way it does for URLs
+        embedded in the transcript directly.
+        """
+        if self._api is None:
+            return [], [], []
+
+        attachments = extract_attachments(msg)
+        if not attachments:
+            return [], [], []
+
+        # Import the cache dir constant from core so downloaded files
+        # land in a root the media-delivery validator already allows.
+        # Local import keeps this module gateway-free at import time
+        # (CI imports the plugin without core).
+        from gateway.platforms.base import IMAGE_CACHE_DIR
+
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        link_urls: list[str] = []
+
+        for att in attachments:
+            aid = att.get("_id") or ""
+            mime = (att.get("mime_type") or "").lower()
+            att_type = (att.get("type") or "").lower()
+            link = att.get("link") or ""
+            filename = att.get("filename") or aid or "attachment.bin"
+
+            # CV's link attachment: the user picked "share a URL" in
+            # the UI. ``link`` is the actual external URL (not an S3
+            # path); ``mime_type`` is null. Surface the URL inline so
+            # the agent can reach for its existing web tools just like
+            # it would for a URL typed in the transcript directly.
+            if att_type == "link":
+                if link:
+                    link_urls.append(link)
+                    logger.info(
+                        "carbonvoice: inbound link attachment surfaced "
+                        "to agent — %s", link,
+                    )
+                else:
+                    logger.warning(
+                        "carbonvoice: skipping link attachment %s — "
+                        "no link URL in payload", filename,
+                    )
+                continue
+
+            if mime.startswith("image/"):
+                target_dir = IMAGE_CACHE_DIR
+            else:
+                logger.warning(
+                    "carbonvoice: skipping inbound attachment %s (%s) — "
+                    "only image/* is wired in this plugin version "
+                    "(document pipeline pending — see DEVELOPMENT.md §4)",
+                    filename, mime or "no-mime",
+                )
+                continue
+
+            if not aid:
+                logger.warning(
+                    "carbonvoice: skipping inbound attachment %s — "
+                    "no attachment_id to resolve a signed URL",
+                    filename,
+                )
+                continue
+
+            try:
+                local_path = await self._api.download_attachment(
+                    aid,
+                    target_dir,
+                    filename=filename,
+                    max_bytes=self._max_attachment_bytes,
+                )
+            except ValueError as exc:
+                # Size cap hit.
+                logger.warning(
+                    "carbonvoice: skipping oversized inbound attachment %s: %s",
+                    filename, exc,
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: failed to download inbound attachment "
+                    "%s (%s): %s", filename, aid, exc,
+                )
+                continue
+
+            # ``file://`` URI is what Hermes core's media routing expects
+            # for locally-cached paths (see ``validate_media_delivery_path``
+            # in ``gateway/platforms/base.py``).
+            media_urls.append(f"file://{local_path}")
+            media_types.append(mime)
+            logger.info(
+                "carbonvoice: inbound attachment downloaded — "
+                "att=%s mime=%s path=%s",
+                aid, mime, local_path,
+            )
+
+        return media_urls, media_types, link_urls
+
     async def _process_message(self, msg: Dict[str, Any]) -> bool:
         message_id = extract_message_id(msg)
         if not message_id:
@@ -1080,6 +1235,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             message_id=message_id,
             thread_id=session_thread_id,
         )
+        # Inbound multimodal (PR 7): pull any attached files into local
+        # caches so Hermes core's vision pipeline can consume them. CV's
+        # S3 URLs need auth, so we resolve a signed GET URL per file
+        # attachment, download via that, and hand Hermes core a
+        # ``file://`` URI in ``media_urls``. Image attachments are
+        # routed to vision; ``type:"link"`` attachments (CV's link-
+        # sharing UI) return their URLs in ``link_urls`` so we can
+        # prepend them to the visible text — the agent then sees them
+        # the same way it sees URLs typed inline, and uses its existing
+        # browser / fetch tools to consume them. Anything else (PDFs,
+        # binaries, …) is dropped with a WARNING.
+        media_urls, media_types, link_urls = await self._collect_inbound_media(msg)
+
+        # If CV's link-share UI was used, surface the URL(s) inline so
+        # the agent can fetch them naturally. Prepending preserves the
+        # user's own text right after, so the agent reads:
+        #
+        #     [Attached link: https://...]
+        #     <user's actual message>
+        if link_urls:
+            link_prefix = "\n".join(
+                f"[Attached link: {u}]" for u in link_urls
+            )
+            clean_text = f"{link_prefix}\n{clean_text}" if clean_text else link_prefix
+
         # Mark VOICE when ``CARBONVOICE_VOICE_OUT=true`` so Hermes core's
         # auto-TTS gate (``base.py:3493``) accepts this event for voice-
         # mode dispatch. CV doesn't distinguish text-typed vs voice-
@@ -1097,6 +1277,8 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             message_id=message_id,
             reply_to_message_id=parent,
             reply_to_text=reply_to_text,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         # Dispatch in a background task so processing one message can't block
