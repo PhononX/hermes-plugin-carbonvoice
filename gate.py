@@ -47,14 +47,25 @@ logger = logging.getLogger(__name__)
 class GateDecision:
     """Result of a single gate evaluation.
 
-    ``process`` is the only field the adapter acts on; ``reason`` is
+    ``process`` is the field the adapter acts on; ``reason`` is
     surfaced in debug logs so operators can audit why a particular
     message was accepted or skipped without rebuilding the gate's
     decision tree in their head.
+
+    ``revisitable`` distinguishes rejections whose verdict can flip on
+    a later re-fire of the same message_id (currently only "group
+    channel without @-mention" — because cv-api's tag-resolution job
+    runs async and emits a ``message:updated`` once ``tagged_user_ids``
+    is populated, which can turn an earlier "no mention" into a
+    "mentioned"). The adapter uses this to decide whether to mark the
+    message as seen in the dedup cache or leave the door open for a
+    follow-up update to re-evaluate. All other rejections are stable
+    (ignored channel, allowlist) and don't benefit from re-evaluation.
     """
 
     process: bool
     reason: str
+    revisitable: bool = False
 
 
 class MentionGate:
@@ -113,7 +124,9 @@ class MentionGate:
             return GateDecision(True, "require_mention disabled")
         if is_user_mentioned(msg, self_user_id):
             return GateDecision(True, "agent @-mentioned")
-        return GateDecision(False, "group channel without @-mention")
+        return GateDecision(
+            False, "group channel without @-mention", revisitable=True,
+        )
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
