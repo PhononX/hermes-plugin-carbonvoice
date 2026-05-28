@@ -41,11 +41,26 @@ def now_iso() -> str:
 def extract_transcript(msg: Dict[str, Any]) -> str:
     """Pull the human-readable transcript from a CV message payload.
 
-    The transcript lives in ``text_models[].timecodes[].t`` joined by spaces;
-    the ``value`` field is empty for transcript models. When the message is
-    still being transcribed, all transcript fields are empty — the caller
-    must treat an empty return as "not ready yet" and retry later.
+    Shape compatibility — checked in order so the V5 source-of-truth
+    payload wins, with the older shapes kept as fallback for the brief
+    window between socket signal and the v5 GET enrichment (and for
+    webhook callers that haven't migrated yet):
+
+      - **V5 / GET ``/v5/messages/:id``**: top-level ``transcript`` string.
+      - **V2 (socket push, ``/v3/messages/recent``)**: ``text_models[]``
+        with one entry of ``type == "transcript"`` carrying either a
+        joined ``timecodes[].t`` walk or a ``value`` string.
+      - **Webhook**: ``transcript_txt`` or ``ai_summary_txt`` flat
+        strings.
+
+    When the message is still being transcribed all of these are empty;
+    callers must treat an empty return as "not ready yet" and retry.
     """
+    # V5 — preferred. Single source of truth per cv-api design.
+    v5_transcript = msg.get("transcript")
+    if isinstance(v5_transcript, str) and v5_transcript.strip():
+        return v5_transcript.strip()
+    # V2 — socket / v3-poll fallback.
     text_models = msg.get("text_models") or []
     if isinstance(text_models, list):
         for m in text_models:
@@ -70,10 +85,16 @@ def extract_transcript(msg: Dict[str, Any]) -> str:
 
 
 def extract_message_id(msg: Dict[str, Any]) -> Optional[str]:
-    return first_str(msg.get("message_id"), msg.get("_id"))
+    # V5 uses ``id``; V2 uses ``message_id``; legacy uses ``_id``.
+    return first_str(msg.get("id"), msg.get("message_id"), msg.get("_id"))
 
 
 def extract_channel_id(msg: Dict[str, Any]) -> Optional[str]:
+    # V5 uses ``conversation_id`` (singular); V2 uses ``channel_ids[0]``;
+    # webhook payloads use ``channel_id`` / ``channel_guid``.
+    v5 = first_str(msg.get("conversation_id"))
+    if v5:
+        return v5
     channel_ids = msg.get("channel_ids")
     if isinstance(channel_ids, list) and channel_ids:
         first = channel_ids[0]
@@ -83,6 +104,7 @@ def extract_channel_id(msg: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
+    # Same field across V2 and V5.
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
 
 
