@@ -1162,8 +1162,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 # shape after this point.
                 transcript = extract_transcript(msg) or transcript
 
-        self._seen.mark(message_id)
-
         # Resolve chat_type before the mention gate so the gate can short-
         # circuit group messages without spinning up the rest of the
         # pipeline (visual ack, parent lookup, name resolution). The
@@ -1189,7 +1187,21 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: skip message %s in %s — %s",
                 message_id, channel_id, decision.reason,
             )
+            # Leave revisitable rejections out of the dedup cache so a
+            # follow-up ``message:updated`` re-fire (e.g. cv-api emits
+            # one after the async tag-resolution job populates
+            # ``tagged_user_ids``) gets another shot at the gate. Stable
+            # rejections (ignored channel, etc.) mark seen so we don't
+            # re-evaluate them on every retry. See GateDecision docstring.
+            if not decision.revisitable:
+                self._seen.mark(message_id)
             return False
+
+        # Decision is "process" — commit to it. Marking seen here (rather
+        # than before the gate) guarantees we only dedup messages we
+        # actually dispatch; a re-fire with new metadata still gets a
+        # fair gate evaluation up to this point.
+        self._seen.mark(message_id)
 
         # Fire the visual ack first so the user sees feedback in <100ms,
         # well before the agent's reply (which can take 10+ seconds).
