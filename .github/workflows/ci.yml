@@ -383,6 +383,50 @@ jobs:
               'adapter.py must prepend link URLs to clean_text as "[Attached link: <url>]"'
           print('adapter inbound media wiring: present (images + links)')
 
+          # V5 source-of-truth migration — the socket / v3-poll push
+          # payload is V2-shaped and trails the V5 GET on async fields
+          # (tagged_user_ids resolves after a backend job, attachment
+          # enrichment can lag). The adapter must fetch v5 in
+          # _process_message and reassign msg so all downstream gates
+          # (mention, multimodal) see the canonical post-resolution
+          # state. Locks the contract that future refactors can't
+          # silently revert.
+          assert 'get_message_v5(message_id)' in adapter_src, \
+              'adapter._process_message must enrich the V2 payload via ' \
+              'get_message_v5(message_id) — V5 is the source of truth ' \
+              'per cv-api design (see DEVELOPMENT.md §4 / §7)'
+          assert 'msg = enriched' in adapter_src, \
+              'adapter._process_message must reassign msg to the v5 ' \
+              'payload after fetch — otherwise downstream gates still ' \
+              'read stale V2 fields'
+          print('adapter v5 source-of-truth enrichment: wired')
+
+          # parse helpers must handle BOTH V5 and V2 shapes — V5 because
+          # that's what the v5 GET returns post-enrichment, V2 because
+          # webhook callers and pre-enrichment paths still hit them.
+          from carbonvoice.parse import (
+              extract_message_id as _emid,
+              extract_channel_id as _ecid,
+              extract_transcript as _et,
+              extract_creator_id as _ecr,
+          )
+          # V5 shape
+          v5 = {
+              'id': 'M', 'conversation_id': 'C', 'creator_id': 'U',
+              'transcript': 'hello v5',
+          }
+          assert _emid(v5) == 'M' and _ecid(v5) == 'C'
+          assert _ecr(v5) == 'U' and _et(v5) == 'hello v5'
+          # V2 shape (regression: must still work for pre-enrichment /
+          # transcript-not-ready empty events and webhook callers)
+          v2 = {
+              'message_id': 'M', 'channel_ids': ['C'], 'creator_id': 'U',
+              'text_models': [{'type': 'transcript', 'value': 'hello v2'}],
+          }
+          assert _emid(v2) == 'M' and _ecid(v2) == 'C'
+          assert _ecr(v2) == 'U' and _et(v2) == 'hello v2'
+          print('parse helpers handle V5 + V2 shapes: OK')
+
           # PR 6 — voice-out gate. setup.py can't be imported here (it
           # pulls gateway.*), so we source-grep both files for the
           # required wiring. Three assertions:
