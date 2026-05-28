@@ -170,6 +170,28 @@ jobs:
           g_open = MentionGate(require_mention=False, free_response_channels=set(), ignored_channels=set())
           assert g_open.evaluate(msg={'transcript_txt': 'no mention'}, chat_type='group', channel_id='c', self_user_id='BOT').process
 
+          # Revisitable rejections: only "group channel without @-mention"
+          # is revisitable, because cv-api emits message:updated after
+          # the async tag-resolution job populates tagged_user_ids — a
+          # rejection now can flip to acceptance on the next re-fire.
+          # All other rejections (ignored channel, etc.) are stable and
+          # must NOT be revisitable, otherwise the adapter re-evaluates
+          # them on every retry without any chance of a different outcome.
+          d_no_mention = g.evaluate(
+              msg={'transcript_txt': 'hi'}, chat_type='group',
+              channel_id='c', self_user_id='BOT',
+          )
+          assert not d_no_mention.process and d_no_mention.revisitable, \
+              'group-without-mention rejection must be revisitable so a ' \
+              'later message:updated with populated tagged_user_ids ' \
+              "gets a fresh gate evaluation (don't dedup it away)"
+          d_ignored = g_mute.evaluate(
+              msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='group',
+              channel_id='mute', self_user_id='BOT',
+          )
+          assert not d_ignored.process and not d_ignored.revisitable, \
+              'ignored-channel rejection must be stable (not revisitable)'
+
           # from_env smoke
           import os
           for k in ['CARBONVOICE_REQUIRE_MENTION', 'CARBONVOICE_FREE_RESPONSE_CHANNELS', 'CARBONVOICE_IGNORED_CHANNELS']:
@@ -400,6 +422,34 @@ jobs:
               'payload after fetch — otherwise downstream gates still ' \
               'read stale V2 fields'
           print('adapter v5 source-of-truth enrichment: wired')
+
+          # Revisitable gate rejections must NOT mark the message as
+          # seen — otherwise a follow-up message:updated (which cv-api
+          # emits after the async tag-resolution job completes,
+          # populating tagged_user_ids) gets silently deduped away and
+          # the agent never wakes up despite being tagged. Stable
+          # rejections (ignored channel, etc.) still mark seen so we
+          # don't repeatedly re-evaluate them on every retry.
+          assert 'decision.revisitable' in adapter_src, \
+              'adapter._process_message must branch on ' \
+              'GateDecision.revisitable to decide whether to mark a ' \
+              'rejected message as seen — otherwise post-tag ' \
+              'message:updated re-fires are deduped before the gate ' \
+              'gets a fresh evaluation (the original "voice memo with ' \
+              'picker tag never reaches the bot" bug)'
+          # Make sure no one accidentally re-introduces an unconditional
+          # ``seen.mark`` before the gate runs. Count occurrences: there
+          # should be exactly two ``self._seen.mark(message_id)`` calls
+          # (one in the rejected-but-stable path, one after the gate
+          # accepts), and ``self._seen.is_seen(message_id)`` for the
+          # early dedup check.
+          assert adapter_src.count('self._seen.mark(message_id)') == 2, \
+              'adapter._process_message must mark seen in exactly two ' \
+              'places: (a) when a non-revisitable rejection commits ' \
+              'the decision, (b) when the gate accepts. Counting drift ' \
+              'usually means someone added an unconditional mark before ' \
+              'the gate — that re-introduces the post-tag dedup bug.'
+          print('adapter revisitable-rejection dedup contract: wired')
 
           # parse helpers must handle BOTH V5 and V2 shapes — V5 because
           # that's what the v5 GET returns post-enrichment, V2 because
