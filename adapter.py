@@ -1129,6 +1129,39 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not transcript:
             return False
 
+        # V5 source-of-truth enrichment. The socket / v3-poll push gives
+        # us a V2-shaped payload that trails the v5 GET on async fields:
+        # ``tagged_user_ids`` is empty here until a backend job resolves
+        # the tag picker selection, and attachment metadata can lag the
+        # same way. CV's v5 endpoint is the canonical post-resolution
+        # state — the Flutter client follows the same "socket = signal,
+        # REST = truth" pattern.
+        #
+        # We do the GET only here, after the cheap-reject gates above
+        # (self-loop, allowlist, dedupe, empty-transcript), so empty
+        # ``message:created`` events don't pay the HTTP. On fetch
+        # failure we keep the V2 payload — defensive, so a transient
+        # /v5 hiccup doesn't drop an otherwise-deliverable message.
+        # The parse helpers (``extract_*``) prefer V5 fields when
+        # present, so reassigning ``msg`` is enough — no further
+        # downstream changes needed.
+        if self._api is not None:
+            try:
+                enriched = await self._api.get_message_v5(message_id)
+            except Exception as exc:
+                logger.debug(
+                    "carbonvoice: v5 enrichment failed for %s: %s — "
+                    "continuing with v2 payload",
+                    message_id, exc,
+                )
+                enriched = None
+            if enriched:
+                msg = enriched
+                # Re-pull transcript from the (canonical) v5 payload —
+                # usually the same string but keeps everything in one
+                # shape after this point.
+                transcript = extract_transcript(msg) or transcript
+
         self._seen.mark(message_id)
 
         # Resolve chat_type before the mention gate so the gate can short-
