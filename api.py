@@ -75,11 +75,24 @@ class CarbonVoiceAPI:
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         client = self._require_client()
+        # ``use_last_updated: True`` filters by ``updated_at`` instead
+        # of ``created_at``. Required for voice messages with picker
+        # tags: ``created_at`` fires when the audio bytes land (no
+        # transcript, no tagged_user_ids), but the backend updates the
+        # message ~10–15 s later when STT and the tag-resolution job
+        # finish, bumping ``updated_at`` and emitting cv-api's
+        # ``message:updated`` socket event. With the old
+        # ``created_at`` filter, the polling/catch-up after that socket
+        # event missed the message entirely — its ``created_at`` was
+        # already older than the cursor that advanced past the empty
+        # ``message:created`` window. SeenCache (TTL 5 min) handles the
+        # extra fan-out from messages that update multiple times in
+        # the lookback window.
         body = {
             "date": since_iso,
             "direction": direction,
             "limit": limit,
-            "use_last_updated": False,
+            "use_last_updated": True,
         }
         resp = await client.post("/v3/messages/recent", json=body)
         resp.raise_for_status()
