@@ -116,34 +116,24 @@ jobs:
           assert chat_type_from_channel({'dm_hash': 'abc123'}) == 'dm'
           assert chat_type_from_channel({'dm_hash': None}) == 'dm'
 
-          # Inline mention helpers: extract / detect / strip
-          from carbonvoice.parse import (
-              extract_inline_mentions, is_user_mentioned, strip_inline_mentions,
-          )
-          assert extract_inline_mentions(None) == []
-          assert extract_inline_mentions('plain text') == []
-          assert extract_inline_mentions('@[A](1)') == [('A', '1')]
-          assert extract_inline_mentions('@[A](1) and @[B](2)') == [('A', '1'), ('B', '2')]
-          # Display name may contain spaces and unicode
-          assert extract_inline_mentions('@[Gi’ Martínez](GUID) hi') == [('Gi’ Martínez', 'GUID')]
-
-          # Forward-compat: prefer tagged_user_ids when present
+          # Mention detection — tagged_user_ids ONLY. cv-api #243 exposes
+          # the field; the Flutter composer strips inline @[name](guid) to
+          # plain @Name before send (and voice tags via the batch endpoint
+          # post-STT), so there is no inline markup left to parse. Locks
+          # the structured-only contract (CV mentions migration).
+          from carbonvoice.parse import is_user_mentioned
           assert is_user_mentioned({'tagged_user_ids': ['BOT']}, 'BOT') is True
           assert is_user_mentioned({'tagged_user_ids': ['OTHER']}, 'BOT') is False
-          # Fallback to inline parsing
-          assert is_user_mentioned({'transcript_txt': '@[Bot](BOT) hi'}, 'BOT') is True
-          assert is_user_mentioned({'transcript_txt': 'no mention'}, 'BOT') is False
-          # Empty tagged_user_ids falls through to inline path
-          assert is_user_mentioned(
-              {'tagged_user_ids': [], 'transcript_txt': '@[Bot](BOT) hi'}, 'BOT'
-          ) is True
-          # Missing user_id never matches
+          # Empty / missing tagged_user_ids → not mentioned (no fallback).
+          assert is_user_mentioned({'tagged_user_ids': []}, 'BOT') is False
+          assert is_user_mentioned({}, 'BOT') is False
+          # Inline @[name](guid) in the transcript is now IGNORED — detection
+          # is structured-field only. A voice memo's tag arrives later on a
+          # message:updated, which the gate's revisitable path re-evaluates.
+          assert is_user_mentioned({'transcript': '@[Bot](BOT) hi'}, 'BOT') is False
+          assert is_user_mentioned({'transcript_txt': '@[Bot](BOT) hi'}, 'BOT') is False
+          # Missing user_id never matches.
           assert is_user_mentioned({'tagged_user_ids': ['BOT']}, None) is False
-
-          assert strip_inline_mentions(None) == ''
-          assert strip_inline_mentions('plain') == 'plain'
-          assert strip_inline_mentions('@[A](1) hi') == '@A hi'
-          assert strip_inline_mentions('@[A](1) and @[B](2)') == '@A and @B'
 
           # MentionGate decisions
           from carbonvoice.gate import MentionGate
@@ -320,6 +310,16 @@ jobs:
           assert tc_ttl.get_cached_thread_context('x') is None
 
           # PR 5 — send_text_v5 now accepts an optional attachments param so
+          # the agent can ship "here's the report" + the .md/PDF in a single
+          # bubble. Defaults still work for plain text — guards against a
+          # future refactor flipping the param to required.
+          import inspect
+          sig = inspect.signature(CarbonVoiceAPI.send_text_v5)
+          assert 'attachments' in sig.parameters, \
+              'send_text_v5 missing attachments param (PR 5)'
+          assert sig.parameters['attachments'].default is None, \
+              'send_text_v5.attachments must default to None (plain-text path)'
+
           # CV-13155 / cv-api PR #277 — the v5 conversation create routes
           # renamed the threading input `thread_id` -> `reply_to_message_id`
           # and now REJECT `thread_id` with 400 (it's in the v5
@@ -334,16 +334,6 @@ jobs:
                   f'{_m} missing reply_to_message_id param (CV-13155)'
               assert 'thread_id' not in _params, \
                   f'{_m} still exposes thread_id — cv-api #277 rejects it with 400'
-
-          # the agent can ship "here's the report" + the .md/PDF in a single
-          # bubble. Defaults still work for plain text — guards against a
-          # future refactor flipping the param to required.
-          import inspect
-          sig = inspect.signature(CarbonVoiceAPI.send_text_v5)
-          assert 'attachments' in sig.parameters, \
-              'send_text_v5 missing attachments param (PR 5)'
-          assert sig.parameters['attachments'].default is None, \
-              'send_text_v5.attachments must default to None (plain-text path)'
 
           # PR 5 — adapter is_url / mime guesser helpers. Can't import
           # CarbonVoiceAdapter here (it pulls gateway.*) but we can reach

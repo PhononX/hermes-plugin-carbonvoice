@@ -66,7 +66,6 @@ from .parse import (
     extract_transcript,
     first_str,
     now_iso,
-    strip_inline_mentions,
 )
 # extract_transcript is also re-exported via parse for the parent-text path
 # (now handled by ConversationTracker, but the import here is kept so
@@ -884,9 +883,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 except Exception:
                     name = creator
             name = name or "unknown"
-            # Strip CV's inline @[name](guid) markup for the same reason
-            # we strip it on inbound — the guids are LLM noise.
-            text = strip_inline_mentions(text)
             prefix = "[thread parent] " if is_root else ""
             parts.append(f"{prefix}{name}: {text}")
 
@@ -1235,10 +1231,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         reply_to_text = await self._tracker.get_parent_text(parent)
 
-        # Strip CV's inline @[name](guid) markup so the agent sees
-        # readable text — the guid in the original is LLM noise that
-        # can confuse instruction following.
-        clean_text = strip_inline_mentions(transcript)
+        # Mentions now arrive structured in ``tagged_user_ids`` (see
+        # parse.is_user_mentioned). The Flutter composer sends the
+        # transcript as plain text — ``@Name`` without the guid — so
+        # there is no inline ``@[name](guid)`` markup left to strip; pass
+        # the transcript through as-is.
+        clean_text = transcript
 
         # Session sharing in groups: pass the thread root as
         # ``SessionSource.thread_id`` so Hermes core composes a shared

@@ -23,8 +23,7 @@ The plugin connects a Hermes Agent instance to Carbon Voice as a bot user. It li
 | **Chat-type discrimination** | DM vs group resolved per-channel via `GET /channel/{id}`. Cached for the process lifetime. |
 | **Reply context** | When an inbound message has `parent_message_id`, the adapter fetches the parent and populates `MessageEvent.reply_to_text` so the agent sees the text it's replying to. |
 | **Mention gate** | In group channels, the agent only responds when `@`-mentioned. DMs always pass. Bypass with `CARBONVOICE_FREE_RESPONSE_CHANNELS`; hard veto with `CARBONVOICE_IGNORED_CHANNELS`; global disable with `CARBONVOICE_REQUIRE_MENTION=false`. |
-| **Forward-compat mention detection** | Today: parses `@[Display Name](user_guid)` inline syntax embedded by the Flutter client. Tomorrow (post cv-api PR): prefers `tagged_user_ids` from the message payload. Same helper, automatic switchover. |
-| **Inline markup stripping** | The `@[name](guid)` syntax is replaced with `@name` before the transcript reaches the agent, so the LLM sees clean text instead of GUID noise. |
+| **Structured mention detection** | Detection is **exclusively** via the `tagged_user_ids` array on the message (cv-api #243 exposes it; #271/#278 populate it for text + voice). The Flutter composer strips mentions to plain `@Name` before send and tags voice memos via the batch `PUT /messages/:id/tagged-users` after STT — so the transcript carries no GUID markup. Nothing to parse or strip on the plugin side; voice tags that land after STT re-enter the gate via the `revisitable` re-fire path. |
 
 ## 2. Module map
 
@@ -54,7 +53,7 @@ hermes/
 │
 ├── parse.py          Pure functions only. Payload-shape helpers
 │                     (extract_transcript, extract_message_id, etc.),
-│                     chat_type mapper, inline mention helpers.
+│                     chat_type mapper, structured mention check.
 │
 ├── reactions.py      ReactionService — visual ack on inbound. Discovers
 │                     available reaction IDs at startup; pin one via env.
@@ -124,7 +123,7 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 
 | Limitation | Impact | Resolution path |
 |---|---|---|
-| **Spoken-only mentions undetectable.** A user who records a voice memo *saying* "Hey Hermes" without typing `@` or using the tagging UI produces a transcript with no `@[name](guid)` markup and no entry in `tagged_user_ids`. The mention is invisible to the gate. | Voice users in group channels who don't use the tagging UI can't reach the bot. | No resolution planned for v1 — would require CV to detect mentions in spoken audio server-side. Voice memos *with* UI tagging work today via the `tagged_user_ids` field (deployed Q2 2026). |
+| **Spoken-only mentions undetectable.** A user who records a voice memo *saying* "Hey Hermes" without using the tagging UI produces a message with no entry in `tagged_user_ids` — and since detection is structured-field-only, the mention is invisible to the gate. | Voice users in group channels who don't use the tagging UI can't reach the bot. | No resolution planned — would require CV to detect mentions in spoken audio server-side. Voice memos *with* UI tagging work today: the tag is applied after STT via the batch endpoint and the gate's `revisitable` re-fire picks it up. |
 | ~~**No multi-user awareness in group channels.**~~ ✅ **Resolved within threads (Q2 2026 PR 2).** `SessionSource.thread_id` is now populated from `ConversationTracker.thread_id_of(msg)` for groups, so all participants in a thread share one session and Hermes core prefixes each user message with `[sender name]` automatically. The agent can attribute statements across users in the same thread. **Outside threads** (top-level posts in a group), per-user isolation remains the default — set `CARBONVOICE_SHARED_GROUP_SESSIONS=true` to extend sharing to non-threaded conversations as well (useful for bot-room channels). | Bot now sees the full multi-party discussion when participants reply within a thread. | — |
 | **No thread memory.** Every message in a group channel requires re-mention. A user mentioning the bot, then sending a follow-up in the same thread without re-mentioning, gets silence. | Conversational UX in groups is choppy. | Next-branch feature. Track engaged thread roots + outbound message ids in adapter state, pass booleans to the gate. Design sketched in §5. |
 | ~~**No engaged-thread context on first @mention.**~~ ✅ **Resolved (Q2 2026 PR 4).** When the agent is @mentioned in a thread for the first time (no Hermes session yet for that thread), `adapter._fetch_thread_context` pulls the prior messages and prepends them as a `[Thread context …]` block so the LLM has history from turn 1. Cached per-thread (TTL 30 min, LRU 200) so re-mentions in a hot thread don't re-hit the API. Subsequent turns ride on Hermes' SQLite session history. | The first @mention in a long-running thread now carries the prior conversation; no more "wait, what are we talking about?" responses. | — |
@@ -158,7 +157,7 @@ Ordered by user-visible value per unit of effort. Items in **bold** are the next
 9. **Per-workspace skill bindings.** Map workspace_id → skill set so the agent loads different tools depending on which workspace the message came from.
 
 ### Blocked on backend
-10. ~~**Migrate `is_user_mentioned()` to prefer `tagged_user_ids`.**~~ ✅ **Resolved (Q2 2026).** Forward-compat path was already coded, and cv-api now ships the field. No-op migration — already in effect. Voice memos with UI tagging reach the bot today.
+10. ~~**Migrate `is_user_mentioned()` to prefer `tagged_user_ids`.**~~ ✅ **Resolved (Q2 2026).** Went further than "prefer" — detection is now `tagged_user_ids`-**only**. The Flutter client stopped embedding GUIDs in the transcript (sends plain `@Name` + the id array; voice tags via the batch endpoint after STT), so the inline-parsing fallback and `strip_inline_mentions` were deleted. Voice memos with UI tagging reach the bot today.
 11. **Enriched mention metadata.** If cv-api eventually returns `tagged_users: { id, display_name }[]` instead of raw IDs, the adapter could pass display names through to the agent for nicer replies ("@user1, ...").
 
 ## 6. Architecture decisions
@@ -179,12 +178,12 @@ Brief notes on the non-obvious choices. ADR-lite format.
 
 **Consequence.** Gate is a pure function easy to unit-test. State changes don't risk breaking the decision policy. Adding new gate rules is local to `gate.py`; adding new state is local to `adapter.py`.
 
-### Inline mention parsing as v1, structured field as v2
-**Context.** Carbon Voice's DB has `tagged_user_ids` but it's not exposed in any API response. The Flutter client embeds mentions inline as `@[name](guid)` in the transcript. Two ways to detect mentions: parse the inline syntax, or wait for the backend to expose the field.
+### Mention detection: structured `tagged_user_ids` only
+**Context.** Originally Carbon Voice's `tagged_user_ids` was not exposed on any API response, so the plugin parsed the Flutter client's inline `@[name](guid)` transcript markup (with a forward-compat preference for the structured field "once the backend ships it"). The backend then shipped the field (cv-api #243), and the Flutter client was reworked (Q2 2026) so it now sends mentions **structured only**: the composer strips `@[name](guid)` → plain `@Name` before send (`MentionParser.stripToDisplay`) and carries the ids in `tagged_user_ids`, while voice memos tag via the batch `PUT /messages/:id/tagged-users` after recording. The transcript no longer contains GUID markup on any path.
 
-**Decision.** Implement inline parsing now. Code `is_user_mentioned()` to prefer `tagged_user_ids` when present and fall back to inline parsing when not. This is forward-compatible: when the backend ships the field, detection upgrades automatically with no plugin code change.
+**Decision.** Detect mentions **exclusively** from `tagged_user_ids`. The inline-parsing fallback and the `strip_inline_mentions` cleanup were deleted — there is no markup left to parse or strip. Voice is the reason the structured field is authoritative: the tag lands *after* STT on a `message:updated`, so detection cannot depend on anything present at create time.
 
-**Consequence.** Mention gate ships today. Voice-only mentions (no inline markup) are unsupported until the backend lands the field. Migration is zero-touch.
+**Consequence.** `is_user_mentioned()` is a one-line `tagged_user_ids` membership check. Voice memos reach the bot reliably because the gate's `revisitable` rejection (keeps the message out of the dedup cache) plus the `get_message_v5` enrichment re-evaluate the updated payload once the tag job populates the array. A user who *speaks* the agent's name without using the tagging UI is still undetectable (see §4) — unchanged.
 
 ### `ChannelCache` has no TTL
 **Context.** Channel kind (DM vs group) is effectively immutable after creation. A channel won't switch from DM to group mid-conversation.
@@ -193,12 +192,8 @@ Brief notes on the non-obvious choices. ADR-lite format.
 
 **Consequence.** Simpler code, fewer API calls. If a channel were ever retyped (which CV doesn't allow), a process restart would pick up the new type.
 
-### Strip `@[name](guid)` before the agent sees text
-**Context.** The raw transcript contains GUIDs as part of mention markup. LLMs treat hex strings as noise that can confuse instruction following.
-
-**Decision.** `strip_inline_mentions()` replaces `@[Display Name](guid)` with `@Display Name` before constructing the `MessageEvent`. The original raw payload is preserved in `event.raw_message` for any downstream code that needs it.
-
-**Consequence.** Agent sees readable text. Same pattern Slack/Discord adapters use (stripping `<@U123>` to `@username`). No information loss because mention detection runs before stripping.
+### ~~Strip `@[name](guid)` before the agent sees text~~ (removed Q2 2026)
+**Superseded.** The plugin used to run the transcript through `strip_inline_mentions()` to turn `@[Display Name](guid)` into a readable `@Display Name` before building the `MessageEvent`. The Flutter client now does that stripping itself (`MentionParser.stripToDisplay`) and sends the transcript as plain `@Name`, so the inbound text is already clean — the helper and both call sites were deleted. The agent still sees readable `@Name` text (same end result as the old Slack-style `<@U123>` → `@username` cleanup); it just happens upstream now. See "Mention detection: structured `tagged_user_ids` only" above.
 
 ### Visual ack runs after the gate, not before
 **Context.** Earlier behavior: ack every inbound message immediately on arrival. With the gate added, this would mean acking messages we then silently drop, which is confusing UX ("the bot saw my message but didn't reply").
@@ -259,8 +254,9 @@ Already aligned (✅ shipped):
   `get_chat_info`) plus `send_typing` no-op.
 - Composition-over-inheritance pattern (one responsibility per module).
 - DM-vs-group mention split matching Slack/Discord/Telegram.
-- Inline markup stripping (`@[name](guid)` → `@name`), same shape as
-  Slack's `<@U123>` → `@username` pattern.
+- Structured mention detection via `tagged_user_ids` (the Flutter client
+  sends plain `@Name` text + the id array; no inline markup to parse or
+  strip — see the §6 ADR).
 - Allowlist + audit log, mirroring `*_ALLOWED_USERS` / `GATEWAY_ALLOW_ALL_USERS`.
 - Cursor-based offline catch-up.
 - Stale-anchor recovery on outbound 400s (PR 2 closed the underlying

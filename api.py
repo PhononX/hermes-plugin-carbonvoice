@@ -464,9 +464,13 @@ class CarbonVoiceAPI:
         """
         client = self._require_client()
         resp = await client.get(f"/v5/messages/{message_id}")
-        if resp.status_code >= 400:
+        if resp.status_code >= 400 or not resp.content:
             return None
-        return resp.json() if resp.content else None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+        inner = data.get("message")
+        return inner if isinstance(inner, dict) else data
 
     async def get_messages_by_ids_v5(
         self, message_ids: List[str]

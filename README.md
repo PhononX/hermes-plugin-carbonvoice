@@ -143,9 +143,9 @@ The agent uses a DM-vs-channel split that mirrors how Slack/Discord/Telegram ada
 - **Group channels:** require an `@`-mention of the agent unless the channel is in `CARBONVOICE_FREE_RESPONSE_CHANNELS` or `CARBONVOICE_REQUIRE_MENTION=false`.
 - **Ignored channels:** never processed, even when mentioned.
 
-Carbon Voice's Flutter client embeds mentions in the transcript as `@[Display Name](user_guid)` — the adapter parses this format to detect when the agent's `user_guid` was tagged. Once the cv-api exposes `tagged_user_ids` directly on the message DTO, the adapter prefers that structured field and falls back to inline parsing automatically.
+Mention detection is **structured**: the adapter checks the message's `tagged_user_ids` array for the agent's `user_guid`. Carbon Voice's Flutter client sends the tag list directly (text messages carry it on send; voice memos add it via the tagging UI after recording), and the transcript itself is plain text — so the adapter never parses names out of the message body.
 
-> ⚠️ **Voice-only messages:** mentions made by speaking the agent's name without typing `@` will not be detected, because the transcript won't contain the structured marker. To mention the agent from a voice memo, type the `@`-mention in the message caption or use the tagging UI before recording.
+> ⚠️ **Voice-only messages:** mentions made by *speaking* the agent's name without using the tagging UI will not be detected, because nothing populates `tagged_user_ids`. To mention the agent from a voice memo, tag it in the picker (the tag is applied after the recording is transcribed, and the agent picks it up automatically).
 
 ### Voice replies (auto-TTS)
 

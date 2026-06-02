@@ -6,16 +6,8 @@ of the input dict. Keeps the rest of the plugin free of payload-shape knowledge.
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
-# Carbon Voice embeds mentions inline in the transcript as ``@[Display
-# Name](user_guid)`` — markdown-link-style syntax produced by the Flutter
-# client when a user tags someone. The display name can include any
-# character except ``]``; the guid is opaque alphanumerics but we accept
-# anything that isn't ``)`` to stay forgiving of future format tweaks.
-_INLINE_MENTION_PATTERN = re.compile(r"@\[([^\]]+)\]\(([^)]+)\)")
+from typing import Any, Dict, List, Optional
 
 
 def auth_headers(pat: str) -> Dict[str, str]:
@@ -151,53 +143,28 @@ def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def extract_inline_mentions(text: Optional[str]) -> List[Tuple[str, str]]:
-    """Return ``(display_name, user_guid)`` pairs from CV's inline syntax.
-
-    Carbon Voice's Flutter app emits mentions as ``@[Display Name](guid)``
-    in the message transcript. This helper extracts each pair in order of
-    appearance, without de-duplication (so the caller can count repeats
-    if it ever matters).
-    """
-    if not text:
-        return []
-    return [
-        (m.group(1), m.group(2))
-        for m in _INLINE_MENTION_PATTERN.finditer(text)
-    ]
-
-
 def is_user_mentioned(msg: Dict[str, Any], user_id: Optional[str]) -> bool:
     """Return True when *user_id* is tagged in *msg*.
 
-    Forward-compatible: prefers a structured ``tagged_user_ids`` field
-    when the API exposes it (pending cv-api PR), and falls back to
-    parsing the inline ``@[name](guid)`` syntax in the transcript. The
-    fallback works today; the structured path will take over
-    automatically once the backend ships the field.
+    Detection is **exclusively** via the structured ``tagged_user_ids``
+    field. cv-api #243 exposes it on the message DTOs; the Flutter client
+    populates it on the POST body for text messages and via the batch
+    ``PUT /messages/:id/tagged-users`` for voice (cv-api #271 / #278).
+    The transcript no longer carries the old ``@[name](guid)`` inline
+    markup — the Flutter composer strips mentions to plain ``@Name``
+    before send, so there is nothing to parse out of the text.
+
+    Voice is the reason the field is authoritative: a voice memo tags
+    Hermes *after* the audio is recorded, so the tag lands on a later
+    ``message:updated`` rather than at create time. The gate's
+    ``revisitable`` rejection (leaves the message out of the dedup cache)
+    plus the ``get_message_v5`` enrichment guarantee that updated payload
+    is re-evaluated with the now-populated array.
     """
     if not user_id:
         return False
     tagged = msg.get("tagged_user_ids")
-    if isinstance(tagged, list) and tagged:
-        return user_id in tagged
-    return any(
-        guid == user_id
-        for _, guid in extract_inline_mentions(extract_transcript(msg))
-    )
-
-
-def strip_inline_mentions(text: Optional[str]) -> str:
-    """Replace ``@[name](guid)`` with a bare ``@name`` for cleaner agent input.
-
-    The agent doesn't need to see the guid — it adds noise to the LLM
-    prompt and can confuse instruction-following. The bare ``@name`` is
-    what the agent should see; the original guid stays out of the model
-    context.
-    """
-    if not text:
-        return text or ""
-    return _INLINE_MENTION_PATTERN.sub(r"@\1", text)
+    return isinstance(tagged, list) and user_id in tagged
 
 
 def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
