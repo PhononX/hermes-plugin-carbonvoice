@@ -142,15 +142,16 @@ jobs:
           assert g.evaluate(msg={'transcript_txt': 'hi'}, chat_type='dm', channel_id='c', self_user_id='BOT').process
           # Group without mention → skip
           assert not g.evaluate(msg={'transcript_txt': 'hi'}, chat_type='group', channel_id='c', self_user_id='BOT').process
-          # Group with inline mention → process
-          assert g.evaluate(msg={'transcript_txt': '@[Bot](BOT) hi'}, chat_type='group', channel_id='c', self_user_id='BOT').process
-          # Group with tagged_user_ids forward-compat → process
+          # Group with structured tag → process
           assert g.evaluate(msg={'tagged_user_ids': ['BOT']}, chat_type='group', channel_id='c', self_user_id='BOT').process
+          # Group with ONLY inline markup (no tag) → skip. Detection is
+          # tagged_user_ids-only now; inline @[name](guid) is ignored.
+          assert not g.evaluate(msg={'transcript': '@[Bot](BOT) hi'}, chat_type='group', channel_id='c', self_user_id='BOT').process
 
           # Ignored channel vetoes everything, including DMs
           g_mute = MentionGate(require_mention=True, free_response_channels=set(), ignored_channels={'mute'})
-          assert not g_mute.evaluate(msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='dm', channel_id='mute', self_user_id='BOT').process
-          assert not g_mute.evaluate(msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='group', channel_id='mute', self_user_id='BOT').process
+          assert not g_mute.evaluate(msg={'tagged_user_ids': ['BOT']}, chat_type='dm', channel_id='mute', self_user_id='BOT').process
+          assert not g_mute.evaluate(msg={'tagged_user_ids': ['BOT']}, chat_type='group', channel_id='mute', self_user_id='BOT').process
 
           # Free-response channel bypasses mention requirement
           g_free = MentionGate(require_mention=True, free_response_channels={'free'}, ignored_channels=set())
@@ -176,7 +177,7 @@ jobs:
               'later message:updated with populated tagged_user_ids ' \
               "gets a fresh gate evaluation (don't dedup it away)"
           d_ignored = g_mute.evaluate(
-              msg={'transcript_txt': '@[B](BOT) hi'}, chat_type='group',
+              msg={'tagged_user_ids': ['BOT']}, chat_type='group',
               channel_id='mute', self_user_id='BOT',
           )
           assert not d_ignored.process and not d_ignored.revisitable, \
