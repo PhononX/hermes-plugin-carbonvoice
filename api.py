@@ -109,9 +109,9 @@ class CarbonVoiceAPI:
 
         Kept for compatibility with code paths that still pass through the v3
         contract. New code should use ``send_text_v5`` which accepts
-        ``thread_id`` directly (no reply-anchor resolution required) and
-        uses ``idempotency_key`` instead of the deprecated
-        ``unique_client_id``.
+        ``reply_to_message_id`` directly (the server resolves the thread
+        root, no reply-anchor resolution required) and uses
+        ``idempotency_key`` instead of the deprecated ``unique_client_id``.
         """
         client = self._require_client()
         body: Dict[str, Any] = {
@@ -130,29 +130,42 @@ class CarbonVoiceAPI:
     # ── v5 transport ────────────────────────────────────────────────────
     #
     # The v5 endpoints replace the v3 contract with cleaner naming
-    # (``thread_id`` as the preferred public field, ``idempotency_key``
+    # (``reply_to_message_id`` as the reply field, ``idempotency_key``
     # in place of ``unique_client_id``) and split create paths by media
     # kind: ``/text``, ``/audio`` (multipart), and ``/attachment`` (URLs).
     #
-    # The CV team's design intent — "Just always reply to ``thread_id``
-    # when wanting to do thread; eliminate client guessing" — is encoded
-    # natively in these endpoints. Callers pass ``thread_id`` from the
-    # inbound message (``ConversationTracker.thread_id_of(msg)``) and the
-    # server resolves the rest. No reply-anchor lookup needed.
+    # Threading contract (cv-api PR #277 / CV-13155, cv-contracts 4.0.1):
+    # the v5 *conversation* create routes accept ``reply_to_message_id``
+    # — the id of the message being replied to. The backend resolves the
+    # thread *root* automatically (``resolveRootParentMessageId``): pass
+    # a root and it stays the root; pass a reply and the server attaches
+    # to that reply's root instead of rejecting it (the old
+    # "You cannot reply to a message that is a reply" 400 is gone). The
+    # only remaining reply error is cross-conversation (400).
+    #
+    # NOTE: the earlier ``thread_id`` input field was *renamed* to
+    # ``reply_to_message_id`` and ``thread_id`` is now in the v5
+    # reject-deprecated-keys pipe — sending it returns a 400. Callers
+    # pass the thread root from the inbound message
+    # (``ConversationTracker.thread_id_of(msg)``) as
+    # ``reply_to_message_id``; root-resolves-to-itself keeps threading
+    # correct with no reply-anchor lookup.
 
     async def send_text_v5(
         self,
         conversation_id: str,
         transcript: str,
-        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """POST /v5/messages/text — create a text message in a conversation.
 
-        Returns the created MessageV5 dict on 2xx. ``thread_id`` is the
-        preferred field for threading (see module docstring); pass
-        ``None`` for a new top-level post.
+        Returns the created MessageV5 dict on 2xx. ``reply_to_message_id``
+        threads the message (see module docstring — the backend resolves
+        the thread root automatically); pass ``None`` for a new top-level
+        post. Sending the old ``thread_id`` key is rejected with 400 by
+        the v5 deprecated-fields pipe (cv-api PR #277).
 
         ``attachments`` is an optional list of
         ``V5RequestAttachmentPayload`` dicts (same shape used by
@@ -168,8 +181,8 @@ class CarbonVoiceAPI:
             "transcript": transcript,
             "idempotency_key": idempotency_key or str(uuid.uuid4()),
         }
-        if thread_id:
-            body["thread_id"] = str(thread_id)
+        if reply_to_message_id:
+            body["reply_to_message_id"] = str(reply_to_message_id)
         if attachments:
             body["attachments"] = attachments
         resp = await client.post("/v5/messages/text", json=body)
@@ -180,17 +193,19 @@ class CarbonVoiceAPI:
         self,
         conversation_id: str,
         audio_path: str,
-        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         duration_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         """POST /v5/messages/audio — multipart upload of an audio file.
 
         Sends two parts: ``payload`` (JSON with conversation_id /
-        thread_id / idempotency_key / duration) and ``audio_file`` (the
-        raw bytes of the file at ``audio_path``). The server transcribes
-        and threads the resulting message; returns the created
-        MessageV5 dict on 2xx.
+        reply_to_message_id / idempotency_key / duration) and
+        ``audio_file`` (the raw bytes of the file at ``audio_path``). The
+        server transcribes and threads the resulting message; returns the
+        created MessageV5 dict on 2xx. This is the *conversation* audio
+        route (``messages/audio``), which accepts ``reply_to_message_id``
+        — only the ``voicememos/audio`` route forbids it (cv-api PR #277).
 
         For Hermes' ``send_voice`` adapter override.
         """
@@ -206,8 +221,8 @@ class CarbonVoiceAPI:
             "conversation_id": conversation_id.strip(),
             "idempotency_key": idempotency_key or str(uuid.uuid4()),
         }
-        if thread_id:
-            payload["thread_id"] = str(thread_id)
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = str(reply_to_message_id)
         if duration_ms is not None:
             payload["duration"] = int(duration_ms)
 
@@ -224,7 +239,7 @@ class CarbonVoiceAPI:
         self,
         conversation_id: str,
         attachments: List[Dict[str, Any]],
-        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /v5/messages/attachment — create a message with link attachments.
@@ -245,8 +260,8 @@ class CarbonVoiceAPI:
             "attachments": attachments,
             "idempotency_key": idempotency_key or str(uuid.uuid4()),
         }
-        if thread_id:
-            body["thread_id"] = str(thread_id)
+        if reply_to_message_id:
+            body["reply_to_message_id"] = str(reply_to_message_id)
         resp = await client.post("/v5/messages/attachment", json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}

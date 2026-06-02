@@ -320,6 +320,21 @@ jobs:
           assert tc_ttl.get_cached_thread_context('x') is None
 
           # PR 5 — send_text_v5 now accepts an optional attachments param so
+          # CV-13155 / cv-api PR #277 — the v5 conversation create routes
+          # renamed the threading input `thread_id` -> `reply_to_message_id`
+          # and now REJECT `thread_id` with 400 (it's in the v5
+          # reject-deprecated-fields pipe). Lock the rename across all three
+          # outbound send methods so a regression can't silently 400 every
+          # threaded reply / voice memo / attachment. The Hermes-side
+          # `thread_id` *concept* (SessionSource.thread_id, thread_id_of,
+          # reply anchors) is unaffected — only the CV wire field moved.
+          for _m in ('send_text_v5', 'send_audio_v5', 'send_attachment_v5'):
+              _params = inspect.signature(getattr(CarbonVoiceAPI, _m)).parameters
+              assert 'reply_to_message_id' in _params, \
+                  f'{_m} missing reply_to_message_id param (CV-13155)'
+              assert 'thread_id' not in _params, \
+                  f'{_m} still exposes thread_id — cv-api #277 rejects it with 400'
+
           # the agent can ship "here's the report" + the .md/PDF in a single
           # bubble. Defaults still work for plain text — guards against a
           # future refactor flipping the param to required.

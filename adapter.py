@@ -241,13 +241,15 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        # v5 transport: pass ``thread_id`` directly to the server. The CV
-        # team's design intent — "Just always reply to thread_id when
-        # wanting to do thread; eliminate client guessing" — means the
-        # server resolves the threading; no client-side reply-anchor
-        # lookup is required.
+        # v5 transport: the resolved thread root is sent to the server as
+        # ``reply_to_message_id`` (cv-api PR #277 renamed the old
+        # ``thread_id`` input). The server resolves threading itself —
+        # ``resolveRootParentMessageId`` roots whatever id we pass, so
+        # sending the thread root keeps it the root and no client-side
+        # reply-anchor lookup is required.
         #
-        # ``thread_id`` priority:
+        # ``thread_id`` priority (Hermes-side concept; the value becomes
+        # the wire ``reply_to_message_id`` below):
         #   1. ``metadata['thread_id']`` — populated by Hermes core from
         #      ``SessionSource.thread_id`` for group messages.
         #   2. ``reply_to`` from the caller — used as a fallback when no
@@ -259,7 +261,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             data = await self._api.send_text_v5(
                 conversation_id=chat_id,
                 transcript=content,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
@@ -291,8 +293,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         """Send a voice memo via ``POST /v5/messages/audio`` (multipart).
 
         ``audio_path`` is a local audio file. CV transcribes it
-        server-side and threads the resulting message using ``thread_id``
-        from metadata (same resolution rules as :meth:`send`).
+        server-side and threads the resulting message via the resolved
+        thread root sent as ``reply_to_message_id`` (same resolution
+        rules as :meth:`send`).
 
         Parameter names match :class:`BasePlatformAdapter.send_voice` —
         Hermes core's media dispatch (``base.py:3640``) invokes us with
@@ -308,7 +311,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             data = await self._api.send_audio_v5(
                 conversation_id=chat_id,
                 audio_path=audio_path,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
@@ -594,13 +597,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             return await self._api.send_text_v5(
                 conversation_id=chat_id,
                 transcript=caption,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
                 attachments=[attachment],
             )
         return await self._api.send_attachment_v5(
             conversation_id=chat_id,
             attachments=[attachment],
-            thread_id=thread_id,
+            reply_to_message_id=thread_id,
         )
 
     async def _upload_attachment_in_background(

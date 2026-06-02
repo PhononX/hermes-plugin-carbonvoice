@@ -230,12 +230,16 @@ def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
 def extract_reply_anchor(msg: Dict[str, Any]) -> Optional[str]:
     """The message_id to thread *next* replies under.
 
-    Carbon Voice rejects ``reply_to_message_id`` that points at a reply (it
-    returns ``400 You cannot reply to a message that is a reply``). To stay
-    safe, we anchor to the parent of the inbound message when present, and
-    fall back to the message itself only when it is a top-level message.
-    Mirrors the ``parent_message_id ?? message_id`` pattern in the TypeScript
-    reference implementation.
+    Resolves to ``parent_message_id`` (the thread root) when the inbound
+    message is a reply, else the message's own id. Mirrors the
+    ``parent_message_id ?? message_id`` pattern in the TypeScript client.
+
+    As of cv-api PR #277 (CV-13155) the backend resolves the thread root
+    server-side (``resolveRootParentMessageId``): sending a non-root id as
+    ``reply_to_message_id`` no longer returns ``400 You cannot reply to a
+    message that is a reply`` — it is normalized to the root. The only
+    remaining reply error is cross-conversation. Anchoring to the root
+    here is therefore belt-and-suspenders, not a hard requirement.
     """
     parent = first_str(
         msg.get("parent_message_id"), msg.get("parent_message_guid")
