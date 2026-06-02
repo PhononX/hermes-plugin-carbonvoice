@@ -66,7 +66,6 @@ from .parse import (
     extract_transcript,
     first_str,
     now_iso,
-    strip_inline_mentions,
 )
 # extract_transcript is also re-exported via parse for the parent-text path
 # (now handled by ConversationTracker, but the import here is kept so
@@ -241,13 +240,15 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
-        # v5 transport: pass ``thread_id`` directly to the server. The CV
-        # team's design intent — "Just always reply to thread_id when
-        # wanting to do thread; eliminate client guessing" — means the
-        # server resolves the threading; no client-side reply-anchor
-        # lookup is required.
+        # v5 transport: the resolved thread root is sent to the server as
+        # ``reply_to_message_id`` (cv-api PR #277 renamed the old
+        # ``thread_id`` input). The server resolves threading itself —
+        # ``resolveRootParentMessageId`` roots whatever id we pass, so
+        # sending the thread root keeps it the root and no client-side
+        # reply-anchor lookup is required.
         #
-        # ``thread_id`` priority:
+        # ``thread_id`` priority (Hermes-side concept; the value becomes
+        # the wire ``reply_to_message_id`` below):
         #   1. ``metadata['thread_id']`` — populated by Hermes core from
         #      ``SessionSource.thread_id`` for group messages.
         #   2. ``reply_to`` from the caller — used as a fallback when no
@@ -259,7 +260,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             data = await self._api.send_text_v5(
                 conversation_id=chat_id,
                 transcript=content,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
@@ -291,8 +292,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         """Send a voice memo via ``POST /v5/messages/audio`` (multipart).
 
         ``audio_path`` is a local audio file. CV transcribes it
-        server-side and threads the resulting message using ``thread_id``
-        from metadata (same resolution rules as :meth:`send`).
+        server-side and threads the resulting message via the resolved
+        thread root sent as ``reply_to_message_id`` (same resolution
+        rules as :meth:`send`).
 
         Parameter names match :class:`BasePlatformAdapter.send_voice` —
         Hermes core's media dispatch (``base.py:3640``) invokes us with
@@ -308,7 +310,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             data = await self._api.send_audio_v5(
                 conversation_id=chat_id,
                 audio_path=audio_path,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
             return SendResult(success=True, message_id=msg_id, raw_response=data)
@@ -594,13 +596,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             return await self._api.send_text_v5(
                 conversation_id=chat_id,
                 transcript=caption,
-                thread_id=thread_id,
+                reply_to_message_id=thread_id,
                 attachments=[attachment],
             )
         return await self._api.send_attachment_v5(
             conversation_id=chat_id,
             attachments=[attachment],
-            thread_id=thread_id,
+            reply_to_message_id=thread_id,
         )
 
     async def _upload_attachment_in_background(
@@ -881,9 +883,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 except Exception:
                     name = creator
             name = name or "unknown"
-            # Strip CV's inline @[name](guid) markup for the same reason
-            # we strip it on inbound — the guids are LLM noise.
-            text = strip_inline_mentions(text)
             prefix = "[thread parent] " if is_root else ""
             parts.append(f"{prefix}{name}: {text}")
 
@@ -1129,7 +1128,38 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not transcript:
             return False
 
-        self._seen.mark(message_id)
+        # V5 source-of-truth enrichment. The socket / v3-poll push gives
+        # us a V2-shaped payload that trails the v5 GET on async fields:
+        # ``tagged_user_ids`` is empty here until a backend job resolves
+        # the tag picker selection, and attachment metadata can lag the
+        # same way. CV's v5 endpoint is the canonical post-resolution
+        # state — the Flutter client follows the same "socket = signal,
+        # REST = truth" pattern.
+        #
+        # We do the GET only here, after the cheap-reject gates above
+        # (self-loop, allowlist, dedupe, empty-transcript), so empty
+        # ``message:created`` events don't pay the HTTP. On fetch
+        # failure we keep the V2 payload — defensive, so a transient
+        # /v5 hiccup doesn't drop an otherwise-deliverable message.
+        # The parse helpers (``extract_*``) prefer V5 fields when
+        # present, so reassigning ``msg`` is enough — no further
+        # downstream changes needed.
+        if self._api is not None:
+            try:
+                enriched = await self._api.get_message_v5(message_id)
+            except Exception as exc:
+                logger.debug(
+                    "carbonvoice: v5 enrichment failed for %s: %s — "
+                    "continuing with v2 payload",
+                    message_id, exc,
+                )
+                enriched = None
+            if enriched:
+                msg = enriched
+                # Re-pull transcript from the (canonical) v5 payload —
+                # usually the same string but keeps everything in one
+                # shape after this point.
+                transcript = extract_transcript(msg) or transcript
 
         # Resolve chat_type before the mention gate so the gate can short-
         # circuit group messages without spinning up the rest of the
@@ -1156,7 +1186,21 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: skip message %s in %s — %s",
                 message_id, channel_id, decision.reason,
             )
+            # Leave revisitable rejections out of the dedup cache so a
+            # follow-up ``message:updated`` re-fire (e.g. cv-api emits
+            # one after the async tag-resolution job populates
+            # ``tagged_user_ids``) gets another shot at the gate. Stable
+            # rejections (ignored channel, etc.) mark seen so we don't
+            # re-evaluate them on every retry. See GateDecision docstring.
+            if not decision.revisitable:
+                self._seen.mark(message_id)
             return False
+
+        # Decision is "process" — commit to it. Marking seen here (rather
+        # than before the gate) guarantees we only dedup messages we
+        # actually dispatch; a re-fire with new metadata still gets a
+        # fair gate evaluation up to this point.
+        self._seen.mark(message_id)
 
         # Fire the visual ack first so the user sees feedback in <100ms,
         # well before the agent's reply (which can take 10+ seconds).
@@ -1187,10 +1231,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         reply_to_text = await self._tracker.get_parent_text(parent)
 
-        # Strip CV's inline @[name](guid) markup so the agent sees
-        # readable text — the guid in the original is LLM noise that
-        # can confuse instruction following.
-        clean_text = strip_inline_mentions(transcript)
+        # Mentions now arrive structured in ``tagged_user_ids`` (see
+        # parse.is_user_mentioned). The Flutter composer sends the
+        # transcript as plain text — ``@Name`` without the guid — so
+        # there is no inline ``@[name](guid)`` markup left to strip; pass
+        # the transcript through as-is.
+        clean_text = transcript
 
         # Session sharing in groups: pass the thread root as
         # ``SessionSource.thread_id`` so Hermes core composes a shared
