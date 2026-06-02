@@ -63,12 +63,15 @@ hermes/
 ├── state.py          Cursor — disk-persisted "last seen at" timestamp
 │                     for offline catch-up. Debounced 5s flush.
 │
-├── transport.py      Socket.IO client + REST polling lifecycle. Calls
-│                     a callback when there's something to fetch.
-│
-└── users.py          UserCache — resolves user_guid → display name via
-                      GET /v3/users/{id}. Per-process cache, no TTL.
+└── transport.py      Socket.IO client + REST polling lifecycle. Calls
+                      a callback when there's something to fetch.
 ```
+
+> **Name resolution lives in `channels.py`, not a separate `users.py`.**
+> The standalone `GET /v3/users/{id}` endpoint is dead (404), so the old
+> `UserCache` was removed. `ChannelCache` now derives both `chat_type` and
+> a `{user_guid → name}` roster from one `GET /channel/{id}` call
+> (`json_collaborators`), so participant names cost zero extra requests.
 
 **Design principle:** the adapter is a coordinator. Each subsystem owns one responsibility and is independently testable. When a new responsibility appears (e.g., the mention gate), it gets its own module rather than swelling the adapter.
 
@@ -136,6 +139,8 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | ~~**`tagged_user_ids` not in API response.**~~ ✅ **Resolved (Q2 2026).** The DB field is now surfaced in `Message`, `MessageV2`, and `MessageV5` DTOs (cv-api #243). `is_user_mentioned()` is now a structured-field-only check — the inline-parsing fallback was removed once the Flutter client stopped embedding GUIDs in the transcript (see §6 ADR). | Voice memos with UI tagging now reach the bot. | — |
 | ~~**`tagged_user_ids` empty on inbound socket push for voice messages with picker tags.**~~ ✅ **Resolved (Q2 2026 PR — V5 source-of-truth migration).** The WebSocket / `/v3/messages/recent` push delivers a V2-shaped payload that **trails** the v5 GET on async fields: the tag-resolution job that populates `tagged_user_ids` from the Flutter picker selection runs after the message is created and STT-transcribed, but the socket push doesn't wait for it. Querying `GET /v5/messages/:id` minutes later returns the populated array — so the field reaches v5 correctly, just not the push. The plugin now treats the socket / poll payload as a **notification signal** and refetches via `get_message_v5(id)` inside `_process_message` (right after the cheap-reject gates so empty-transcript events don't pay the HTTP). This matches the architecture the Flutter client already uses (signal-then-pull). Defensive fallback to the V2 payload on fetch failure so a transient `/v5` hiccup doesn't drop the message. Parse helpers (`extract_message_id`, `extract_channel_id`, `extract_transcript`) handle both V5 and V2 shapes so the pre-enrichment and webhook paths still work. | Voice-message tagging via the Flutter picker now reaches the bot reliably. Side benefit: any future field the V5 serializer adds to the GET endpoint is consumed automatically. | — |
 | ~~**v5 outbound used the short-lived `thread_id` input field.**~~ ✅ **Resolved (Q2 2026 — cv-api PR #277 / CV-13155, cv-contracts 4.0.1).** The v5 *conversation* create routes (`/v5/messages/{text,audio,attachment}`) **renamed the threading input `thread_id` → `reply_to_message_id`** and moved `thread_id` into the v5 reject-deprecated-fields pipe — sending it now returns **400**. The backend also got smarter: `resolveRootParentMessageId` resolves whatever message id you pass to its thread root server-side (replying to a reply is normalized instead of 400'd; only cross-conversation replies still fail). On the **inbound** side, `MessageV5` and the webhook payload **dropped `thread_id`**; `parent_message_id` is the canonical (un-deprecated) public thread field again. The plugin's `api.send_text_v5` / `send_audio_v5` / `send_attachment_v5` now send `reply_to_message_id`; the adapter passes the resolved thread root (root-resolves-to-itself keeps threading correct). The Hermes-side `thread_id` *concept* (`SessionSource.thread_id`, `ConversationTracker.thread_id_of`, reply anchors, thread-context cache) is unchanged — it already reads inbound `parent_message_id`. CI locks the rename (the three send methods must expose `reply_to_message_id` and not `thread_id`). | Threaded replies / voice memos / attachments no longer 400 against current `main`. Clients may now reply to any visible message, not just the root. | — |
+| ~~**Agent saw user IDs, not names.**~~ ✅ **Resolved (Q2 2026).** `GET /v3/users/{id}` is dead (404 for every guid, including the bot), so the old `UserCache` always fell back to the raw guid — and Hermes core's session context showed `**User ID:** <guid>` instead of a name. Names now come from the channel's `json_collaborators` (`ChannelCache.resolve_name`, same `GET /channel/{id}` call as chat_type → zero extra requests). `SessionSource.user_name` is populated for DMs and groups, and a participant roster is injected via `MessageEvent.channel_context` (`[Participants in this conversation: …]`) when there are ≥2 humans, so the agent can name and attribute people — including those who haven't spoken yet. | The agent knows who it's talking to and who else is in the room. | — |
+| ~~**`/v5/messages/by-ids` 400'd → thread context silently broke.**~~ ✅ **Resolved (Q2 2026).** The endpoint's request body changed from `{ids:[...]}` to `{conversation_id, message_ids:[...]}` (it now requires the conversation id). `get_messages_by_ids_v5` sends the new shape and `_fetch_thread_context` passes `channel_id`; first-@mention thread context works again. Returned items are flat MessageV5 dicts (no `{"message": …}` envelope, unlike the single GET). | First-@mention thread history reaches the agent again. | The single-call thread-listing endpoint in the row above would still be a nice optimization. |
 
 ## 5. Roadmap
 
@@ -325,7 +330,7 @@ When the key resolves to a shared session, Hermes core
 (`gateway/run.py:6704`) automatically prefixes every user message with
 `[<user_name>]` before passing to the LLM, so the agent can attribute
 statements ("Alice asked X, Bob added Y…"). The plugin only needs
-`source.user_name` populated — `UserCache` already does this.
+`source.user_name` populated — `ChannelCache.resolve_name` (from the channel roster) does this.
 
 ### 7.3 Current behavior in this plugin
 
@@ -374,7 +379,7 @@ some are misplaced. Consolidate them in a new `ConversationTracker`:
 | Cursor (`last_seen_at`) | global | persistent (disk) | `state.py` | keep |
 | Self user id | global | process | `adapter.py` | keep |
 | Channel type (DM/group) | per-channel | process | `channels.py` (`ChannelCache`) | keep |
-| Display names | per-user | process | `users.py` (`UserCache`) | keep |
+| Display names | per-channel roster | process | `channels.py` (`ChannelCache`, from `json_collaborators`) | keep |
 | Seen messages (dedup) | per-message | TTL ~10m | `dedupe.py` (`SeenCache`) | keep |
 | Outbound reply anchor | **per-thread** | process | `adapter._last_inbound_msg` keyed by `channel_id` ⚠️ | **move + rekey** |
 | ~~Thread root (parent→root)~~ | ~~per-message~~ | ~~process, LRU~~ | ~~—~~ | ~~**add**~~ — **not needed**, CV is flat (§4) |
@@ -440,7 +445,7 @@ during restart.
 | State | Persist? | Reason |
 |---|---|---|
 | Cursor | ✅ (already) | Without it we miss or duplicate offline messages. |
-| Self user id, ChannelCache, UserCache | ❌ | Trivially refetchable on connect. |
+| Self user id, ChannelCache (chat_type + roster) | ❌ | Trivially refetchable on connect. |
 | SeenCache | ❌ | Short TTL, refetch is idempotent. |
 | Engaged threads | 🟡 v1 in-memory, revisit | Lose engagement on restart → one extra mention required. Acceptable for v1. |
 | Outbound msg ids | 🟡 v1 in-memory, revisit | Loses "reply-to-bot" detection for pre-restart messages. Acceptable. |

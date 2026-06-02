@@ -20,9 +20,10 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Set
+from typing import TYPE_CHECKING, Optional, Set
 
-from .users import UserCache
+if TYPE_CHECKING:
+    from .channels import ChannelCache
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,9 @@ class AllowlistGate:
 class IgnoredSenderLog:
     """Append-only JSON-lines log of rejected inbound senders."""
 
-    def __init__(self, path: Path, users: UserCache):
+    def __init__(self, path: Path, channels: "ChannelCache"):
         self._path = path
-        self._users = users
+        self._channels = channels
 
     @property
     def path(self) -> Path:
@@ -83,7 +84,14 @@ class IgnoredSenderLog:
 
     async def _record(self, user_id: str, channel_id: Optional[str]) -> None:
         try:
-            username = await self._users.resolve(user_id) if user_id else ""
+            # Resolve the name from the channel roster when we have a
+            # channel; an unauthorized sender may not be a collaborator,
+            # in which case this is None and we log just the guid.
+            username = ""
+            if user_id and channel_id:
+                username = (
+                    await self._channels.resolve_name(channel_id, user_id) or ""
+                )
             entry = {
                 "time": datetime.now(timezone.utc).isoformat(),
                 "user_id": user_id,

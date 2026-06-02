@@ -576,14 +576,6 @@ class CarbonVoiceAPI:
         )
         resp.raise_for_status()
 
-    async def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """GET /v3/users/{user_id} — returns user profile dict or None on 4xx."""
-        client = self._require_client()
-        resp = await client.get(f"/v3/users/{user_id}")
-        if resp.status_code >= 400:
-            return None
-        return resp.json() if resp.content else None
-
     async def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
         """GET /v3/messages/{message_id} — returns the message dict or None on 4xx.
 
