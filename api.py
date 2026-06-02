@@ -486,7 +486,7 @@ class CarbonVoiceAPI:
         return inner if isinstance(inner, dict) else data
 
     async def get_messages_by_ids_v5(
-        self, message_ids: List[str]
+        self, conversation_id: str, message_ids: List[str]
     ) -> List[Dict[str, Any]]:
         """POST /v5/messages/by-ids — batch fetch of multiple MessageV5s.
 
@@ -494,11 +494,21 @@ class CarbonVoiceAPI:
         ``adapter._fetch_thread_context``) to pull the transcripts for the
         message ids that ``list_channel_message_index`` identified as
         belonging to the thread, in a single round-trip.
+
+        The endpoint requires BOTH ``conversation_id`` and ``message_ids``
+        — it rejects the message-id list alone with a 400
+        ("conversation_id should not be empty"). The returned items are
+        flat MessageV5 dicts (no ``{"message": …}`` envelope, unlike the
+        single ``GET /v5/messages/{id}``), so ``extract_*`` helpers work on
+        them directly.
         """
         if not message_ids:
             return []
         client = self._require_client()
-        resp = await client.post("/v5/messages/by-ids", json={"ids": message_ids})
+        resp = await client.post(
+            "/v5/messages/by-ids",
+            json={"conversation_id": conversation_id.strip(), "message_ids": message_ids},
+        )
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else data.get("messages", []) if isinstance(data, dict) else []

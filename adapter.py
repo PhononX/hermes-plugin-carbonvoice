@@ -841,7 +841,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         ids = [mid for mid, _, _ in thread_items]
         try:
-            full = await self._api.get_messages_by_ids_v5(ids)
+            full = await self._api.get_messages_by_ids_v5(channel_id, ids)
         except Exception as exc:
             logger.debug(
                 "carbonvoice: get_messages_by_ids_v5 for thread context failed: %s",
