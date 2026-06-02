@@ -455,12 +455,25 @@ class CarbonVoiceAPI:
         return out_path
 
     async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """GET /v5/messages/{id} — returns the MessageV5 dict or None on 4xx.
+        """GET /v5/messages/{id} — returns the flat MessageV5 dict or None.
 
-        Same shape as ``GET /v3/messages/{id}`` but with ``thread_id`` as
-        the preferred public field and ``parent_message_id`` as the
-        deprecated alias. Used by future memory wiring to fetch full
-        thread context on @mention without local buffering.
+        The v5 single-GET wraps its payload in a ``{"message": {...}}``
+        envelope (unlike ``GET /v3/messages/{id}``, which is flat). We
+        unwrap it here so callers receive the flat shape that the
+        ``extract_*`` helpers and the mention gate expect:
+        ``tagged_user_ids``, ``parent_message_id``, and ``transcript``
+        live on the message object, not the envelope.
+
+        Returning the envelope unchanged hid every field behind the
+        ``message`` key — that was the bug that silently dropped
+        @-mentions in group channels: the enriched payload's
+        ``tagged_user_ids`` was invisible to ``is_user_mentioned``
+        (DMs masked it, since the gate passes them regardless).
+
+        ``parent_message_id`` is the canonical public thread field
+        (cv-contracts 4.0.1 / cv-api PR #277 removed the short-lived
+        ``thread_id`` field). The unwrap is defensive: if the endpoint
+        ever returns a flat body, that is passed through unchanged.
         """
         client = self._require_client()
         resp = await client.get(f"/v5/messages/{message_id}")
