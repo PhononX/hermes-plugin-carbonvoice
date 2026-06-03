@@ -194,6 +194,49 @@ def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
     return "dm"
 
 
+def _collaborator_name(p: Dict[str, Any]) -> str:
+    """Best display name for one ``json_collaborators`` entry.
+
+    Prefers ``first_name [last_name]``; falls back to the flat
+    ``display_name`` / ``name`` / ``username`` shapes some payloads use.
+    Returns ``""`` when nothing usable is present.
+    """
+    first = str(p.get("first_name") or "").strip()
+    last = str(p.get("last_name") or "").strip()
+    full = (first + " " + last).strip()
+    if full:
+        return full
+    return first_str(p.get("display_name"), p.get("name"), p.get("username")) or ""
+
+
+def extract_roster(channel: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Map ``user_guid`` → display name from a channel's collaborators.
+
+    Carbon Voice's ``GET /channel/{id}`` returns ``json_collaborators`` —
+    one entry per participant with ``user_guid`` + ``first_name`` /
+    ``last_name``. This is the canonical place to resolve names: the
+    standalone ``GET /v3/users/{id}`` endpoint is dead (404), and the
+    collaborator list is already on the channel payload the adapter
+    fetches for chat-type resolution, so names cost zero extra calls.
+
+    Returns ``{}`` on a missing/partial payload. Entries without a guid or
+    a usable name are skipped.
+    """
+    out: Dict[str, str] = {}
+    if not channel:
+        return out
+    for p in (channel.get("json_collaborators") or []):
+        if not isinstance(p, dict):
+            continue
+        guid = first_str(p.get("user_guid"), p.get("guid"), p.get("id"))
+        if not guid:
+            continue
+        name = _collaborator_name(p)
+        if name:
+            out[guid] = name
+    return out
+
+
 def extract_reply_anchor(msg: Dict[str, Any]) -> Optional[str]:
     """The message_id to thread *next* replies under.
 

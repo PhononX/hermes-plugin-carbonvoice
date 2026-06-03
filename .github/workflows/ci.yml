@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'users', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -100,6 +100,19 @@ jobs:
           assert not c.is_seen('x')
           c.mark('x')
           assert c.is_seen('x')
+
+          # Participant roster from json_collaborators (GET /v3/users is dead,
+          # 404; the channel collaborator list is the name source of truth).
+          from carbonvoice.parse import extract_roster
+          _chan = {'json_collaborators': [
+              {'user_guid': 'u1', 'first_name': 'Cristian', 'last_name': 'Murillo'},
+              {'user_guid': 'u2', 'first_name': 'crd', 'last_name': 'producer'},
+              {'user_guid': 'u3', 'display_name': 'Flat Name'},   # alt shape
+          ]}
+          _r = extract_roster(_chan)
+          assert _r == {'u1': 'Cristian Murillo', 'u2': 'crd producer', 'u3': 'Flat Name'}, _r
+          assert extract_roster(None) == {} and extract_roster({}) == {}
+          assert extract_roster({'json_collaborators': [{'first_name': 'x'}]}) == {}  # no guid → skip
 
           from carbonvoice.parse import chat_type_from_channel
           # Safe defaults: missing/empty/unknown payload → "dm" (preserves
@@ -276,12 +289,69 @@ jobs:
               'upload_to_s3',          # direct S3 PUT (PR 5)
               'update_attachment',     # attachment status flip (PR 5)
               'get_message',           # legacy v3 single fetch (kept)
-              'get_channel',           # channel metadata
+              'get_channel',           # channel metadata + collaborator roster
               'whoami', 'fetch_recent', 'fetch_reactions', 'react', 'mark_read',
-              'get_user',
           ):
               assert hasattr(CarbonVoiceAPI, method), f'CarbonVoiceAPI is missing {method}'
           print(f'CarbonVoiceAPI surface: {sum(1 for m in dir(CarbonVoiceAPI) if not m.startswith("_"))} public methods')
+
+          # by-ids now requires conversation_id (cv-api changed the body from
+          # {ids:[...]} to {conversation_id, message_ids:[...]} — the old shape
+          # 400s, which is why thread-context fetch was silently broken).
+          import inspect as _inspect, asyncio as _asyncio
+          _p = list(_inspect.signature(CarbonVoiceAPI.get_messages_by_ids_v5).parameters)
+          assert _p[:3] == ['self', 'conversation_id', 'message_ids'], _p
+
+          # ChannelCache resolves chat_type AND the participant roster from a
+          # SINGLE GET /channel/{id} (names come from json_collaborators now,
+          # not the dead /v3/users/{id}). Assert one call serves both axes.
+          from carbonvoice.channels import ChannelCache
+          class _FakeAPI:
+              def __init__(self): self.calls = 0
+              async def get_channel(self, cid):
+                  self.calls += 1
+                  return {'type': 'namedConversation', 'json_collaborators': [
+                      {'user_guid': 'u1', 'first_name': 'Cristian', 'last_name': 'Murillo'},
+                      {'user_guid': 'bot', 'first_name': 'Hermes', 'last_name': '2'}]}
+          async def _cc_test():
+              api = _FakeAPI(); cc = ChannelCache(api)
+              assert await cc.resolve_chat_type('c1') == 'group'
+              assert await cc.get_roster('c1') == {'u1': 'Cristian Murillo', 'bot': 'Hermes 2'}
+              assert await cc.resolve_name('c1', 'u1') == 'Cristian Murillo'
+              assert await cc.resolve_name('c1', 'nope') is None
+              assert api.calls == 1, f'expected 1 get_channel call, got {api.calls}'
+              # TTL: with ttl_s=0 every access refetches (picks up new joiners
+              # without a restart). With the default TTL the entry stays warm.
+              api0 = _FakeAPI(); cc0 = ChannelCache(api0, ttl_s=0)
+              await cc0.resolve_chat_type('c1')   # load → call 1
+              await cc0.get_roster('c1')          # ttl=0 → expired → call 2
+              assert api0.calls == 2, f'ttl=0 should refetch, got {api0.calls}'
+          _asyncio.run(_cc_test())
+          print('ChannelCache: one call for chat_type+roster; TTL refetch — OK')
+
+          # get_message_v5 must UNWRAP the {"message": {...}} envelope the v5
+          # single-GET returns (the source-of-truth test mocked a flat payload
+          # and missed this — a regression silently drops @-mentions because
+          # tagged_user_ids hides behind the 'message' key).
+          class _EnvResp:
+              status_code = 200
+              content = b'{"message":{"id":"m1","tagged_user_ids":["BOT"]}}'
+              def json(self): return {'message': {'id': 'm1', 'tagged_user_ids': ['BOT']}}
+          class _FlatResp:
+              status_code = 200
+              content = b'{"id":"m2"}'
+              def json(self): return {'id': 'm2'}
+          class _GetClient:
+              def __init__(self, resp): self._resp = resp
+              async def get(self, url): return self._resp
+          async def _env_test():
+              a = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a._client = _GetClient(_EnvResp())
+              out = await a.get_message_v5('m1')
+              assert out == {'id': 'm1', 'tagged_user_ids': ['BOT']}, out  # unwrapped
+              a2 = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a2._client = _GetClient(_FlatResp())
+              assert await a2.get_message_v5('m2') == {'id': 'm2'}  # flat passthrough
+          _asyncio.run(_env_test())
+          print('get_message_v5 unwraps {message:…} envelope + flat passthrough — OK')
 
           # PR 4 — thread-context cache on ConversationTracker:
           # TTL eviction (entries past ttl_s return None) + LRU eviction

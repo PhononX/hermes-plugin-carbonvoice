@@ -13,7 +13,7 @@ This module is the thin orchestrator that wires together:
     state        — disk-persisted cursor (Cursor)
     dedupe       — in-memory seen-message TTL cache (SeenCache)
     reactions    — visual ack on inbound (ReactionService)
-    users        — username resolution cache (UserCache)
+    channels     — chat_type ("dm"/"group") + participant roster cache
     audit        — allowlist gate + ignored-sender audit log
 
 No public webhook is required — the adapter holds an outbound Socket.IO
@@ -73,7 +73,6 @@ from .parse import (
 from .reactions import ReactionService
 from .state import Cursor, default_state_path
 from .transport import Transport
-from .users import UserCache
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +157,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             ws_retry_max_s=ws_retry_max_s,
             on_tick=self._fetch_missed_messages,
         )
-        self._users = UserCache(self._api) if self._api else None
         self._channels = ChannelCache(self._api) if self._api else None
         self._reactions = (
             ReactionService(
@@ -172,7 +170,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         self._allowlist = AllowlistGate.from_env()
         self._gate = MentionGate.from_env()
         self._ignored_log = (
-            IgnoredSenderLog(ignored_log_path, self._users) if self._users else None
+            IgnoredSenderLog(ignored_log_path, self._channels)
+            if self._channels
+            else None
         )
 
         # Per-thread reply anchors + parent-text cache + (eventually)
@@ -841,7 +841,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         ids = [mid for mid, _, _ in thread_items]
         try:
-            full = await self._api.get_messages_by_ids_v5(ids)
+            full = await self._api.get_messages_by_ids_v5(channel_id, ids)
         except Exception as exc:
             logger.debug(
                 "carbonvoice: get_messages_by_ids_v5 for thread context failed: %s",
@@ -877,9 +877,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             ):
                 continue
             name = creator
-            if creator and self._users is not None:
+            if creator and self._channels is not None:
                 try:
-                    name = await self._users.resolve(creator)
+                    name = await self._channels.resolve_name(channel_id, creator) or creator
                 except Exception:
                     name = creator
             name = name or "unknown"
@@ -1223,10 +1223,17 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if thread_id:
             self._tracker.set_reply_anchor(thread_id, thread_id)
 
+        # Resolve the sender's display name from the channel roster
+        # (json_collaborators on GET /channel/{id}, cached). The old
+        # GET /v3/users/{id} endpoint is dead (404), so the channel
+        # collaborator list is the source of truth — and it's the same
+        # payload we already fetched for chat_type above, so this is a
+        # cache hit. Falls back to the raw guid when the sender isn't in
+        # the list (shouldn't happen — you must be a collaborator to post).
         user_name = ""
-        if creator_id and self._users is not None:
-            user_name = await self._users.resolve(creator_id)
-        elif creator_id:
+        if creator_id and self._channels is not None:
+            user_name = await self._channels.resolve_name(channel_id, creator_id) or ""
+        if not user_name and creator_id:
             user_name = creator_id
 
         reply_to_text = await self._tracker.get_parent_text(parent)
@@ -1306,6 +1313,30 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             )
             clean_text = f"{link_prefix}\n{clean_text}" if clean_text else link_prefix
 
+        # Participant roster: give the agent the names of everyone in the
+        # conversation (not just whoever is speaking) so it can address
+        # people and attribute statements. Sourced from the channel
+        # collaborator list (cache hit — same payload as chat_type), with
+        # the bot itself excluded. Injected via ``channel_context``, which
+        # Hermes core prepends once after the sender prefix and keeps in
+        # history — unlike ``channel_prompt`` which resets per message and
+        # would bust the prompt cache. We only inject when there are ≥2
+        # other humans: in a 1:1 DM the sender's name already rides in the
+        # system prompt (``SessionSource.user_name``), so a one-name roster
+        # would be redundant noise.
+        channel_context: Optional[str] = None
+        if self._channels is not None:
+            roster = await self._channels.get_roster(channel_id)
+            others = sorted(
+                n for g, n in roster.items() if g != self._self_user_id
+            )
+            if len(others) >= 2:
+                channel_context = (
+                    "[Participants in this conversation: "
+                    + ", ".join(others)
+                    + "]"
+                )
+
         # Mark VOICE when ``CARBONVOICE_VOICE_OUT=true`` so Hermes core's
         # auto-TTS gate (``base.py:3493``) accepts this event for voice-
         # mode dispatch. CV doesn't distinguish text-typed vs voice-
@@ -1325,6 +1356,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             media_urls=media_urls,
             media_types=media_types,
+            channel_context=channel_context,
         )
 
         # Dispatch in a background task so processing one message can't block
