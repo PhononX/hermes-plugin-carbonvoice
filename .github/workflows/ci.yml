@@ -320,8 +320,38 @@ jobs:
               assert await cc.resolve_name('c1', 'u1') == 'Cristian Murillo'
               assert await cc.resolve_name('c1', 'nope') is None
               assert api.calls == 1, f'expected 1 get_channel call, got {api.calls}'
+              # TTL: with ttl_s=0 every access refetches (picks up new joiners
+              # without a restart). With the default TTL the entry stays warm.
+              api0 = _FakeAPI(); cc0 = ChannelCache(api0, ttl_s=0)
+              await cc0.resolve_chat_type('c1')   # load → call 1
+              await cc0.get_roster('c1')          # ttl=0 → expired → call 2
+              assert api0.calls == 2, f'ttl=0 should refetch, got {api0.calls}'
           _asyncio.run(_cc_test())
-          print('ChannelCache: chat_type + roster from one get_channel call — OK')
+          print('ChannelCache: one call for chat_type+roster; TTL refetch — OK')
+
+          # get_message_v5 must UNWRAP the {"message": {...}} envelope the v5
+          # single-GET returns (the source-of-truth test mocked a flat payload
+          # and missed this — a regression silently drops @-mentions because
+          # tagged_user_ids hides behind the 'message' key).
+          class _EnvResp:
+              status_code = 200
+              content = b'{"message":{"id":"m1","tagged_user_ids":["BOT"]}}'
+              def json(self): return {'message': {'id': 'm1', 'tagged_user_ids': ['BOT']}}
+          class _FlatResp:
+              status_code = 200
+              content = b'{"id":"m2"}'
+              def json(self): return {'id': 'm2'}
+          class _GetClient:
+              def __init__(self, resp): self._resp = resp
+              async def get(self, url): return self._resp
+          async def _env_test():
+              a = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a._client = _GetClient(_EnvResp())
+              out = await a.get_message_v5('m1')
+              assert out == {'id': 'm1', 'tagged_user_ids': ['BOT']}, out  # unwrapped
+              a2 = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a2._client = _GetClient(_FlatResp())
+              assert await a2.get_message_v5('m2') == {'id': 'm2'}  # flat passthrough
+          _asyncio.run(_env_test())
+          print('get_message_v5 unwraps {message:…} envelope + flat passthrough — OK')
 
           # PR 4 — thread-context cache on ConversationTracker:
           # TTL eviction (entries past ttl_s return None) + LRU eviction

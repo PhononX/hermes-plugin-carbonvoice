@@ -12,19 +12,24 @@ One ``GET /channel/{id}`` per channel populates two things, both keyed by
     payload we already fetch for chat-type, so names cost zero extra
     calls.
 
-The first message in a new channel pays one API call; every message
-after is free for both axes. A failed lookup caches ``"dm"`` + an empty
-roster so the adapter degrades gracefully (keeps responding, falls back
-to the raw guid for names) rather than re-hitting the API per message.
+The first message in a new channel pays one API call; within the TTL
+window every message after is free for both axes. A failed *initial*
+lookup caches ``"dm"`` + an empty roster so the adapter degrades
+gracefully (keeps responding, falls back to the raw guid for names)
+rather than re-hitting the API per message.
 
-Roster note: membership *can* change (people join/leave), but names
-rarely do; we accept process-lifetime caching for v1. A restart refreshes
-both. If stale rosters ever bite, add a TTL here with the same shape.
+TTL: the payload is refreshed after ``ttl_s`` (default 30 min) so a
+participant who joins mid-conversation shows up in the roster without a
+gateway restart. ``chat_type`` is immutable so re-fetching it is wasted
+but harmless — keeping one cache policy is simpler than two. A failed
+*refresh* keeps the prior good values (we don't blow a known roster away
+with an empty one on a transient hiccup).
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, Optional
 
 from .api import CarbonVoiceAPI
@@ -32,16 +37,32 @@ from .parse import chat_type_from_channel, extract_roster
 
 logger = logging.getLogger(__name__)
 
+# 30 min — long enough that a busy channel stays cache-warm, short enough
+# that a new joiner is picked up within a reasonable window. Mirrors the
+# thread-context TTL in conversations.py.
+DEFAULT_CHANNEL_TTL_S = 1800
+
 
 class ChannelCache:
-    def __init__(self, api: CarbonVoiceAPI):
+    def __init__(
+        self, api: CarbonVoiceAPI, *, ttl_s: int = DEFAULT_CHANNEL_TTL_S
+    ):
         self._api = api
         self._type_cache: Dict[str, str] = {}
         self._roster_cache: Dict[str, Dict[str, str]] = {}
+        self._loaded_at: Dict[str, float] = {}
+        self._ttl_s = ttl_s
 
     async def _ensure_loaded(self, channel_id: str) -> None:
-        """Fetch the channel once and populate both caches."""
-        if channel_id in self._type_cache:
+        """Fetch the channel and populate both caches, honoring the TTL.
+
+        Returns early when a cached entry is still within ``ttl_s``. On a
+        refresh that fails, the prior cached values are kept (and the
+        timestamp bumped so we don't hammer the API on repeated failures).
+        """
+        now = time.monotonic()
+        loaded = self._loaded_at.get(channel_id)
+        if loaded is not None and (now - loaded) <= self._ttl_s:
             return
         try:
             data = await self._api.get_channel(channel_id)
@@ -50,8 +71,13 @@ class ChannelCache:
                 "carbonvoice: get_channel(%s) failed: %s", channel_id, exc
             )
             data = None
+        if data is None and channel_id in self._type_cache:
+            # Refresh failed but we have prior good values — keep them.
+            self._loaded_at[channel_id] = now
+            return
         self._type_cache[channel_id] = chat_type_from_channel(data)
         self._roster_cache[channel_id] = extract_roster(data)
+        self._loaded_at[channel_id] = now
 
     async def resolve_chat_type(self, channel_id: str) -> str:
         """Return ``"dm"`` or ``"group"`` for *channel_id*.
