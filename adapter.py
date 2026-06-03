@@ -932,15 +932,36 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         messages.sort(key=lambda m: m.get("created_at") or "")
 
-        for msg in messages:
+        # Track the first "stuck" message (transcript not ready yet —
+        # `_process_message` returns None). We hold the cursor just before
+        # it so the next poll re-fetches from there and retries, instead of
+        # advancing past and risking a skip. Mirrors the Claude Code
+        # Channel's stuck-message handling.
+        first_stuck_idx: Optional[int] = None
+        for i, msg in enumerate(messages):
             try:
-                await self._process_message(msg)
+                result = await self._process_message(msg)
             except Exception as exc:
                 logger.error("carbonvoice: process_message error: %s", exc)
+                continue
+            if result is None and first_stuck_idx is None:
+                first_stuck_idx = i
 
-        # Advance cursor to when this request was fired, not message timestamps —
-        # avoids missing concurrent writes that landed during the call.
-        self._cursor.advance(request_started_at)
+        # Advance the cursor as far as is safe:
+        #   - no stuck messages → advance to the request start time
+        #     (clock-safe; avoids missing concurrent writes mid-call).
+        #   - some stuck → advance only to just before the first stuck
+        #     message, leaving it (and everything after) for the next poll.
+        #     Earlier already-dispatched messages are deduped by SeenCache
+        #     if the shrunk window re-fetches them.
+        #   - first message stuck (idx 0) or no usable timestamp → leave
+        #     the cursor unchanged so the stuck message is retried.
+        if first_stuck_idx is None:
+            self._cursor.advance(request_started_at)
+        elif first_stuck_idx > 0:
+            prev_created = messages[first_stuck_idx - 1].get("created_at")
+            if isinstance(prev_created, str) and prev_created:
+                self._cursor.advance(prev_created)
 
     # ── Inbound multimodal (PR 7) ────────────────────────────────────────
     #
@@ -1086,7 +1107,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         return media_urls, media_types, link_urls
 
-    async def _process_message(self, msg: Dict[str, Any]) -> bool:
+    async def _process_message(self, msg: Dict[str, Any]) -> Optional[bool]:
+        """Process one inbound message; return its disposition for the cursor.
+
+          - ``True``  — dispatched to the agent.
+          - ``False`` — skipped for good (self-loop, single-user restrict,
+            not allowed, deduped, gate-rejected). Safe to advance past.
+          - ``None``  — *stuck*: the transcript isn't ready yet (CV is
+            still transcribing). The caller holds the cursor just *before*
+            this message so the next poll re-fetches and retries it,
+            instead of advancing past and risking a skip. Mirrors the
+            Claude Code Channel's null-return contract.
+        """
         message_id = extract_message_id(msg)
         if not message_id:
             return False
@@ -1123,10 +1155,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._seen.is_seen(message_id):
             return False
 
-        # Two-phase transcript: empty means "not ready yet" — don't mark seen.
+        # Two-phase transcript: empty means "not ready yet" (CV is still
+        # transcribing). Return None — the *stuck* signal — so the poll
+        # loop holds the cursor just before this message and retries it
+        # next tick, rather than advancing past it. Don't mark seen.
         transcript = extract_transcript(msg)
         if not transcript:
-            return False
+            return None
 
         # V5 source-of-truth enrichment. The socket / v3-poll push gives
         # us a V2-shaped payload that trails the v5 GET on async fields:
