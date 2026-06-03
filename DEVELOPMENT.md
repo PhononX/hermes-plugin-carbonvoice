@@ -112,7 +112,14 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default channel for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 
-### Voice-out (PR 6)
+### Voice-out (PR 6) — opt-in, off by default
+
+> **Product decision (Q2 2026): keep this off.** Carbon Voice does STT and any
+> TTS on its own backend, so the agent replies in text and CV handles speech.
+> The voice-out code is kept intact (not deleted) so it can be re-enabled by
+> flipping `CARBONVOICE_VOICE_OUT=true` + `voice.auto_tts: true` — but the
+> default is text-out and that is the supported path.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `CARBONVOICE_VOICE_OUT` | `false` | When `true`, every inbound message is tagged `MessageType.VOICE` so Hermes core's auto-TTS pipeline (`gateway/platforms/base.py:3493`) converts the agent's text reply into audio and ships it via `send_voice` → `/v5/messages/audio`. CV transcribes the audio server-side, so the recipient sees a voice-memo bubble with the transcript inline. Required companion config in `~/.hermes/config.yaml`: `voice.auto_tts: true` plus a configured `tts.provider` (`edge` works key-less; `elevenlabs` / `openai` require their respective API keys). With voice-out off (default) the adapter preserves the existing text-reply behavior so existing deployments don't change shape unexpectedly. |

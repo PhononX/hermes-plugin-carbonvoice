@@ -147,9 +147,11 @@ Mention detection is **structured**: the adapter checks the message's `tagged_us
 
 > ⚠️ **Voice-only messages:** mentions made by *speaking* the agent's name without using the tagging UI will not be detected, because nothing populates `tagged_user_ids`. To mention the agent from a voice memo, tag it in the picker (the tag is applied after the recording is transcribed, and the agent picks it up automatically).
 
-### Voice replies (auto-TTS)
+### Voice replies (auto-TTS) — optional, off by default
 
-Carbon Voice is voice-first, so the plugin can run the agent's text replies through Hermes' TTS pipeline and ship them as voice memos. The recipient sees a single bubble — a play button with the transcript inline (Carbon Voice transcribes the audio server-side) — threaded as a reply to the original message, mirroring how a human responds on the platform.
+> ℹ️ **Disabled by default.** The plugin ships with `CARBONVOICE_VOICE_OUT` off and Hermes core's `voice.auto_tts` defaults to `false`, so out of the box the agent replies in **text** and Carbon Voice handles speech (STT on the way in, and any read-aloud on its own side). This section is opt-in — enable it only if you specifically want Hermes itself to synthesize voice-memo replies.
+
+Carbon Voice is voice-first, so the plugin *can* run the agent's text replies through Hermes' TTS pipeline and ship them as voice memos. The recipient sees a single bubble — a play button with the transcript inline (Carbon Voice transcribes the audio server-side) — threaded as a reply to the original message, mirroring how a human responds on the platform.
 
 #### Setup checklist (three pieces, all required)
 
