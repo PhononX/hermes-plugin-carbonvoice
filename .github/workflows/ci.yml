@@ -527,6 +527,29 @@ jobs:
               'the gate — that re-introduces the post-tag dedup bug.'
           print('adapter revisitable-rejection dedup contract: wired')
 
+          # Stuck-message cursor hold: when a transcript isn't ready,
+          # _process_message returns None (not False), and the poll loop
+          # holds the cursor just before the first stuck message instead
+          # of advancing past it (which could skip a message whose
+          # transcript never bumps updated_at in time). Mirrors the Claude
+          # Code Channel's null-return + stuck-message handling.
+          assert '-> Optional[bool]' in adapter_src, \
+              '_process_message must return Optional[bool] (True=dispatched, ' \
+              'False=skip, None=stuck) so the cursor can distinguish a ' \
+              'not-ready transcript from a permanent skip'
+          assert 'first_stuck_idx' in adapter_src, \
+              '_fetch_missed_messages must track the first stuck message ' \
+              'and hold the cursor before it (stuck-message handling)'
+          # The not-ready-transcript branch must return None, not False —
+          # returning False would let the cursor advance past a message CV
+          # is still transcribing.
+          import re as _re
+          _m = _re.search(r'if not transcript:\s*\n\s*return (\w+)', adapter_src)
+          assert _m and _m.group(1) == 'None', \
+              'the empty-transcript branch of _process_message must ' \
+              f'return None (stuck), got {_m.group(1) if _m else "no match"}'
+          print('adapter stuck-message cursor-hold contract: wired')
+
           # parse helpers must handle BOTH V5 and V2 shapes — V5 because
           # that's what the v5 GET returns post-enrichment, V2 because
           # webhook callers and pre-enrichment paths still hit them.
