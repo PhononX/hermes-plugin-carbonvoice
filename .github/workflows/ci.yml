@@ -479,7 +479,18 @@ jobs:
               'adapter.py _collect_inbound_media must surface link attachments'
           assert '[Attached link:' in adapter_src, \
               'adapter.py must prepend link URLs to clean_text as "[Attached link: <url>]"'
-          print('adapter inbound media wiring: present (images + links)')
+          # media_urls must carry BARE local paths, not file:// URIs — Hermes
+          # core's native image routing (agent/image_routing.py
+          # build_native_content_parts) does Path(raw_path) directly, so a
+          # file:// prefix makes the path non-existent and the image is
+          # dropped as "unreadable". Slack/Telegram pass bare paths too.
+          assert 'media_urls.append(f"file://' not in adapter_src and \
+                 "media_urls.append(f'file://" not in adapter_src, \
+              'inbound media_urls must be bare local paths, not file:// URIs ' \
+              '(core native image routing drops file:// paths as unreadable)'
+          assert 'media_urls.append(str(local_path))' in adapter_src, \
+              'adapter must append the bare local path to media_urls'
+          print('adapter inbound media wiring: present (images + links, bare paths)')
 
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields
