@@ -969,9 +969,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     # canonical S3 URL — auth-gated, returns 403 to unauthenticated
     # requests. To consume them we resolve a signed S3 GET URL via
     # ``GET /attachments/signedurl/:_id`` (authenticated with our PAT),
-    # download the bytes to ``IMAGE_CACHE_DIR``, and return ``file://``
-    # URIs for Hermes core to inject into the agent's multimodal
-    # context (Claude vision sees the bytes inline).
+    # download the bytes to ``IMAGE_CACHE_DIR``, and return local
+    # filesystem paths for Hermes core to inject into the agent's
+    # multimodal context (Claude vision sees the bytes inline).
     #
     # Scope for v1: ``image/*`` only. Other mime types (PDFs,
     # ``text/*``, binaries) are dropped with a WARNING because Hermes
@@ -997,8 +997,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     ) -> "tuple[list[str], list[str], list[str]]":
         """Process inbound attachments and return three lists:
 
-          - ``media_urls``  — ``file://`` URIs of downloaded image
-            files, ready for ``MessageEvent.media_urls``
+          - ``media_urls``  — local filesystem paths of downloaded image
+            files (bare paths, no ``file://`` scheme), ready for
+            ``MessageEvent.media_urls``
           - ``media_types`` — parallel list of mime types
           - ``link_urls``   — bare URLs from ``type:"link"``
             attachments (CV's link-sharing UI flow), to be prepended
@@ -1094,10 +1095,17 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 )
                 continue
 
-            # ``file://`` URI is what Hermes core's media routing expects
-            # for locally-cached paths (see ``validate_media_delivery_path``
-            # in ``gateway/platforms/base.py``).
-            media_urls.append(f"file://{local_path}")
+            # Pass the bare local path (NOT a ``file://`` URI) — that's
+            # what every other built-in adapter puts in ``media_urls``
+            # (Slack: ``media_urls.append(cached_path)``; Telegram:
+            # ``event.media_urls = [cached_path]``), and what Hermes core's
+            # native-image routing expects: ``build_native_content_parts``
+            # (agent/image_routing.py) does ``Path(raw_path)`` directly, so a
+            # ``file://`` prefix makes the path non-existent and the image is
+            # silently dropped as "unreadable" (only the older text/vision
+            # path tolerated the scheme — once image_input_mode resolves to
+            # ``native`` for a vision model, the prefix breaks inbound images).
+            media_urls.append(str(local_path))
             media_types.append(mime)
             logger.info(
                 "carbonvoice: inbound attachment downloaded — "
@@ -1326,8 +1334,8 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # Inbound multimodal (PR 7): pull any attached files into local
         # caches so Hermes core's vision pipeline can consume them. CV's
         # S3 URLs need auth, so we resolve a signed GET URL per file
-        # attachment, download via that, and hand Hermes core a
-        # ``file://`` URI in ``media_urls``. Image attachments are
+        # attachment, download via that, and hand Hermes core a local
+        # filesystem path in ``media_urls``. Image attachments are
         # routed to vision; ``type:"link"`` attachments (CV's link-
         # sharing UI) return their URLs in ``link_urls`` so we can
         # prepend them to the visible text — the agent then sees them
