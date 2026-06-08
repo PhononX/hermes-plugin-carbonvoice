@@ -505,6 +505,18 @@ jobs:
               'adapter must append the bare local path to media_urls'
           print('adapter inbound media wiring: present (images + links, bare paths)')
 
+          # channel_context is a NEWER Hermes core field on MessageEvent.
+          # It must be set defensively (hasattr + setattr), never passed as a
+          # ctor kwarg — older cores raise "unexpected keyword argument
+          # 'channel_context'" and crash every message. Regression guard.
+          assert 'channel_context=channel_context' not in adapter_src, \
+              'channel_context must NOT be a MessageEvent ctor kwarg — it ' \
+              'crashes older Hermes cores; set it via ' \
+              'hasattr(event, "channel_context") after construction'
+          assert 'hasattr(event, "channel_context")' in adapter_src, \
+              'adapter must set channel_context defensively (cross-core compat)'
+          print('adapter MessageEvent.channel_context: set defensively (compat)')
+
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields
           # (tagged_user_ids resolves after a backend job, attachment

@@ -1429,8 +1429,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             media_urls=media_urls,
             media_types=media_types,
-            channel_context=channel_context,
         )
+        # ``channel_context`` (participant roster) is a *newer* Hermes core
+        # field on MessageEvent (added with the Discord channel-history
+        # backfill). Set it only when this core supports it — passing it as a
+        # ctor kwarg on an older core raises "unexpected keyword argument
+        # 'channel_context'" and crashes every message. Setting the attribute
+        # post-construction degrades gracefully: the roster is dropped on old
+        # cores, everything else still works.
+        if channel_context and hasattr(event, "channel_context"):
+            event.channel_context = channel_context
 
         # Dispatch in a background task so processing one message can't block
         # the poll/WS loop while the agent thinks.
