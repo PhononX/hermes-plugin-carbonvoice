@@ -37,6 +37,12 @@ class ReactionService:
     def enabled(self) -> bool:
         return self._enabled and bool(self._reaction_id)
 
+    @property
+    def reaction_id(self) -> str:
+        """The reaction id used for the ack (also the server-side
+        processed-marker the adapter checks for inbound dedup)."""
+        return self._reaction_id
+
     async def discover(self) -> None:
         """List the workspace's available reactions to the log.
 

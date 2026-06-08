@@ -148,6 +148,19 @@ jobs:
           # Missing user_id never matches.
           assert is_user_mentioned({'tagged_user_ids': ['BOT']}, None) is False
 
+          # Server-side dedup marker: the bot's own ack reaction in
+          # reaction_summary means "already processed" (survives restarts,
+          # breaks the use_last_updated re-capture loop).
+          from carbonvoice.parse import bot_has_reacted
+          _rs = {'reaction_summary': {'top_user_reactions': [
+              {'user_id': 'BOT', 'reaction_id': 'acknowledged'}]}}
+          assert bot_has_reacted(_rs, 'BOT', 'acknowledged') is True
+          assert bot_has_reacted(_rs, 'OTHER', 'acknowledged') is False     # someone else's reaction
+          assert bot_has_reacted(_rs, 'BOT', 'love') is False               # different reaction
+          assert bot_has_reacted({}, 'BOT', 'acknowledged') is False        # no summary
+          assert bot_has_reacted(_rs, None, 'acknowledged') is False
+          assert bot_has_reacted(_rs, 'BOT', None) is False
+
           # MentionGate decisions
           from carbonvoice.gate import MentionGate
           g = MentionGate(require_mention=True, free_response_channels=set(), ignored_channels=set())
@@ -526,17 +539,31 @@ jobs:
               'picker tag never reaches the bot" bug)'
           # Make sure no one accidentally re-introduces an unconditional
           # ``seen.mark`` before the gate runs. Count occurrences: there
-          # should be exactly two ``self._seen.mark(message_id)`` calls
-          # (one in the rejected-but-stable path, one after the gate
-          # accepts), and ``self._seen.is_seen(message_id)`` for the
-          # early dedup check.
-          assert adapter_src.count('self._seen.mark(message_id)') == 2, \
-              'adapter._process_message must mark seen in exactly two ' \
-              'places: (a) when a non-revisitable rejection commits ' \
-              'the decision, (b) when the gate accepts. Counting drift ' \
-              'usually means someone added an unconditional mark before ' \
-              'the gate — that re-introduces the post-tag dedup bug.'
+          # should be exactly three ``self._seen.mark(message_id)`` calls —
+          # (a) the server-side reaction-dedup skip (already-acked message),
+          # (b) the rejected-but-stable path, (c) after the gate accepts —
+          # plus ``self._seen.is_seen(message_id)`` for the early dedup
+          # check. The reaction-dedup mark is conditional on the bot's ack,
+          # so it never touches a revisitable rejection (those carry no ack)
+          # and can't re-introduce the post-tag dedup bug.
+          assert adapter_src.count('self._seen.mark(message_id)') == 3, \
+              'adapter._process_message must mark seen in exactly three ' \
+              'places: (a) reaction-dedup skip (already acked), (b) a ' \
+              'non-revisitable rejection, (c) when the gate accepts. ' \
+              'Counting drift usually means someone added an unconditional ' \
+              'mark before the gate — that re-introduces the post-tag dedup bug.'
           print('adapter revisitable-rejection dedup contract: wired')
+
+          # Server-side reaction dedup: the adapter must skip a message the
+          # bot already acked (reaction_summary), so dedup survives restarts
+          # and the use_last_updated re-capture loop can't re-answer the same
+          # message. Checked on the canonical v5 payload (post-enrichment).
+          assert 'bot_has_reacted(' in adapter_src, \
+              '_process_message must dedup on the bot ack reaction ' \
+              '(bot_has_reacted) — the in-memory SeenCache is lost on ' \
+              'restart and lapses after 5 min, which let one message be ' \
+              'dispatched 5x as the ack/reply kept bumping updated_at'
+          print('adapter server-side reaction dedup contract: wired')
 
           # Stuck-message cursor hold: when a transcript isn't ready,
           # _process_message returns None (not False), and the poll loop
