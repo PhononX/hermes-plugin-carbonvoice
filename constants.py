@@ -15,3 +15,10 @@ MAX_MESSAGE_LENGTH = 8000
 # box without operator config. Override with CARBONVOICE_REACTION_ID after
 # inspecting the available reactions logged on startup.
 DEFAULT_REACTION_ID = "acknowledged"
+
+# "confused" (⁉️) is a built-in CV reaction. We put it on an unauthorized
+# sender's first message as a silent "we saw you, you're pending approval"
+# signal — instead of posting a text reply that clutters the channel and
+# spams every old conversation when deny-by-default re-flags them. Override
+# with CARBONVOICE_PENDING_REACTION_ID.
+DEFAULT_PENDING_REACTION_ID = "confused"
