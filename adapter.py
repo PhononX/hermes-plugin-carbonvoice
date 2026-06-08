@@ -59,6 +59,7 @@ from .constants import (
 from .dedupe import SeenCache
 from .gate import MentionGate
 from .parse import (
+    bot_has_reacted,
     extract_attachments,
     extract_channel_id,
     extract_creator_id,
@@ -1203,6 +1204,35 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 # usually the same string but keeps everything in one
                 # shape after this point.
                 transcript = extract_transcript(msg) or transcript
+
+        # Server-side dedup (persistent, survives restarts). We put an ack
+        # reaction on every *accepted* message, so a message already
+        # carrying the bot's ack was already processed — skip it. This
+        # complements the in-memory SeenCache, which is lost on restart
+        # and expires after 5 min. Crucially it breaks the
+        # ``use_last_updated`` re-capture loop: the ack reaction and the
+        # bot's in-thread reply both bump ``updated_at``, so the poller
+        # keeps re-fetching the same message; without a durable marker the
+        # SeenCache eventually lapses and the agent re-answers the same
+        # message (observed: one message dispatched 5× across a day of
+        # restarts). We read ``reaction_summary`` from the canonical v5
+        # payload above. Mark seen too so immediate re-polls skip without
+        # paying another v5 GET. Mirrors the Claude Code Channel's
+        # reaction-based ``isProcessed`` dedup.
+        if (
+            self._reactions is not None
+            and self._reactions.enabled
+            and self._self_user_id
+            and bot_has_reacted(
+                msg, self._self_user_id, self._reactions.reaction_id
+            )
+        ):
+            logger.debug(
+                "carbonvoice: skip %s — already acked by bot (server-side dedup)",
+                message_id,
+            )
+            self._seen.mark(message_id)
+            return False
 
         # Resolve chat_type before the mention gate so the gate can short-
         # circuit group messages without spinning up the rest of the

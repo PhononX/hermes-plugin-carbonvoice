@@ -167,6 +167,45 @@ def is_user_mentioned(msg: Dict[str, Any], user_id: Optional[str]) -> bool:
     return isinstance(tagged, list) and user_id in tagged
 
 
+def bot_has_reacted(
+    msg: Dict[str, Any], bot_id: Optional[str], reaction_id: Optional[str]
+) -> bool:
+    """True when *bot_id* already reacted to *msg* with *reaction_id*.
+
+    Reads ``msg['reaction_summary']['top_user_reactions']`` — the
+    server-side record of who reacted with what. The adapter uses this as
+    a **persistent "already processed" marker**: it puts an ack reaction
+    on every accepted message, so a message that already carries the bot's
+    ack was already handled and must not be re-dispatched.
+
+    Unlike the in-memory ``SeenCache`` (lost on restart, 5-min TTL), the
+    reaction lives in Carbon Voice, so this dedup survives gateway
+    restarts and breaks the ``use_last_updated`` re-capture loop — the ack
+    (and the bot's in-thread reply) bump ``updated_at``, which would
+    otherwise make the poller re-fetch and re-process the same message
+    indefinitely.
+
+    Defensive against field-name variants and missing/oddly-shaped
+    summaries; returns ``False`` on anything it can't positively match.
+    """
+    if not bot_id or not reaction_id:
+        return False
+    summary = msg.get("reaction_summary")
+    if not isinstance(summary, dict):
+        return False
+    entries = summary.get("top_user_reactions")
+    if not isinstance(entries, list):
+        return False
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        uid = first_str(e.get("user_id"), e.get("user_guid"), e.get("creator_id"))
+        rid = first_str(e.get("reaction_id"), e.get("id"))
+        if uid == bot_id and rid == reaction_id:
+            return True
+    return False
+
+
 def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
     """Map a Carbon Voice channel payload to Hermes ``chat_type``.
 
