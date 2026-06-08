@@ -41,13 +41,29 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 
 ---
 
-### Optional: restrict who can talk to the bot
+### Who can talk to the bot (deny-by-default)
 
-By default the bot accepts messages from any Carbon Voice user (good for personal/dev setups). To limit access to specific people, add their `user_guid`s to `~/.hermes/.env`:
+**The bot only responds to authorized users.** Since the agent can read and run things on the host, an open bot is a security hole — so access is **deny-by-default**. A user is allowed if any of these holds:
+
+- **They're the owner** — the Carbon Voice user who *created* the bot account (`whoami.created_by`). Auto-detected at startup; **always allowed, no setup needed.**
+- They're listed in `CARBONVOICE_ALLOWED_USERS` (a static comma-separated list).
+- The owner approved them at runtime (see below).
+
+**Interactive onboarding.** When an unauthorized user messages the bot, it asks **you** (the owner) in the home channel:
+
+> 👤 *Teammate Name (Abc123…) wants to talk to me but isn't authorized.*
+> *To allow them, reply:* `/cv-allow Abc123…`
+> *To block them, reply:* `/cv-deny Abc123…`
+
+Reply `/cv-allow <user_guid>` and they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). Also: `/cv-deny <user_guid>`, `/cv-list`. (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
+
+To add people up front instead, set `CARBONVOICE_ALLOWED_USERS`:
 
 ```bash
 echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>,<teammate_guid>' >> "$(hermes config env-path)"
 ```
+
+To go back to the old open behavior, set `CARBONVOICE_ALLOW_ALL_USERS=true`.
 
 > 💡 Prefer a GUI for editing the `.env`? Run `open $(hermes config env-path)` to open it in your default editor, or `hermes dashboard` for the web UI at <http://127.0.0.1:9119>.
 
@@ -86,7 +102,7 @@ That's the only required variable. By default the bot accepts messages from any 
 CARBONVOICE_ALLOWED_USERS=<your_carbonvoice_user_guid>[,<another_guid>...]
 ```
 
-To explicitly close the bot to everyone (e.g., temporary maintenance mode), set `CARBONVOICE_ALLOW_ALL_USERS=false` and leave `CARBONVOICE_ALLOWED_USERS` empty. Your own `user_guid` shows up in the gateway logs as `carbonvoice: connected as <guid>` on startup.
+Access is **deny-by-default**: only the owner (auto-detected), users in `CARBONVOICE_ALLOWED_USERS`, and users approved via `/cv-allow` can talk to the bot. To disable gating entirely (open to everyone), set `CARBONVOICE_ALLOW_ALL_USERS=true`. Your own `user_guid` shows up in the gateway logs as `carbonvoice: owner is <guid>` on startup.
 
 ## Run
 
@@ -122,8 +138,8 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
-| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed to trigger the bot. When set, **only** these users are accepted. |
-| `CARBONVOICE_ALLOW_ALL_USERS` | `true` | Default open access. Set to `false` (and leave `CARBONVOICE_ALLOWED_USERS` empty) to explicitly close the bot. |
+| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow`-approved users. |
+| `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 | `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |
@@ -266,7 +282,7 @@ The adapter never accepts inbound HTTP — both transports are outbound-initiate
 
 **`401 Unauthorized` on `/whoami`** — your PAT is wrong, expired, or revoked. Generate a new one at https://www.developer.carbonvoice.app/.
 
-**`No user allowlists configured` warning** — the bot rejects all senders until you set `CARBONVOICE_ALLOW_ALL_USERS=true` or `CARBONVOICE_ALLOWED_USERS=<guid>`.
+**`deny-by-default is active but NO authorized users` warning** — `whoami` returned no owner (`created_by`) and `CARBONVOICE_ALLOWED_USERS` is empty, so the bot will ignore everyone. Set `CARBONVOICE_ALLOWED_USERS=<your_guid>` (or `CARBONVOICE_ALLOW_ALL_USERS=true` to disable gating). Normally the owner is auto-detected and this never fires.
 
 **Messages from voice notes don't arrive** — transcription can take a few seconds. The adapter waits for `message:updated` (or the next poll) to pick up the populated transcript. If a transcript never arrives, check the Carbon Voice account has transcription enabled.
 

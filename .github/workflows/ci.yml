@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'permits', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -81,19 +81,46 @@ jobs:
 
           from carbonvoice.audit import AllowlistGate
           import os
-          # Default-allow semantics: unset env vars → allow anyone.
+          # DENY-BY-DEFAULT: unset env vars → nobody allowed (security fix).
           os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS', None)
           os.environ.pop('CARBONVOICE_ALLOWED_USERS', None)
-          assert AllowlistGate.from_env().is_allowed('anyone')
-          # Explicit close.
-          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'false'
-          assert not AllowlistGate.from_env().is_allowed('anyone')
+          _g = AllowlistGate.from_env()
+          assert _g.is_allowed('anyone') is False, 'deny-by-default'
+          assert _g.has_any_authorizer is False
+          # The owner (whoami.created_by, set at connect) is always allowed —
+          # this is what makes deny-by-default usable with zero config.
+          _g.set_owner('OWNER')
+          assert _g.is_owner('OWNER') and _g.is_allowed('OWNER')
+          assert _g.is_allowed('anyone') is False
+          assert _g.has_any_authorizer is True
+          # allow-all is now an explicit opt-IN escape hatch (was the default).
+          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'true'
+          assert AllowlistGate.from_env().is_allowed('anyone') is True
           os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS')
-          # Allowed list overrides the default.
+          # Static env list still works alongside the owner.
           os.environ['CARBONVOICE_ALLOWED_USERS'] = 'abc'
-          g = AllowlistGate.from_env()
-          assert g.is_allowed('abc') and not g.is_allowed('xyz')
+          g = AllowlistGate.from_env(); g.set_owner('OWNER')
+          assert g.is_allowed('abc') and g.is_allowed('OWNER') and not g.is_allowed('xyz')
           os.environ.pop('CARBONVOICE_ALLOWED_USERS')
+
+          # Interactive allow-list: command parser + ApprovalStore degrades
+          # safely without Hermes core (no gateway.pairing in standalone CI).
+          from carbonvoice.permits import parse_admin_command, ApprovalStore
+          assert parse_admin_command('/cv-allow Fmx4') == ('allow', 'Fmx4')
+          assert parse_admin_command('  /CV-DENY  ABC ') == ('deny', 'ABC')
+          assert parse_admin_command('/cv-list') == ('list', None)
+          assert parse_admin_command('/cv-allow') == ('allow', None)   # missing arg → usage
+          assert parse_admin_command('hi /cv-allow X') is None         # not a command
+          assert parse_admin_command('/cv-nope X') is None
+          assert parse_admin_command(None) is None and parse_admin_command('') is None
+          _appr = ApprovalStore()
+          assert _appr.available is False
+          assert _appr.is_approved('x') is False and _appr.approve('x') is False
+          assert _appr.revoke('x') is False and _appr.list_approved() == []
+          # Gate consults the ApprovalStore for dynamic approvals.
+          ga = AllowlistGate.from_env(_appr); ga.set_owner('OWNER')
+          assert ga.is_allowed('OWNER') and not ga.is_allowed('x')
+          print('deny-by-default allow-list + interactive commands: OK')
 
           from carbonvoice.dedupe import SeenCache
           c = SeenCache(ttl_s=60)
@@ -551,17 +578,18 @@ jobs:
               'picker tag never reaches the bot" bug)'
           # Make sure no one accidentally re-introduces an unconditional
           # ``seen.mark`` before the gate runs. Count occurrences: there
-          # should be exactly three ``self._seen.mark(message_id)`` calls —
+          # should be exactly four ``self._seen.mark(message_id)`` calls —
           # (a) the server-side reaction-dedup skip (already-acked message),
-          # (b) the rejected-but-stable path, (c) after the gate accepts —
-          # plus ``self._seen.is_seen(message_id)`` for the early dedup
-          # check. The reaction-dedup mark is conditional on the bot's ack,
-          # so it never touches a revisitable rejection (those carry no ack)
-          # and can't re-introduce the post-tag dedup bug.
-          assert adapter_src.count('self._seen.mark(message_id)') == 3, \
-              'adapter._process_message must mark seen in exactly three ' \
-              'places: (a) reaction-dedup skip (already acked), (b) a ' \
-              'non-revisitable rejection, (c) when the gate accepts. ' \
+          # (b) the owner allow-list command path (/cv-*), (c) the
+          # rejected-but-stable path, (d) after the gate accepts — plus
+          # ``self._seen.is_seen(message_id)`` for the early dedup check.
+          # (a), (b) and (d) are conditional (acked / owner-command / gate
+          # accept), so none touches a revisitable rejection (which carries
+          # no ack) and they can't re-introduce the post-tag dedup bug.
+          assert adapter_src.count('self._seen.mark(message_id)') == 4, \
+              'adapter._process_message must mark seen in exactly four ' \
+              'places: (a) reaction-dedup skip, (b) owner /cv-* command, ' \
+              '(c) a non-revisitable rejection, (d) when the gate accepts. ' \
               'Counting drift usually means someone added an unconditional ' \
               'mark before the gate — that re-introduces the post-tag dedup bug.'
           print('adapter revisitable-rejection dedup contract: wired')

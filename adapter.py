@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -48,6 +49,7 @@ from gateway.session import SessionSource
 
 from .api import CarbonVoiceAPI
 from .audit import AllowlistGate, IgnoredSenderLog, default_ignored_log_path
+from .permits import ApprovalStore, parse_admin_command
 from .channels import ChannelCache
 from .conversations import ConversationTracker
 from .constants import (
@@ -168,13 +170,26 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             if self._api
             else None
         )
-        self._allowlist = AllowlistGate.from_env()
+        # Dynamic allow-list (Hermes core's PairingStore) + deny-by-default
+        # gate. The owner is filled in at connect() from whoami.created_by.
+        self._approvals = ApprovalStore()
+        self._allowlist = AllowlistGate.from_env(self._approvals)
         self._gate = MentionGate.from_env()
         self._ignored_log = (
             IgnoredSenderLog(ignored_log_path, self._channels)
             if self._channels
             else None
         )
+
+        # Interactive onboarding: the channel where the agent asks the owner
+        # to approve unknown senders, and a per-process dedup set so we only
+        # ask once per pending user. ``home_channel`` falls back to the
+        # legacy CARBONVOICE_HOME_CHANNEL env if not in ``extra``.
+        self._home_channel: Optional[str] = (
+            first_str(extra.get("home_channel"))
+            or first_str(os.environ.get("CARBONVOICE_HOME_CHANNEL"))
+        )
+        self._pending_approval_notified: set[str] = set()
 
         # Per-thread reply anchors + parent-text cache + (eventually)
         # engagement / outbound tracking. See conversations.py and
@@ -191,7 +206,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         await self._api.open()
 
         try:
-            self._self_user_id = await self._api.whoami()
+            self._self_user_id, owner_id = await self._api.whoami()
         except Exception as exc:
             logger.error("carbonvoice: /whoami failed: %s", exc)
             await self._api.close()
@@ -200,6 +215,28 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             logger.error("carbonvoice: /whoami returned no user id")
             await self._api.close()
             return False
+
+        # Deny-by-default: the bot's creator (whoami.created_by) is the
+        # owner — always authorized, and the seed from which they approve
+        # everyone else via /cv-allow. Auto-detected so the security
+        # default needs no manual setup.
+        self._allowlist.set_owner(owner_id)
+        if owner_id:
+            logger.info("carbonvoice: owner is %s (auto-detected from created_by)", owner_id)
+            # Mirror the owner into the dynamic allow-list (PairingStore).
+            # Hermes core's own authorization checks the pairing store for
+            # every platform but doesn't know about `created_by`, so without
+            # this the owner could pass the plugin gate yet be blocked by
+            # core. Idempotent.
+            self._approvals.approve(owner_id, "owner")
+        if not self._allowlist.has_any_authorizer:
+            logger.warning(
+                "carbonvoice: deny-by-default is active but NO authorized "
+                "users — whoami returned no owner and CARBONVOICE_ALLOWED_USERS "
+                "is empty. The bot will ignore everyone. Set "
+                "CARBONVOICE_ALLOWED_USERS to your user_guid, or "
+                "CARBONVOICE_ALLOW_ALL_USERS=true to disable gating."
+            )
 
         if self._reactions is not None:
             await self._reactions.discover()
@@ -1156,6 +1193,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: dropped message from unauthorized sender %s",
                 creator_id,
             )
+            # Deny-by-default onboarding: ask the owner (in the home channel)
+            # to approve this sender — once per pending user per process.
+            await self._maybe_notify_unauthorized(creator_id, channel_id)
             if self._ignored_log is not None and creator_id:
                 self._ignored_log.record(creator_id, channel_id)
             return False
@@ -1233,6 +1273,19 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             )
             self._seen.mark(message_id)
             return False
+
+        # Admin allow-list commands (/cv-allow, /cv-deny, /cv-list). Only the
+        # OWNER may run these — a normally-approved user must not be able to
+        # escalate by approving others. Handled here and NOT forwarded to the
+        # agent. Ack + mark seen so a re-poll doesn't re-run it.
+        if self._allowlist.is_owner(creator_id):
+            cmd = parse_admin_command(transcript)
+            if cmd is not None:
+                await self._handle_admin_command(channel_id, cmd)
+                if self._reactions is not None:
+                    self._reactions.ack(message_id)
+                self._seen.mark(message_id)
+                return False
 
         # Resolve chat_type before the mention gate so the gate can short-
         # circuit group messages without spinning up the rest of the
@@ -1444,6 +1497,110 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # the poll/WS loop while the agent thinks.
         asyncio.create_task(self._dispatch(event))
         return True
+
+    # ── Interactive allow-list (deny-by-default onboarding) ──────────────
+
+    async def _maybe_notify_unauthorized(
+        self, creator_id: str, channel_id: str
+    ) -> None:
+        """Ask the owner (in the home channel) to approve an unknown sender.
+
+        Sent at most once per pending user per process. Requires a home
+        channel; without one we just log and the message stays denied (safe
+        default — no info leaks to the unknown sender, who gets no reply).
+        """
+        if not creator_id or creator_id in self._pending_approval_notified:
+            return
+        self._pending_approval_notified.add(creator_id)
+        if not self._home_channel or self._api is None:
+            logger.info(
+                "carbonvoice: unauthorized sender %s — no CARBONVOICE_HOME_CHANNEL "
+                "configured, can't ask the owner to approve (set it to enable "
+                "interactive onboarding)",
+                creator_id,
+            )
+            return
+        name = ""
+        if self._channels is not None:
+            try:
+                name = await self._channels.resolve_name(channel_id, creator_id) or ""
+            except Exception:
+                name = ""
+        who = f"{name} ({creator_id})" if name else creator_id
+        text = (
+            f"👤 {who} wants to talk to me but isn't authorized.\n"
+            f"To allow them, reply:  /cv-allow {creator_id}\n"
+            f"To block them, reply:  /cv-deny {creator_id}"
+        )
+        try:
+            await self.send(self._home_channel, text)
+            logger.info(
+                "carbonvoice: asked owner to approve %s in home channel",
+                creator_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "carbonvoice: failed to notify owner about %s: %s",
+                creator_id, exc,
+            )
+
+    async def _handle_admin_command(
+        self, channel_id: str, cmd: "tuple[str, Optional[str]]"
+    ) -> None:
+        """Run an owner allow-list command and reply in *channel_id*."""
+        action, arg = cmd
+        reply: Optional[str] = None
+
+        if action == "list":
+            rows = self._approvals.list_approved()
+            if not rows:
+                reply = (
+                    "No dynamically-approved users yet. "
+                    "(The owner and CARBONVOICE_ALLOWED_USERS still apply.)"
+                )
+            else:
+                lines = []
+                for r in rows:
+                    uid = r.get("user_id") or ""
+                    nm = r.get("user_name") or ""
+                    lines.append(f"• {nm} ({uid})" if nm else f"• {uid}")
+                reply = "Approved users:\n" + "\n".join(lines)
+
+        elif action == "allow":
+            if not arg:
+                reply = "Usage: /cv-allow <user_guid>"
+            else:
+                name = ""
+                if self._channels is not None:
+                    try:
+                        name = await self._channels.resolve_name(channel_id, arg) or ""
+                    except Exception:
+                        name = ""
+                ok = self._approvals.approve(arg, name)
+                self._pending_approval_notified.discard(arg)
+                reply = (
+                    f"✅ Allowed {name or arg}. They can talk to me now."
+                    if ok
+                    else f"⚠️ Couldn't approve {arg} — allow-list store unavailable."
+                )
+
+        elif action == "deny":
+            if not arg:
+                reply = "Usage: /cv-deny <user_guid>"
+            else:
+                self._approvals.revoke(arg)  # drop if previously approved
+                # Keep them marked notified so we don't re-ask this session.
+                self._pending_approval_notified.add(arg)
+                reply = (
+                    f"🚫 {arg} denied — won't be approved "
+                    "(revoked if previously allowed)."
+                )
+
+        if reply and self._api is not None:
+            try:
+                await self.send(channel_id, reply)
+            except Exception as exc:
+                logger.warning("carbonvoice: failed to send admin reply: %s", exc)
 
     async def _dispatch(self, event: MessageEvent) -> None:
         try:

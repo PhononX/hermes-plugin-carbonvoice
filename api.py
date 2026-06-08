@@ -59,14 +59,24 @@ class CarbonVoiceAPI:
             raise RuntimeError("CarbonVoiceAPI used before open()")
         return self._client
 
-    async def whoami(self) -> Optional[str]:
-        """Return the agent's own ``user_guid``, or None when not parseable."""
+    async def whoami(self) -> "tuple[Optional[str], Optional[str]]":
+        """Return ``(user_guid, owner_id)`` for the bot account.
+
+        - ``user_guid`` — the agent's own id (for the self-loop guard).
+        - ``owner_id`` — ``user.created_by``, the user who *created* the bot
+          account. That's the deny-by-default owner: always authorized, and
+          auto-detected here so no manual setup is needed. Either may be
+          None when not parseable.
+        """
         client = self._require_client()
         resp = await client.get("/whoami")
         resp.raise_for_status()
         data = resp.json() or {}
         user = data.get("user") or {}
-        return first_str(user.get("user_guid"), user.get("_id"), user.get("id"))
+        return (
+            first_str(user.get("user_guid"), user.get("_id"), user.get("id")),
+            first_str(user.get("created_by")),
+        )
 
     async def fetch_recent(
         self,
