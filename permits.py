@@ -111,10 +111,21 @@ class ApprovalStore:
             return []
 
 
-# Operator commands, used only from an already-authorized sender in the
-# home channel. ``/cv-allow <id>`` and ``/cv-deny <id>`` take a user_guid;
-# ``/cv-list`` takes none. Case-insensitive; leading/trailing space ok.
-_CMD_RE = re.compile(r"^\s*/cv-(allow|deny|list)\b\s*(\S+)?\s*$", re.IGNORECASE)
+# Operator commands (owner-only, in the home channel). Explicit verb-object
+# names so they're self-documenting:
+#   /cv-allow-user <id>     /cv-deny-user <id>     /cv-list-allow-users
+# Case-insensitive; leading/trailing space ok. Order the longest alternative
+# first so ``list-allow-users`` isn't shadowed by ``allow-user``.
+_CMD_RE = re.compile(
+    r"^\s*/cv-(list-allow-users|allow-user|deny-user)\b\s*(\S+)?\s*$",
+    re.IGNORECASE,
+)
+# Map the spoken command to the canonical action the handler switches on.
+_ACTION = {
+    "allow-user": "allow",
+    "deny-user": "deny",
+    "list-allow-users": "list",
+}
 
 
 def parse_admin_command(text: Optional[str]) -> Optional[Tuple[str, Optional[str]]]:
@@ -130,6 +141,6 @@ def parse_admin_command(text: Optional[str]) -> Optional[Tuple[str, Optional[str
     m = _CMD_RE.match(text)
     if not m:
         return None
-    action = m.group(1).lower()
+    action = _ACTION[m.group(1).lower()]
     arg = m.group(2)
     return (action, arg)

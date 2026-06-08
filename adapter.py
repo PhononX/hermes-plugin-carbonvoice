@@ -182,14 +182,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         )
 
         # Interactive onboarding: the channel where the agent asks the owner
-        # to approve unknown senders, and a per-process dedup set so we only
-        # ask once per pending user. ``home_channel`` falls back to the
-        # legacy CARBONVOICE_HOME_CHANNEL env if not in ``extra``.
+        # to approve unknown senders, and a per-process map of pending users
+        # → the channel they first wrote in (so we ask once per user AND can
+        # resolve their display name from the right roster on approval).
+        # ``home_channel`` falls back to the legacy CARBONVOICE_HOME_CHANNEL
+        # env if not in ``extra``.
         self._home_channel: Optional[str] = (
             first_str(extra.get("home_channel"))
             or first_str(os.environ.get("CARBONVOICE_HOME_CHANNEL"))
         )
-        self._pending_approval_notified: set[str] = set()
+        self._pending_approval: Dict[str, str] = {}
 
         # Per-thread reply anchors + parent-text cache + (eventually)
         # engagement / outbound tracking. See conversations.py and
@@ -1516,9 +1518,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         channel; without one we just log and the message stays denied (safe
         default — no info leaks to the unknown sender, who gets no reply).
         """
-        if not creator_id or creator_id in self._pending_approval_notified:
+        if not creator_id or creator_id in self._pending_approval:
             return
-        self._pending_approval_notified.add(creator_id)
+        # Remember the channel they wrote in so /cv-allow-user can resolve
+        # their display name from that roster (they're a stranger in the
+        # home channel).
+        self._pending_approval[creator_id] = channel_id
         if not self._home_channel or self._api is None:
             logger.info(
                 "carbonvoice: unauthorized sender %s — no CARBONVOICE_HOME_CHANNEL "
@@ -1536,8 +1541,8 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         who = f"{name} ({creator_id})" if name else creator_id
         text = (
             f"👤 {who} wants to talk to me but isn't authorized.\n"
-            f"To allow them, reply:  /cv-allow {creator_id}\n"
-            f"To block them, reply:  /cv-deny {creator_id}"
+            f"To allow them, reply:  /cv-allow-user {creator_id}\n"
+            f"To block them, reply:  /cv-deny-user {creator_id}"
         )
         try:
             await self.send(self._home_channel, text)
@@ -1551,6 +1556,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 creator_id, exc,
             )
 
+    async def _resolve_pending_name(self, user_id: str) -> str:
+        """Display name of a pending user, from the channel they wrote in."""
+        origin = self._pending_approval.get(user_id)
+        if not origin or self._channels is None:
+            return ""
+        try:
+            return await self._channels.resolve_name(origin, user_id) or ""
+        except Exception:
+            return ""
+
     async def _handle_admin_command(
         self, channel_id: str, cmd: "tuple[str, Optional[str]]"
     ) -> None:
@@ -1562,7 +1577,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             rows = self._approvals.list_approved()
             if not rows:
                 reply = (
-                    "No dynamically-approved users yet. "
+                    "No allowed users yet. "
                     "(The owner and CARBONVOICE_ALLOWED_USERS still apply.)"
                 )
             else:
@@ -1571,20 +1586,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                     uid = r.get("user_id") or ""
                     nm = r.get("user_name") or ""
                     lines.append(f"• {nm} ({uid})" if nm else f"• {uid}")
-                reply = "Approved users:\n" + "\n".join(lines)
+                reply = "Allowed users:\n" + "\n".join(lines)
 
         elif action == "allow":
             if not arg:
-                reply = "Usage: /cv-allow <user_guid>"
+                reply = "Usage: /cv-allow-user <user_guid>"
             else:
-                name = ""
-                if self._channels is not None:
-                    try:
-                        name = await self._channels.resolve_name(channel_id, arg) or ""
-                    except Exception:
-                        name = ""
+                # Resolve the name from the channel they originally wrote in
+                # (saved in _pending_approval) — they're a stranger in the
+                # home channel, so resolving there yields nothing.
+                name = await self._resolve_pending_name(arg)
                 ok = self._approvals.approve(arg, name)
-                self._pending_approval_notified.discard(arg)
+                self._pending_approval.pop(arg, None)
                 reply = (
                     f"✅ Allowed {name or arg}. They can talk to me now."
                     if ok
@@ -1593,11 +1606,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         elif action == "deny":
             if not arg:
-                reply = "Usage: /cv-deny <user_guid>"
+                reply = "Usage: /cv-deny-user <user_guid>"
             else:
                 self._approvals.revoke(arg)  # drop if previously approved
-                # Keep them marked notified so we don't re-ask this session.
-                self._pending_approval_notified.add(arg)
+                # Keep them marked (mapped to their origin channel, or "") so
+                # we don't re-ask this session.
+                self._pending_approval.setdefault(arg, "")
                 reply = (
                     f"🚫 {arg} denied — won't be approved "
                     "(revoked if previously allowed)."

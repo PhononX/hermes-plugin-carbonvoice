@@ -106,12 +106,15 @@ jobs:
           # Interactive allow-list: command parser + ApprovalStore degrades
           # safely without Hermes core (no gateway.pairing in standalone CI).
           from carbonvoice.permits import parse_admin_command, ApprovalStore
-          assert parse_admin_command('/cv-allow Fmx4') == ('allow', 'Fmx4')
-          assert parse_admin_command('  /CV-DENY  ABC ') == ('deny', 'ABC')
-          assert parse_admin_command('/cv-list') == ('list', None)
-          assert parse_admin_command('/cv-allow') == ('allow', None)   # missing arg → usage
-          assert parse_admin_command('hi /cv-allow X') is None         # not a command
+          assert parse_admin_command('/cv-allow-user Fmx4') == ('allow', 'Fmx4')
+          assert parse_admin_command('  /CV-DENY-USER  ABC ') == ('deny', 'ABC')
+          assert parse_admin_command('/cv-list-allow-users') == ('list', None)
+          assert parse_admin_command('/cv-allow-user') == ('allow', None)  # missing arg → usage
+          assert parse_admin_command('hi /cv-allow-user X') is None        # not a command
           assert parse_admin_command('/cv-nope X') is None
+          assert parse_admin_command('/cv-allow X') is None                # old short form gone
+          # list-allow-users must not be shadowed by allow-user
+          assert parse_admin_command('/cv-list-allow-users')[0] == 'list'
           assert parse_admin_command(None) is None and parse_admin_command('') is None
           _appr = ApprovalStore()
           assert _appr.available is False

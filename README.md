@@ -52,10 +52,10 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 **Interactive onboarding.** When an unauthorized user messages the bot, it asks **you** (the owner) in the home channel:
 
 > 👤 *Teammate Name (Abc123…) wants to talk to me but isn't authorized.*
-> *To allow them, reply:* `/cv-allow Abc123…`
-> *To block them, reply:* `/cv-deny Abc123…`
+> *To allow them, reply:* `/cv-allow-user Abc123…`
+> *To block them, reply:* `/cv-deny-user Abc123…`
 
-Reply `/cv-allow <user_guid>` and they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). Also: `/cv-deny <user_guid>`, `/cv-list`. (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
+Reply `/cv-allow-user <user_guid>` and they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). Commands (owner-only, in the home channel): `/cv-allow-user <id>`, `/cv-deny-user <id>`, `/cv-list-allow-users`. (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
 
 To add people up front instead, set `CARBONVOICE_ALLOWED_USERS`:
 
@@ -102,7 +102,7 @@ That's the only required variable. By default the bot accepts messages from any 
 CARBONVOICE_ALLOWED_USERS=<your_carbonvoice_user_guid>[,<another_guid>...]
 ```
 
-Access is **deny-by-default**: only the owner (auto-detected), users in `CARBONVOICE_ALLOWED_USERS`, and users approved via `/cv-allow` can talk to the bot. To disable gating entirely (open to everyone), set `CARBONVOICE_ALLOW_ALL_USERS=true`. Your own `user_guid` shows up in the gateway logs as `carbonvoice: owner is <guid>` on startup.
+Access is **deny-by-default**: only the owner (auto-detected), users in `CARBONVOICE_ALLOWED_USERS`, and users approved via `/cv-allow-user` can talk to the bot. To disable gating entirely (open to everyone), set `CARBONVOICE_ALLOW_ALL_USERS=true`. Your own `user_guid` shows up in the gateway logs as `carbonvoice: owner is <guid>` on startup.
 
 ## Run
 
@@ -138,7 +138,7 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
-| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow`-approved users. |
+| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow-user`-approved users. |
 | `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
