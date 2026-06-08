@@ -228,7 +228,14 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             # every platform but doesn't know about `created_by`, so without
             # this the owner could pass the plugin gate yet be blocked by
             # core. Idempotent.
-            self._approvals.approve(owner_id, "owner")
+            if self._approvals.approve(owner_id, "owner"):
+                logger.info("carbonvoice: owner mirrored into pairing store")
+            else:
+                logger.warning(
+                    "carbonvoice: could NOT mirror owner into pairing store "
+                    "(PairingStore available=%s) — core may block the owner",
+                    self._approvals.available,
+                )
         if not self._allowlist.has_any_authorizer:
             logger.warning(
                 "carbonvoice: deny-by-default is active but NO authorized "
