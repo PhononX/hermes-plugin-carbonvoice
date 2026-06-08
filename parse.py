@@ -30,6 +30,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_utc() -> "datetime":
+    """Timezone-aware current UTC time (for :func:`message_age_seconds`)."""
+    return datetime.now(timezone.utc)
+
+
 def extract_transcript(msg: Dict[str, Any]) -> str:
     """Pull the human-readable transcript from a CV message payload.
 
@@ -98,6 +103,26 @@ def extract_channel_id(msg: Dict[str, Any]) -> Optional[str]:
 def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     # Same field across V2 and V5.
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
+
+
+def message_age_seconds(msg: Dict[str, Any], now: "datetime") -> Optional[float]:
+    """Seconds between a message's ``created_at`` and ``now``.
+
+    Returns ``None`` when the payload carries no parseable timestamp (so
+    callers can fall back to age-agnostic behavior). ``created_at`` is an
+    ISO-8601 string across V2/V5 (``2026-06-05T19:36:44.437Z``); the
+    trailing ``Z`` is normalized to ``+00:00`` for :meth:`fromisoformat`.
+    """
+    raw = first_str(msg.get("created_at"), msg.get("created"))
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (now - ts).total_seconds()
 
 
 def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
