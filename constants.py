@@ -19,6 +19,15 @@ DEFAULT_STUCK_MAX_AGE_S = 5 * 60
 HTTP_TIMEOUT = 30.0
 MAX_MESSAGE_LENGTH = 8000
 
+# Carbon Voice's API gateway intermittently returns 502/503/504 (observed in
+# bursts). A transient 5xx on a latency-critical GET/reaction would otherwise
+# wait for the next poll tick (~5s) to recover; a couple of fast retries with
+# short backoff recover in well under a second. Only idempotent reads/reactions
+# retry — sends do NOT (a retried send could duplicate a delivered message).
+TRANSIENT_RETRY_ATTEMPTS = 2
+TRANSIENT_RETRY_BACKOFF_S = 0.4
+TRANSIENT_STATUS = (502, 503, 504)
+
 # "acknowledged" is a built-in Carbon Voice reaction id — works out of the
 # box without operator config. Override with CARBONVOICE_REACTION_ID after
 # inspecting the available reactions logged on startup.
