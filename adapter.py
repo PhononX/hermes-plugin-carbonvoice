@@ -25,6 +25,7 @@ processed on the next startup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
@@ -56,6 +57,7 @@ from .conversations import ConversationTracker
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_STUCK_MAX_AGE_S,
     DEFAULT_WS_RETRY_MAX_MS,
     MAX_MESSAGE_LENGTH,
 )
@@ -69,7 +71,9 @@ from .parse import (
     extract_message_id,
     extract_transcript,
     first_str,
+    message_age_seconds,
     now_iso,
+    now_utc,
 )
 # extract_transcript is also re-exported via parse for the parent-text path
 # (now handled by ConversationTracker, but the import here is kept so
@@ -85,6 +89,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     """Hermes ↔ Carbon Voice bridge over Socket.IO + REST polling fallback."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
+    # Carbon Voice has no in-place message edit API — a "reply" is always a
+    # new message. Declaring this False (like Signal / Weixin / WeCom) tells
+    # the core's stream consumer NOT to attempt progressive edits, so it uses
+    # the send-once path instead of editing a streamed bubble. Without it the
+    # consumer keeps an editable-message assumption that, when a send fails
+    # (e.g. CV returns 502), leaves "final delivery" unconfirmed and the core
+    # re-sends the same response once per queued follow-up — the observed
+    # "same message multiple times" duplication.
+    SUPPORTS_MESSAGE_EDITING = False
 
     # Voice-out integration with Hermes core's auto-TTS pipeline.
     #
@@ -150,6 +164,39 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         self._max_attachment_bytes: int = int(
             extra.get("max_attachment_mb") or 10
         ) * 1024 * 1024
+        # Stuck-message cutoff: a message with no transcript holds the cursor
+        # (gets retried) only while younger than this. Past it we assume the
+        # transcript will never arrive (image-only / system / failed STT) and
+        # advance past it, so a single permanently-empty message can't pin the
+        # cursor and re-feed the whole window on every poll/restart.
+        self._stuck_max_age_s: float = float(
+            extra.get("stuck_max_age_s")
+            or os.environ.get("CARBONVOICE_STUCK_MAX_AGE_S")
+            or DEFAULT_STUCK_MAX_AGE_S
+        )
+        # Outbound dedup: defense-in-depth against the core re-sending the
+        # same response once per queued follow-up when delivery confirmation
+        # is lost (e.g. CV 502 mid-stream). Keyed by channel → (text-hash,
+        # monotonic ts); a repeat of the SAME text to the SAME channel within
+        # the window is dropped. Independent of SUPPORTS_MESSAGE_EDITING, so
+        # it also covers cores/paths we don't control. Window is short so a
+        # user legitimately repeating themselves isn't blocked for long.
+        self._send_dedup_window_s: float = float(
+            extra.get("send_dedup_window_s")
+            or os.environ.get("CARBONVOICE_SEND_DEDUP_WINDOW_S")
+            or 90
+        )
+        self._last_sent: Dict[str, "tuple[str, float]"] = {}
+        # Serialize message fetches. Every WS ``message:created`` /
+        # ``message:updated`` event (and each reconnect) fires on_tick →
+        # _fetch_missed_messages. A burst of events would otherwise run many
+        # overlapping fetches over the SAME cursor window in parallel, each
+        # re-processing the same messages — a key amplifier of the
+        # duplicate-processing bursts. The lock makes fetches mutually
+        # exclusive; _fetch_missed_messages skips (coalesces) if one is
+        # already running, since the in-flight fetch already covers the
+        # latest window.
+        self._fetch_lock = asyncio.Lock()
 
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
@@ -167,6 +214,11 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 self._api,
                 reaction_id=extra.get("reaction_id"),
                 enabled=not bool(extra.get("disable_ack_reaction")),
+                pending_reaction_id=(
+                    extra.get("pending_reaction_id")
+                    or os.environ.get("CARBONVOICE_PENDING_REACTION_ID")
+                    or None
+                ),
             )
             if self._api
             else None
@@ -297,6 +349,30 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
+        # Outbound dedup: drop an identical re-send to the same channel inside
+        # the dedup window. The core re-sends the same "first response" once
+        # per queued follow-up when streaming delivery wasn't confirmed (CV
+        # 502s make this common); without this guard the user sees the same
+        # reply many times. We report success (not failure) so the core
+        # treats it as delivered and stops retrying. Keyed by an order-stable
+        # hash of the exact text.
+        dedup_key = chat_id or ""
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if dedup_key:
+            prev = self._last_sent.get(dedup_key)
+            now_m = time.monotonic()
+            if (
+                prev is not None
+                and prev[0] == content_hash
+                and now_m - prev[1] < self._send_dedup_window_s
+            ):
+                logger.info(
+                    "carbonvoice: suppressed duplicate send to %s "
+                    "(same text within %.0fs dedup window)",
+                    dedup_key, self._send_dedup_window_s,
+                )
+                return SendResult(success=True, message_id=None)
+
         # v5 transport: the resolved thread root is sent to the server as
         # ``reply_to_message_id`` (cv-api PR #277 renamed the old
         # ``thread_id`` input). The server resolves threading itself —
@@ -320,6 +396,11 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
+            # Record for outbound dedup only on a real, successful send — a
+            # failed send must NOT prime the dedup (else a legit retry of a
+            # genuinely-undelivered message would be suppressed).
+            if dedup_key:
+                self._last_sent[dedup_key] = (content_hash, time.monotonic())
             return SendResult(success=True, message_id=msg_id, raw_response=data)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
@@ -972,6 +1053,17 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._api is None:
             return
 
+        # Coalesce overlapping ticks: if a fetch is already running, skip —
+        # it already covers the latest cursor window. Prevents a burst of WS
+        # events from spawning parallel fetches that re-process the same
+        # messages (a key amplifier of the duplicate-processing bursts).
+        if self._fetch_lock.locked():
+            logger.debug("carbonvoice: fetch already in progress — skipping tick")
+            return
+        async with self._fetch_lock:
+            await self._fetch_missed_messages_locked()
+
+    async def _fetch_missed_messages_locked(self) -> None:
         request_started_at = now_iso()
 
         if not self._cursor.last_seen_at:
@@ -1212,11 +1304,24 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: dropped message from unauthorized sender %s",
                 creator_id,
             )
-            # Deny-by-default onboarding: ask the owner (in the home channel)
-            # to approve this sender — once per pending user per process.
-            await self._maybe_notify_unauthorized(creator_id, channel_id)
+            # Deny-by-default onboarding: react ⁉️ on the sender's message
+            # (silent "pending approval") and ask the owner in the home
+            # channel to approve them (rate-limited per pending user).
+            await self._maybe_notify_unauthorized(
+                creator_id, channel_id, message_id
+            )
             if self._ignored_log is not None and creator_id:
                 self._ignored_log.record(creator_id, channel_id)
+            # Mark THIS message seen so the poll loop doesn't re-process the
+            # exact same unauthorized message every tick. Without this, a
+            # not-yet-approved sender's message is re-evaluated on every poll
+            # (worsened by 502 retries re-fetching the same window) — the
+            # observed 2500×-"dropped unauthorized" burst. This does NOT lock
+            # the *user* out: once the owner approves them, their NEW messages
+            # pass the gate normally; only this specific already-reacted
+            # message is suppressed (SeenCache TTL is short, so even it
+            # re-evaluates later if still unapproved).
+            self._seen.mark(message_id)
             return False
 
         # Dedupe early so retries on still-transcribing messages don't multiply.
@@ -1227,8 +1332,25 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # transcribing). Return None — the *stuck* signal — so the poll
         # loop holds the cursor just before this message and retries it
         # next tick, rather than advancing past it. Don't mark seen.
+        #
+        # BUT only while the message is young. A message with no transcript
+        # is "stuck" only transiently; some never get one (image-only,
+        # system events, failed STT). If we held the cursor for those
+        # forever, every poll/restart would re-fetch the whole window from
+        # the pinned timestamp and re-feed already-processed messages — the
+        # "cadena de mensajes" bug. Past CARBONVOICE_STUCK_MAX_AGE_S we stop
+        # waiting and let it advance the cursor (return False, not None).
         transcript = extract_transcript(msg)
         if not transcript:
+            age = message_age_seconds(msg, now_utc())
+            if age is not None and age > self._stuck_max_age_s:
+                logger.info(
+                    "carbonvoice: message %s has no transcript after %.0fs "
+                    "(> %ss) — treating as permanently empty, advancing past it",
+                    message_id, age, self._stuck_max_age_s,
+                )
+                self._seen.mark(message_id)
+                return False
             return None
 
         # V5 source-of-truth enrichment. The socket / v3-poll push gives
@@ -1296,14 +1418,25 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # Admin allow-list commands (/cv-allow, /cv-deny, /cv-list). Only the
         # OWNER may run these — a normally-approved user must not be able to
         # escalate by approving others. Handled here and NOT forwarded to the
-        # agent. Ack + mark seen so a re-poll doesn't re-run it.
+        # agent.
         if self._allowlist.is_owner(creator_id):
             cmd = parse_admin_command(transcript)
             if cmd is not None:
-                await self._handle_admin_command(channel_id, cmd)
-                if self._reactions is not None:
-                    self._reactions.ack(message_id)
+                # Dedup BEFORE running the command. The command sends a reply
+                # ("✅ Allowed …") which bumps updated_at and re-fires the
+                # poll; if the durable ack isn't on the server yet (or the
+                # SeenCache was lost to a restart), the re-fetched command
+                # re-runs and re-replies — the observed 298×-spam bug. So we
+                # (1) mark the in-memory SeenCache and (2) put the durable
+                # server-side ack reaction *and wait for it* — BEFORE sending
+                # the reply. ``ack_sync`` blocks until the marker is on the
+                # server, so the re-fetch is guaranteed deduped by the
+                # ``bot_has_reacted`` check above. ``approve``/``revoke`` are
+                # idempotent too, so a stale in-flight copy is a harmless no-op.
                 self._seen.mark(message_id)
+                if self._reactions is not None:
+                    await self._reactions.ack_sync(message_id)
+                await self._handle_admin_command(channel_id, cmd)
                 return False
 
         # Resolve chat_type before the mention gate so the gate can short-
@@ -1520,19 +1653,32 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     # ── Interactive allow-list (deny-by-default onboarding) ──────────────
 
     async def _maybe_notify_unauthorized(
-        self, creator_id: str, channel_id: str
+        self, creator_id: str, channel_id: str, message_id: str = ""
     ) -> None:
-        """Ask the owner to approve an unknown sender + tell the sender.
+        """React to an unknown sender's message + ask the owner to approve.
 
-        Rate-limited to once per ``approval_notify_cooldown_s`` per user, so
-        a persistent stranger doesn't spam the owner — but the owner IS
-        re-notified after the cooldown (a single prompt could be missed).
-        Also replies once-per-cooldown to the sender so they know their
-        request is pending instead of thinking the bot is dead. Always
-        records the channel they wrote in (for name resolution on approval).
+        The sender gets a silent "pending approval" reaction (⁉️) on their
+        message — NOT a text reply. A text reply clutters the channel and,
+        worse, spammed every old conversation when we switched to
+        deny-by-default (each re-flagged sender got a wall message). A
+        reaction is unobtrusive and self-evidently "seen but not answered".
+
+        The owner prompt (in the home channel) is rate-limited to once per
+        ``approval_notify_cooldown_s`` per user so a persistent stranger
+        doesn't spam the owner — but the owner IS re-notified after the
+        cooldown (a single prompt could be missed). Always records the
+        channel they wrote in (for name resolution on approval).
         """
         if not creator_id:
             return
+
+        # (B) Silent feedback to the sender: react ⁉️ on THIS message. Not
+        # cooldown-gated — every new message from a pending user gets the
+        # reaction, so they always see they were seen. Cheap + idempotent
+        # (re-reacting the same message is a no-op server-side).
+        if self._reactions is not None and message_id:
+            self._reactions.pending(message_id)
+
         now = time.monotonic()
         entry = self._pending_approval.get(creator_id)
         if entry is None:
@@ -1584,23 +1730,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "interactive onboarding)",
                 creator_id,
             )
-
-        # (B) let the sender know their request is pending (once per
-        # cooldown), so they don't think the bot is broken. Only when a home
-        # channel exists — i.e. interactive onboarding is actually on.
-        if self._api is not None and self._home_channel and channel_id:
-            try:
-                await self.send(
-                    channel_id,
-                    "🔒 Your request to talk to the assistant was sent to its "
-                    "admin for approval. You'll be able to chat once they "
-                    "approve you.",
-                )
-            except Exception as exc:
-                logger.debug(
-                    "carbonvoice: failed to send pending notice to %s: %s",
-                    creator_id, exc,
-                )
 
     async def _resolve_pending_name(self, user_id: str) -> str:
         """Display name of a pending user, from the channel they wrote in."""

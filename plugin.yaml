@@ -1,7 +1,7 @@
 name: carbonvoice-platform
 label: Carbon Voice
 kind: platform
-version: 0.3.5
+version: 0.3.6
 description: >
   Carbon Voice gateway adapter for Hermes Agent.
   Connects via Socket.IO (primary) with REST polling fallback — no public
@@ -63,6 +63,14 @@ optional_env:
   - name: CARBONVOICE_REACTION_ID
     description: "Reaction id used to acknowledge inbound messages (default: 'acknowledged'). Available ids are logged on startup."
     prompt: "Ack reaction id"
+    password: false
+  - name: CARBONVOICE_PENDING_REACTION_ID
+    description: "Reaction id put on an UNAUTHORIZED sender's message as a silent 'pending approval' signal instead of a text reply (default: 'confused' ⁉️). Available ids are logged on startup."
+    prompt: "Pending-approval reaction id"
+    password: false
+  - name: CARBONVOICE_STUCK_MAX_AGE_S
+    description: "How long (seconds) a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor (default: 300)."
+    prompt: "Stuck-message max age (seconds)"
     password: false
   - name: CARBONVOICE_DISABLE_ACK_REACTION
     description: "Disable the visual ack reaction on inbound messages (default: false)"

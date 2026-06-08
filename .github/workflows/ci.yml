@@ -563,10 +563,83 @@ jobs:
               'deny must clear the pending entry so the user can re-request (#3)'
           assert '_pending_approval.setdefault(' not in adapter_src, \
               'deny must not silence the user via setdefault — breaks re-add (#3)'
-          #  - sender gets a "request sent" notice (B).
-          assert 'sent to its' in adapter_src, \
-              'unauthorized sender must get a pending-request notice (B)'
-          print('adapter interactive allow-list: cooldown + feedback + repeatable deny')
+
+          # Duplicate-response guard. The core re-sends the same "first
+          # response" once per queued follow-up when streaming delivery
+          # isn't confirmed (CV 502s make this common), so the user sees the
+          # same reply many times. Two defenses must stay in place:
+          #  (1) SUPPORTS_MESSAGE_EDITING=False — CV has no edit API; declaring
+          #      it stops the stream consumer assuming an editable bubble.
+          #  (2) an outbound send-dedup that drops an identical re-send to the
+          #      same channel within a short window (reports success so the
+          #      core stops retrying).
+          assert 'SUPPORTS_MESSAGE_EDITING = False' in adapter_src, \
+              'CV has no edit API — must declare SUPPORTS_MESSAGE_EDITING=False ' \
+              '(else the stream consumer re-sends on unconfirmed delivery)'
+          assert '_send_dedup_window_s' in adapter_src and '_last_sent' in adapter_src, \
+              'send() must dedup identical re-sends per channel (duplicate-response guard)'
+          assert 'hashlib.sha256(content' in adapter_src, \
+              'send-dedup must key on a hash of the exact outbound text'
+
+          # Fetch reentrancy guard. Every WS message:created/updated event
+          # fires on_tick → _fetch_missed_messages; a burst would otherwise
+          # run overlapping fetches over the same cursor window in parallel,
+          # multiplying re-processing (a key amplifier of the bursts). A lock
+          # must serialize fetches and coalesce overlapping ticks.
+          assert '_fetch_lock' in adapter_src, \
+              'message fetches must be serialized by a lock (no parallel re-fetch)'
+          assert '_fetch_lock.locked()' in adapter_src, \
+              'overlapping ticks must coalesce (skip if a fetch is in progress)'
+
+          # Stuck-message cursor pin guard. A message with no transcript is
+          # held (return None → cursor not advanced) ONLY while young; past
+          # CARBONVOICE_STUCK_MAX_AGE_S it must advance past, or one
+          # permanently-empty message (image-only / system / failed STT)
+          # pins the cursor and re-feeds the whole window every poll/restart
+          # — the "cadena de mensajes ya procesados" bug. The age check must
+          # gate the stuck return.
+          assert 'self._stuck_max_age_s' in adapter_src, \
+              'empty-transcript stuck-hold must be bounded by a max age, ' \
+              'or a permanently-empty message pins the cursor forever'
+          assert 'message_age_seconds(' in adapter_src, \
+              'adapter must compute message age to bound the stuck-hold'
+          # parse.message_age_seconds: ISO parsing incl. trailing Z + naive.
+          from carbonvoice.parse import message_age_seconds, now_utc
+          from datetime import datetime, timezone, timedelta
+          _now = datetime(2026, 6, 8, 16, 0, 0, tzinfo=timezone.utc)
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00Z'}, _now) == 60.0
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00+00:00'}, _now) == 60.0
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00'}, _now) == 60.0  # naive→UTC
+          assert message_age_seconds({'created_at': '2026-06-05T19:36:44.437Z'}, _now) > 5*60
+          assert message_age_seconds({'id': 'x'}, _now) is None          # no ts → safe retry
+          assert message_age_seconds({'created_at': 'garbage'}, _now) is None
+          assert now_utc().tzinfo is not None
+          print('stuck-message cursor-pin guard + message_age_seconds: OK')
+          #  - sender feedback (B) must be a REACTION, not a text reply.
+          #    A text reply to the channel spammed every old conversation
+          #    when deny-by-default re-flagged them; a ⁉️ reaction is silent.
+          #    Guard against the text reply ever coming back.
+          assert 'sent to its' not in adapter_src, \
+              'unauthorized-sender feedback must NOT be a channel text reply ' \
+              '(it spams old conversations) — use a reaction instead'
+          assert 'self._reactions.pending(' in adapter_src, \
+              'unauthorized sender must get a silent ⁉️ reaction, not a text reply (B)'
+          # ReactionService exposes a distinct pending reaction (default
+          # "confused"/⁉️) without clobbering the ack reaction.
+          import importlib as _il
+          _rx = _il.import_module('carbonvoice.reactions')
+          from carbonvoice.constants import DEFAULT_PENDING_REACTION_ID, DEFAULT_REACTION_ID
+          assert DEFAULT_PENDING_REACTION_ID == 'confused'
+          assert DEFAULT_PENDING_REACTION_ID != DEFAULT_REACTION_ID, \
+              'pending reaction must differ from the ack reaction'
+          class _FakeAPI:
+              def __init__(self): self.calls = []
+              async def react(self, rid, mid): self.calls.append((rid, mid))
+          _svc = _rx.ReactionService(_FakeAPI())
+          assert _svc.pending_reaction_id == 'confused'
+          assert _svc.reaction_id == DEFAULT_REACTION_ID  # ack unchanged
+          assert hasattr(_svc, 'pending') and callable(_svc.pending)
+          print('adapter interactive allow-list: cooldown + ⁉️ reaction feedback + repeatable deny')
 
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields
@@ -601,21 +674,34 @@ jobs:
               'gets a fresh evaluation (the original "voice memo with ' \
               'picker tag never reaches the bot" bug)'
           # Make sure no one accidentally re-introduces an unconditional
-          # ``seen.mark`` before the gate runs. Count occurrences: there
-          # should be exactly four ``self._seen.mark(message_id)`` calls —
+          # ``seen.mark`` before the *mention/process* gate runs. Count
+          # occurrences: there should be exactly six
+          # ``self._seen.mark(message_id)`` calls —
           # (a) the server-side reaction-dedup skip (already-acked message),
           # (b) the owner allow-list command path (/cv-*), (c) the
-          # rejected-but-stable path, (d) after the gate accepts — plus
-          # ``self._seen.is_seen(message_id)`` for the early dedup check.
-          # (a), (b) and (d) are conditional (acked / owner-command / gate
-          # accept), so none touches a revisitable rejection (which carries
-          # no ack) and they can't re-introduce the post-tag dedup bug.
-          assert adapter_src.count('self._seen.mark(message_id)') == 4, \
-              'adapter._process_message must mark seen in exactly four ' \
+          # rejected-but-stable mention-gate path, (d) after the gate accepts,
+          # (e) the *aged-out stuck* path (a message still missing its
+          # transcript past CARBONVOICE_STUCK_MAX_AGE_S — image-only / system
+          # / failed STT — advanced past instead of pinning the cursor), and
+          # (f) the *unauthorized sender* path — mark the specific message
+          # we just reacted ⁉️ to, so the poll loop (worsened by 502 retries
+          # re-fetching the same window) doesn't re-evaluate the SAME
+          # unauthorized message every tick (the 2500×-"dropped unauthorized"
+          # burst). (f) is bounded + safe: it suppresses only THIS message,
+          # not the user — once approved, their NEW messages pass the gate;
+          # and the SeenCache TTL is short so even this one re-evaluates later
+          # if still unapproved. Plus ``self._seen.is_seen(message_id)`` for
+          # the early dedup check. None of these marks a message that should
+          # later reach the agent after a tag-resolution re-fire (the
+          # revisitable mention-gate rejection is deliberately NOT marked).
+          assert adapter_src.count('self._seen.mark(message_id)') == 6, \
+              'adapter._process_message must mark seen in exactly six ' \
               'places: (a) reaction-dedup skip, (b) owner /cv-* command, ' \
-              '(c) a non-revisitable rejection, (d) when the gate accepts. ' \
+              '(c) a non-revisitable mention rejection, (d) when the gate ' \
+              'accepts, (e) the aged-out stuck path, (f) the unauthorized ' \
+              'sender path (suppress re-processing the same dropped message). ' \
               'Counting drift usually means someone added an unconditional ' \
-              'mark before the gate — that re-introduces the post-tag dedup bug.'
+              'mark before the mention gate — that re-introduces the post-tag dedup bug.'
           print('adapter revisitable-rejection dedup contract: wired')
 
           # Server-side reaction dedup: the adapter must skip a message the
@@ -642,15 +728,27 @@ jobs:
           assert 'first_stuck_idx' in adapter_src, \
               '_fetch_missed_messages must track the first stuck message ' \
               'and hold the cursor before it (stuck-message handling)'
-          # The not-ready-transcript branch must return None, not False —
-          # returning False would let the cursor advance past a message CV
-          # is still transcribing.
+          # The not-ready-transcript branch must hold the cursor (return
+          # None) for a YOUNG message — returning False there would let the
+          # cursor advance past a message CV is still transcribing — but it
+          # must return False once the message ages past the stuck cutoff, so
+          # a permanently-empty message can't pin the cursor (see the
+          # stuck-cursor-pin guard above). Locate the `if not transcript:`
+          # block and assert it contains BOTH an age-gated False and a
+          # trailing bare `return None` (the young/transient default).
           import re as _re
-          _m = _re.search(r'if not transcript:\s*\n\s*return (\w+)', adapter_src)
-          assert _m and _m.group(1) == 'None', \
-              'the empty-transcript branch of _process_message must ' \
-              f'return None (stuck), got {_m.group(1) if _m else "no match"}'
-          print('adapter stuck-message cursor-hold contract: wired')
+          _blk = _re.search(
+              r'if not transcript:\n(?P<body>(?:[ \t].*\n|\n)+)', adapter_src
+          )
+          assert _blk, 'could not locate the empty-transcript branch'
+          _body = _blk.group('body')
+          assert _re.search(r'\bself\._stuck_max_age_s\b', _body), \
+              'empty-transcript branch must consult the stuck max-age cutoff'
+          assert _re.search(r'\breturn False\b', _body), \
+              'aged-out stuck message must return False (advance the cursor)'
+          assert _re.search(r'\n[ \t]+return None\b', _body), \
+              'young stuck message must still return None (hold the cursor)'
+          print('adapter stuck-message cursor-hold contract: age-bounded, wired')
 
           # parse helpers must handle BOTH V5 and V2 shapes — V5 because
           # that's what the v5 GET returns post-enrichment, V2 because

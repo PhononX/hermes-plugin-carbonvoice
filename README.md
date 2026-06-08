@@ -57,7 +57,7 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 
 Reply `/cv-allow-user <user_guid>` and they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). Commands (owner-only, in the home channel): `/cv-allow-user <id>`, `/cv-deny-user <id>`, `/cv-list-allow-users`. (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
 
-The unauthorized sender also gets a one-line *"your request was sent to the admin for approval"* reply, so they don't think the bot is broken. To avoid spamming you, the owner prompt (and the sender notice) are rate-limited to once per `CARBONVOICE_APPROVAL_COOLDOWN_S` (default 1800 s / 30 min) per user — but you ARE re-prompted after the cooldown, in case the first ask was missed. `/cv-deny-user` removes a user *and* clears their pending state, so denied users can request access again later (and you can freely remove/re-add anyone).
+The unauthorized sender doesn't get a text reply (that would clutter the channel and, under deny-by-default, spam every old conversation). Instead the bot puts a silent **⁉️ reaction** on their message — "seen, pending approval". The reaction id defaults to the CV built-in `confused`; override with `CARBONVOICE_PENDING_REACTION_ID`. To avoid spamming you, the owner prompt is rate-limited to once per `CARBONVOICE_APPROVAL_COOLDOWN_S` (default 1800 s / 30 min) per user — but you ARE re-prompted after the cooldown, in case the first ask was missed. `/cv-deny-user` removes a user *and* clears their pending state, so denied users can request access again later (and you can freely remove/re-add anyone).
 
 To add people up front instead, set `CARBONVOICE_ALLOWED_USERS`:
 
@@ -139,13 +139,15 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_POLL_INTERVAL_MS` | `5000` | Polling interval (when WS is down or unavailable). |
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
+| `CARBONVOICE_STUCK_MAX_AGE_S` | `300` | How long a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
 | `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow-user`-approved users. |
 | `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
-| `CARBONVOICE_APPROVAL_COOLDOWN_S` | `1800` | Min seconds between owner-approval prompts (and sender "request sent" notices) for the same unknown user. The owner is re-prompted after this window in case the first ask was missed. |
+| `CARBONVOICE_APPROVAL_COOLDOWN_S` | `1800` | Min seconds between owner-approval prompts for the same unknown user. The owner is re-prompted after this window in case the first ask was missed. (The sender always gets a ⁉️ reaction on each message, independent of this.) |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 | `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |
+| `CARBONVOICE_PENDING_REACTION_ID` | `confused` | Reaction (⁉️) put on an unauthorized sender's message as a silent "pending approval" signal, instead of a text reply. |
 | `CARBONVOICE_DISABLE_ACK_REACTION` | `false` | Disable the visual ack reaction. |
 | `CARBONVOICE_DISABLE_MARK_READ` | `false` | Disable clearing the unread notification after the agent replies. |
 | `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Path to the audit log of rejected senders (one JSON line per rejection). |
