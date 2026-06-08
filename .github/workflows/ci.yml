@@ -547,6 +547,27 @@ jobs:
               'adapter must set channel_context defensively (cross-core compat)'
           print('adapter MessageEvent.channel_context: set defensively (compat)')
 
+          # Interactive allow-list: cooldown re-notify (A), sender feedback
+          # (B), and a deny that re-opens the add/remove cycle (#3).
+          #  - notified_at must use a None sentinel (NOT 0.0): time.monotonic()
+          #    can be < cooldown right after boot, so a 0.0 sentinel would
+          #    silence the very FIRST owner prompt. Regression guard.
+          assert "\"notified_at\": None" in adapter_src or \
+                 "'notified_at': None" in adapter_src, \
+              'first-prompt sentinel must be None, not 0.0 (boot-time edge)'
+          assert 'self._approval_cooldown_s' in adapter_src, \
+              'allow-list owner prompt must be rate-limited by a cooldown (A)'
+          #  - deny must POP the pending entry (re-open the cycle), never
+          #    setdefault it to a sentinel (which would silence re-requests #3).
+          assert '_pending_approval.pop(arg, None)' in adapter_src, \
+              'deny must clear the pending entry so the user can re-request (#3)'
+          assert '_pending_approval.setdefault(' not in adapter_src, \
+              'deny must not silence the user via setdefault — breaks re-add (#3)'
+          #  - sender gets a "request sent" notice (B).
+          assert 'sent to its' in adapter_src, \
+              'unauthorized sender must get a pending-request notice (B)'
+          print('adapter interactive allow-list: cooldown + feedback + repeatable deny')
+
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields
           # (tagged_user_ids resolves after a backend job, attachment

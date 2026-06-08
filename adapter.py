@@ -28,6 +28,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -182,16 +183,25 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         )
 
         # Interactive onboarding: the channel where the agent asks the owner
-        # to approve unknown senders, and a per-process map of pending users
-        # → the channel they first wrote in (so we ask once per user AND can
-        # resolve their display name from the right roster on approval).
-        # ``home_channel`` falls back to the legacy CARBONVOICE_HOME_CHANNEL
-        # env if not in ``extra``.
+        # to approve unknown senders. ``home_channel`` falls back to the
+        # legacy CARBONVOICE_HOME_CHANNEL env if not in ``extra``.
         self._home_channel: Optional[str] = (
             first_str(extra.get("home_channel"))
             or first_str(os.environ.get("CARBONVOICE_HOME_CHANNEL"))
         )
-        self._pending_approval: Dict[str, str] = {}
+        # Per-process record of unauthorized senders we've prompted about:
+        # ``user_id → {"channel": <where they wrote>, "notified_at": <monotonic>}``.
+        # Rate-limits the owner prompt (and the "request sent" reply to the
+        # sender) to once per cooldown, and remembers the channel so
+        # /cv-allow-user can resolve their name. /cv-deny-user CLEARS the
+        # entry (rather than silencing it) so a denied user can ask again
+        # and the owner is re-notified — the add/remove cycle stays open.
+        self._pending_approval: Dict[str, Dict[str, Any]] = {}
+        self._approval_cooldown_s: int = int(
+            extra.get("approval_notify_cooldown_s")
+            or os.environ.get("CARBONVOICE_APPROVAL_COOLDOWN_S")
+            or 1800  # 30 min
+        )
 
         # Per-thread reply anchors + parent-text cache + (eventually)
         # engagement / outbound tracking. See conversations.py and
@@ -1512,53 +1522,90 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     async def _maybe_notify_unauthorized(
         self, creator_id: str, channel_id: str
     ) -> None:
-        """Ask the owner (in the home channel) to approve an unknown sender.
+        """Ask the owner to approve an unknown sender + tell the sender.
 
-        Sent at most once per pending user per process. Requires a home
-        channel; without one we just log and the message stays denied (safe
-        default — no info leaks to the unknown sender, who gets no reply).
+        Rate-limited to once per ``approval_notify_cooldown_s`` per user, so
+        a persistent stranger doesn't spam the owner — but the owner IS
+        re-notified after the cooldown (a single prompt could be missed).
+        Also replies once-per-cooldown to the sender so they know their
+        request is pending instead of thinking the bot is dead. Always
+        records the channel they wrote in (for name resolution on approval).
         """
-        if not creator_id or creator_id in self._pending_approval:
+        if not creator_id:
             return
-        # Remember the channel they wrote in so /cv-allow-user can resolve
-        # their display name from that roster (they're a stranger in the
-        # home channel).
-        self._pending_approval[creator_id] = channel_id
-        if not self._home_channel or self._api is None:
+        now = time.monotonic()
+        entry = self._pending_approval.get(creator_id)
+        if entry is None:
+            # notified_at=None means "never prompted" — distinct from a real
+            # timestamp. (time.monotonic() can be small right after boot, so a
+            # 0.0 sentinel would silence the FIRST prompt if a stranger wrote
+            # within one cooldown of startup.)
+            entry = {"channel": channel_id, "notified_at": None}
+            self._pending_approval[creator_id] = entry
+        else:
+            # Keep the most recent channel for name resolution.
+            entry["channel"] = channel_id or entry.get("channel") or ""
+        # Cooldown gate: skip if we prompted recently (but always prompt the
+        # first time, when notified_at is None).
+        last = entry.get("notified_at")
+        if last is not None and now - float(last) < self._approval_cooldown_s:
+            return
+        entry["notified_at"] = now
+
+        # (A) prompt the owner in the home channel.
+        if self._api is not None and self._home_channel:
+            name = ""
+            if self._channels is not None:
+                try:
+                    name = await self._channels.resolve_name(channel_id, creator_id) or ""
+                except Exception:
+                    name = ""
+            who = f"{name} ({creator_id})" if name else creator_id
+            text = (
+                f"👤 {who} wants to talk to me but isn't authorized.\n"
+                f"To allow them, reply:  /cv-allow-user {creator_id}\n"
+                f"To block them, reply:  /cv-deny-user {creator_id}"
+            )
+            try:
+                await self.send(self._home_channel, text)
+                logger.info(
+                    "carbonvoice: asked owner to approve %s in home channel",
+                    creator_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: failed to notify owner about %s: %s",
+                    creator_id, exc,
+                )
+        elif self._api is not None:
             logger.info(
                 "carbonvoice: unauthorized sender %s — no CARBONVOICE_HOME_CHANNEL "
                 "configured, can't ask the owner to approve (set it to enable "
                 "interactive onboarding)",
                 creator_id,
             )
-            return
-        name = ""
-        if self._channels is not None:
+
+        # (B) let the sender know their request is pending (once per
+        # cooldown), so they don't think the bot is broken. Only when a home
+        # channel exists — i.e. interactive onboarding is actually on.
+        if self._api is not None and self._home_channel and channel_id:
             try:
-                name = await self._channels.resolve_name(channel_id, creator_id) or ""
-            except Exception:
-                name = ""
-        who = f"{name} ({creator_id})" if name else creator_id
-        text = (
-            f"👤 {who} wants to talk to me but isn't authorized.\n"
-            f"To allow them, reply:  /cv-allow-user {creator_id}\n"
-            f"To block them, reply:  /cv-deny-user {creator_id}"
-        )
-        try:
-            await self.send(self._home_channel, text)
-            logger.info(
-                "carbonvoice: asked owner to approve %s in home channel",
-                creator_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "carbonvoice: failed to notify owner about %s: %s",
-                creator_id, exc,
-            )
+                await self.send(
+                    channel_id,
+                    "🔒 Your request to talk to the assistant was sent to its "
+                    "admin for approval. You'll be able to chat once they "
+                    "approve you.",
+                )
+            except Exception as exc:
+                logger.debug(
+                    "carbonvoice: failed to send pending notice to %s: %s",
+                    creator_id, exc,
+                )
 
     async def _resolve_pending_name(self, user_id: str) -> str:
         """Display name of a pending user, from the channel they wrote in."""
-        origin = self._pending_approval.get(user_id)
+        entry = self._pending_approval.get(user_id) or {}
+        origin = entry.get("channel")
         if not origin or self._channels is None:
             return ""
         try:
@@ -1609,12 +1656,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 reply = "Usage: /cv-deny-user <user_guid>"
             else:
                 self._approvals.revoke(arg)  # drop if previously approved
-                # Keep them marked (mapped to their origin channel, or "") so
-                # we don't re-ask this session.
-                self._pending_approval.setdefault(arg, "")
+                # CLEAR the pending entry (don't silence it): if they write
+                # again the owner is re-notified, so the add/remove cycle
+                # stays open. The cooldown still rate-limits the next prompt.
+                self._pending_approval.pop(arg, None)
                 reply = (
-                    f"🚫 {arg} denied — won't be approved "
-                    "(revoked if previously allowed)."
+                    f"🚫 {arg} denied — removed from the allow-list. "
+                    "They can request access again later."
                 )
 
         if reply and self._api is not None:

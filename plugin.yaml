@@ -48,6 +48,10 @@ optional_env:
     description: "Deny-by-default (false). Set true to disable gating and let anyone talk to the bot (old open behavior)."
     prompt: "Allow ALL users? (true/false, default false)"
     password: false
+  - name: CARBONVOICE_APPROVAL_COOLDOWN_S
+    description: "Min seconds between owner-approval prompts (and the sender's 'request sent' notice) for the same unknown user (default: 1800). Owner is re-prompted after the window if the first ask was missed."
+    prompt: "Approval re-prompt cooldown (seconds)"
+    password: false
   - name: CARBONVOICE_HOME_CHANNEL
     description: "Carbon Voice channel_guid for cron/notifications AND where the bot asks the owner to approve unknown senders (/cv-allow-user)"
     prompt: "Home channel guid"
