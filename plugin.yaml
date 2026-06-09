@@ -108,3 +108,7 @@ optional_env:
     description: "Maximum size (MB) for inbound attachments the plugin will download and forward to the agent's multimodal pipeline. Images, PDFs, and text files under the cap are downloaded to ~/.hermes/{image,document}_cache and exposed via MessageEvent.media_urls so the agent can see/read them. Anything larger is logged as a WARNING and skipped (the text part of the message still reaches the agent). Default 10 MB."
     prompt: "Max inbound attachment size in MB"
     password: false
+  - name: CARBONVOICE_SEND_DEDUP_WINDOW_S
+    description: "Drop an identical outbound reply to the same channel within this many seconds (default: 90). Defends against the gateway re-sending the same response once per queued follow-up when delivery confirmation is lost (e.g. CV 502 mid-stream). Set 0 to disable."
+    prompt: "Outbound dedup window (seconds)"
+    password: false

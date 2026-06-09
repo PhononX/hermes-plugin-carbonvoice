@@ -140,6 +140,7 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
 | `CARBONVOICE_STUCK_MAX_AGE_S` | `300` | How long a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor. |
+| `CARBONVOICE_SEND_DEDUP_WINDOW_S` | `90` | Drop an identical outbound reply to the same channel within this window — defends against the gateway re-sending the same response per queued follow-up when delivery confirmation is lost (CV 502 mid-stream). `0` disables. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
 | `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow-user`-approved users. |
 | `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
