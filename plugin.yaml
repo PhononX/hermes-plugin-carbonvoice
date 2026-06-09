@@ -65,8 +65,16 @@ optional_env:
     prompt: "Ack reaction id"
     password: false
   - name: CARBONVOICE_PENDING_REACTION_ID
-    description: "Reaction id put on an UNAUTHORIZED sender's message as a silent 'pending approval' signal instead of a text reply (default: 'confused' ⁉️). Available ids are logged on startup."
+    description: "(Reserved, not used by default.) Reaction id for a 'pending approval' marker on an unauthorized sender's message (default: 'confused' ⁉️). Per-message reactions flooded the owner with notifications, so unauthorized messages are now dropped silently; kept for operators who wire it back in."
     prompt: "Pending-approval reaction id"
+    password: false
+  - name: CARBONVOICE_APPROVE_REACTION_ID
+    description: "Reaction the owner taps on a 'wants to talk' prompt to ALLOW that user — one-tap approval, no typed command (default: 'affirmative' 💯). Available ids are logged on startup."
+    prompt: "Owner approve reaction id"
+    password: false
+  - name: CARBONVOICE_REJECT_REACTION_ID
+    description: "Reaction the owner taps on a 'wants to talk' prompt to BLOCK that user (default: 'negative' 👎). Available ids are logged on startup."
+    prompt: "Owner reject reaction id"
     password: false
   - name: CARBONVOICE_STUCK_MAX_AGE_S
     description: "How long (seconds) a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor (default: 300)."

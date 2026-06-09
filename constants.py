@@ -39,3 +39,12 @@ DEFAULT_REACTION_ID = "acknowledged"
 # spams every old conversation when deny-by-default re-flags them. Override
 # with CARBONVOICE_PENDING_REACTION_ID.
 DEFAULT_PENDING_REACTION_ID = "confused"
+
+# One-tap owner approval: instead of copying "/cv-allow-user <id>", the owner
+# just reacts on the bot's "X wants to talk to me" prompt — 💯 to allow, 👎 to
+# block. Mirrors cv-claude-channels' reaction-based permission relay. These
+# are CV built-in reaction *ids* (the id is what counts; CV stores the
+# "negative" reaction with code ⛔ but clients render it as a thumbs-down 👎);
+# override via CARBONVOICE_APPROVE_REACTION_ID / CARBONVOICE_REJECT_REACTION_ID.
+DEFAULT_APPROVE_REACTION_ID = "affirmative"  # 💯
+DEFAULT_REJECT_REACTION_ID = "negative"      # 👎 (stored code ⛔)

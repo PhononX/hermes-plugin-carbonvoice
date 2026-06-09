@@ -659,30 +659,62 @@ jobs:
           assert now_utc().tzinfo is not None
           print('stuck-message cursor-pin guard + message_age_seconds: OK')
           #  - sender feedback (B) must be a REACTION, not a text reply.
-          #    A text reply to the channel spammed every old conversation
-          #    when deny-by-default re-flagged them; a ⁉️ reaction is silent.
-          #    Guard against the text reply ever coming back.
+          #    An unauthorized sender gets NO per-message feedback at all:
+          #    no text reply (it spammed old conversations under deny-by-
+          #    default) and no ⁉️ reaction (un-cooldowned, it buried the owner
+          #    in one CV notification per spam message). Mirrors
+          #    cv-claude-channels: drop silently; the only feedback is the
+          #    rate-limited owner prompt + a one-time "you've been added"
+          #    notice once approved.
           assert 'sent to its' not in adapter_src, \
-              'unauthorized-sender feedback must NOT be a channel text reply ' \
-              '(it spams old conversations) — use a reaction instead'
-          assert 'self._reactions.pending(' in adapter_src, \
-              'unauthorized sender must get a silent ⁉️ reaction, not a text reply (B)'
-          # ReactionService exposes a distinct pending reaction (default
-          # "confused"/⁉️) without clobbering the ack reaction.
+              'unauthorized-sender feedback must NOT be a channel text reply (spam)'
+          assert 'self._reactions.pending(' not in adapter_src, \
+              'must NOT react per-message to unauthorized senders ' \
+              '(un-cooldowned ⁉️ floods the owner with notifications)'
+          # On approval the now-allowed user is told once, in the channel they
+          # wrote in, that they can talk now.
+          assert "You've been added" in adapter_src, \
+              'an approved user must get a one-time "you can talk now" notice'
+          # The ReactionService still EXPOSES pending() (kept for operators who
+          # opt back in), it's just not wired into the unauthorized path.
           import importlib as _il
           _rx = _il.import_module('carbonvoice.reactions')
-          from carbonvoice.constants import DEFAULT_PENDING_REACTION_ID, DEFAULT_REACTION_ID
-          assert DEFAULT_PENDING_REACTION_ID == 'confused'
-          assert DEFAULT_PENDING_REACTION_ID != DEFAULT_REACTION_ID, \
-              'pending reaction must differ from the ack reaction'
-          class _FakeAPI:
-              def __init__(self): self.calls = []
-              async def react(self, rid, mid): self.calls.append((rid, mid))
-          _svc = _rx.ReactionService(_FakeAPI())
-          assert _svc.pending_reaction_id == 'confused'
-          assert _svc.reaction_id == DEFAULT_REACTION_ID  # ack unchanged
+          _svc = _rx.ReactionService(type('A', (), {'react': lambda *a, **k: None})())
           assert hasattr(_svc, 'pending') and callable(_svc.pending)
-          print('adapter interactive allow-list: cooldown + ⁉️ reaction feedback + repeatable deny')
+          print('adapter interactive allow-list: silent drop + owner prompt + approval notice')
+
+          # One-tap owner approval: the owner reacts 💯/⛔ on the bot's
+          # "X wants to talk" prompt instead of copying /cv-allow-user <id>
+          # (mirrors cv-claude-channels). The adapter must track prompt
+          # message_id → creator_id and resolve only the OWNER's reaction.
+          assert '_pending_prompts' in adapter_src, \
+              'adapter must map prompt message_id → creator_id for reaction approval'
+          assert '_check_pending_prompt_reactions' in adapter_src, \
+              'adapter must resolve owner 💯/⛔ reactions on pending prompts'
+          from carbonvoice.constants import (
+              DEFAULT_APPROVE_REACTION_ID, DEFAULT_REJECT_REACTION_ID,
+          )
+          assert DEFAULT_APPROVE_REACTION_ID == 'affirmative'  # 👍
+          assert DEFAULT_REJECT_REACTION_ID == 'negative'      # 👎
+          assert DEFAULT_APPROVE_REACTION_ID != DEFAULT_REJECT_REACTION_ID
+          # reactors_for: only counts the named reactions; needs a real uid.
+          from carbonvoice.parse import reactors_for
+          _pm = lambda rxns: {'reaction_summary': {'top_user_reactions': rxns}}
+          assert reactors_for(_pm([{'user_id': 'O', 'reaction_id': 'affirmative'}]),
+                              {'affirmative', 'negative'}) == {'O'}
+          assert reactors_for(_pm([{'user_id': 'O', 'reaction_id': 'affirmative'}]),
+                              {'negative'}) == set()
+          # a stranger reacting on their own prompt must not appear as the owner
+          assert 'O' not in reactors_for(
+              _pm([{'user_id': 'STRANGER', 'reaction_id': 'affirmative'}]),
+              {'affirmative'})
+          assert reactors_for(_pm([{'reaction_id': 'affirmative'}]), {'affirmative'}) == set()  # no uid
+          assert reactors_for({}, {'affirmative'}) == set()
+          # The owner-only check must gate on the owner id, never blanket-trust
+          # whoever reacted (else any reactor self-approves).
+          assert 'self._allowlist.owner_id' in adapter_src, \
+              'reaction approval must verify the reactor IS the owner'
+          print('adapter one-tap approval: owner 💯/⛔ on prompt → allow/deny — OK')
 
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields

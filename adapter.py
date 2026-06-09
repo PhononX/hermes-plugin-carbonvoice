@@ -30,6 +30,7 @@ import logging
 import mimetypes
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -55,8 +56,10 @@ from .permits import ApprovalStore, parse_admin_command
 from .channels import ChannelCache
 from .conversations import ConversationTracker
 from .constants import (
+    DEFAULT_APPROVE_REACTION_ID,
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_REJECT_REACTION_ID,
     DEFAULT_STUCK_MAX_AGE_S,
     DEFAULT_WS_RETRY_MAX_MS,
     MAX_MESSAGE_LENGTH,
@@ -74,6 +77,7 @@ from .parse import (
     message_age_seconds,
     now_iso,
     now_utc,
+    reactors_for,
 )
 # extract_transcript is also re-exported via parse for the parent-text path
 # (now handled by ConversationTracker, but the import here is kept so
@@ -89,6 +93,10 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     """Hermes ↔ Carbon Voice bridge over Socket.IO + REST polling fallback."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
+    # Cap on tracked one-tap approval prompts (prompt msg_id → creator_id).
+    # A flood of unknown senders can't grow this unbounded; oldest evict.
+    _MAX_PENDING_PROMPTS = 200
 
     # Carbon Voice has no in-place message edit API — a "reply" is always a
     # new message. Declaring this False (like Signal / Weixin / WeCom) tells
@@ -253,6 +261,22 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             extra.get("approval_notify_cooldown_s")
             or os.environ.get("CARBONVOICE_APPROVAL_COOLDOWN_S")
             or 1800  # 30 min
+        )
+        # One-tap owner approval: maps the bot's prompt message_id → the
+        # creator_id it asks about, so when the owner reacts 👍/👎 on that
+        # prompt we know who to approve/deny without them typing the id.
+        # Mirrors cv-claude-channels' pendingPermissionMessages. Bounded by
+        # _MAX_PENDING_PROMPTS so a flood of strangers can't grow it forever.
+        self._pending_prompts: "OrderedDict[str, str]" = OrderedDict()
+        self._approve_reaction_id: str = (
+            extra.get("approve_reaction_id")
+            or os.environ.get("CARBONVOICE_APPROVE_REACTION_ID")
+            or DEFAULT_APPROVE_REACTION_ID
+        )
+        self._reject_reaction_id: str = (
+            extra.get("reject_reaction_id")
+            or os.environ.get("CARBONVOICE_REJECT_REACTION_ID")
+            or DEFAULT_REJECT_REACTION_ID
         )
 
         # Per-thread reply anchors + parent-text cache + (eventually)
@@ -1079,6 +1103,14 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             logger.warning("carbonvoice: /v3/messages/recent failed: %s", exc)
             return  # don't advance cursor — retry same window next tick
 
+        # One-tap approval: resolve any owner 👍/👎 reactions on our pending
+        # prompts. Done first (and best-effort) so an approval lands even if
+        # the prompt isn't in this fetch window. Never blocks the main path.
+        try:
+            await self._check_pending_prompt_reactions(messages)
+        except Exception as exc:
+            logger.debug("carbonvoice: pending-prompt reaction check failed: %s", exc)
+
         messages.sort(key=lambda m: m.get("created_at") or "")
 
         # Track the first "stuck" message (transcript not ready yet —
@@ -1295,6 +1327,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._creator_id and creator_id and creator_id != self._creator_id:
             return False
 
+        # Dedup FIRST — before the allowlist gate. The same message_id can
+        # arrive twice nearly simultaneously (socket event + poll fetch); if
+        # the gate's unauthorized branch ran before this check, BOTH copies
+        # would log "dropped", react, and prompt before either marked seen —
+        # the observed double-drop-per-message burst from a spamming sender.
+        # Marking happens at each terminal branch below; checking up front
+        # makes a redundant copy a no-op. (Revisitable gate rejections are
+        # deliberately NOT marked, so they still get re-evaluated — see the
+        # mention-gate branch.)
+        if self._seen.is_seen(message_id):
+            return False
+
         # Allowlist gate — default is allow-all (see AllowlistGate docstring).
         # When the operator has configured a restriction, short-circuit
         # rejected senders here so we can log them with a resolved username
@@ -1322,10 +1366,6 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             # message is suppressed (SeenCache TTL is short, so even it
             # re-evaluates later if still unapproved).
             self._seen.mark(message_id)
-            return False
-
-        # Dedupe early so retries on still-transcribing messages don't multiply.
-        if self._seen.is_seen(message_id):
             return False
 
         # Two-phase transcript: empty means "not ready yet" (CV is still
@@ -1672,13 +1712,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not creator_id:
             return
 
-        # (B) Silent feedback to the sender: react ⁉️ on THIS message. Not
-        # cooldown-gated — every new message from a pending user gets the
-        # reaction, so they always see they were seen. Cheap + idempotent
-        # (re-reacting the same message is a no-op server-side).
-        if self._reactions is not None and message_id:
-            self._reactions.pending(message_id)
-
+        # No reaction on the sender's message. We used to react ⁉️ here, but
+        # it was NOT cooldown-gated — a spamming stranger got one reaction per
+        # message, which buried the owner in CV notifications. Mirroring
+        # cv-claude-channels: an unknown sender's messages are dropped
+        # silently; the only feedback is the owner prompt below (rate-limited)
+        # and a one-time "you've been added" message to the sender once the
+        # owner approves them (see _handle_admin_command's allow branch).
         now = time.monotonic()
         entry = self._pending_approval.get(creator_id)
         if entry is None:
@@ -1709,14 +1749,23 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             who = f"{name} ({creator_id})" if name else creator_id
             text = (
                 f"👤 {who} wants to talk to me but isn't authorized.\n"
-                f"To allow them, reply:  /cv-allow-user {creator_id}\n"
-                f"To block them, reply:  /cv-deny-user {creator_id}"
+                f"React 💯 to allow · 👎 to block — "
+                f"or reply /cv-allow-user {creator_id}"
             )
             try:
-                await self.send(self._home_channel, text)
+                result = await self.send(self._home_channel, text)
+                # Map the prompt message → the user it's about, so an owner
+                # 👍/👎 reaction on it resolves the decision without typing
+                # the id. (cv-claude-channels' pendingPermissionMessages.)
+                prompt_id = getattr(result, "message_id", None)
+                if prompt_id:
+                    self._pending_prompts[prompt_id] = creator_id
+                    while len(self._pending_prompts) > self._MAX_PENDING_PROMPTS:
+                        self._pending_prompts.popitem(last=False)
                 logger.info(
-                    "carbonvoice: asked owner to approve %s in home channel",
-                    creator_id,
+                    "carbonvoice: asked owner to approve %s in home channel "
+                    "(prompt=%s, react 💯/👎)",
+                    creator_id, prompt_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1730,6 +1779,77 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "interactive onboarding)",
                 creator_id,
             )
+
+    async def _check_pending_prompt_reactions(
+        self, polled: "list[Dict[str, Any]]"
+    ) -> None:
+        """Resolve owner 👍/👎 reactions on pending approval prompts.
+
+        For each tracked prompt (prompt msg_id → creator_id), read the
+        reactions on that prompt message and, if the OWNER reacted with the
+        approve or reject reaction, apply the decision — no typed command.
+        Mirrors cv-claude-channels' ``checkPendingPermissions``.
+
+        Prompts already in the polled batch are read from it (free); any
+        others are fetched by id (the owner's reaction won't necessarily
+        bring the bot's own prompt into ``fetch_recent``). Only the owner's
+        reaction counts — a stranger reacting 👍 on their own prompt must
+        not self-approve.
+        """
+        if not self._pending_prompts or self._api is None:
+            return
+        owner = self._allowlist.owner_id
+        if not owner:
+            return  # without a known owner, nobody can authorize via reaction
+        wanted = {self._approve_reaction_id, self._reject_reaction_id}
+
+        by_id = {
+            mid: m
+            for m in polled
+            if isinstance(m, dict) and (mid := extract_message_id(m))
+        }
+        # Snapshot keys — we mutate _pending_prompts as we resolve.
+        for prompt_id in list(self._pending_prompts.keys()):
+            creator_id = self._pending_prompts.get(prompt_id)
+            if not creator_id:
+                continue
+            msg = by_id.get(prompt_id)
+            if msg is None:
+                try:
+                    msg = await self._api.get_message_v5(prompt_id)
+                except Exception:
+                    msg = None
+            if not isinstance(msg, dict):
+                continue
+            reactors = reactors_for(msg, wanted)
+            if owner not in reactors:
+                continue
+            # Owner reacted. Approve takes precedence if both are present.
+            approvers = reactors_for(msg, {self._approve_reaction_id})
+            cmd = "allow" if owner in approvers else "deny"
+            self._pending_prompts.pop(prompt_id, None)
+            logger.info(
+                "carbonvoice: owner reacted %s on prompt %s → %s %s",
+                "💯" if cmd == "allow" else "👎", prompt_id, cmd, creator_id,
+            )
+            try:
+                await self._handle_admin_command(
+                    self._home_channel or "", (cmd, creator_id)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: failed to apply reaction verdict for %s: %s",
+                    creator_id, exc,
+                )
+
+    def _drop_pending_prompts_for(self, creator_id: str) -> None:
+        """Forget any pending approval prompts about *creator_id* (after a
+        decision via either reaction or command), so a stale reaction on an
+        old prompt can't re-trigger."""
+        for pid in [
+            p for p, c in self._pending_prompts.items() if c == creator_id
+        ]:
+            self._pending_prompts.pop(pid, None)
 
     async def _resolve_pending_name(self, user_id: str) -> str:
         """Display name of a pending user, from the channel they wrote in."""
@@ -1772,23 +1892,55 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 # (saved in _pending_approval) — they're a stranger in the
                 # home channel, so resolving there yields nothing.
                 name = await self._resolve_pending_name(arg)
+                # Grab their origin channel BEFORE popping the pending entry,
+                # so we can tell them (in the channel they wrote in) that
+                # they've been added.
+                origin = (self._pending_approval.get(arg) or {}).get("channel")
                 ok = self._approvals.approve(arg, name)
                 self._pending_approval.pop(arg, None)
+                self._drop_pending_prompts_for(arg)
                 reply = (
                     f"✅ Allowed {name or arg}. They can talk to me now."
                     if ok
                     else f"⚠️ Couldn't approve {arg} — allow-list store unavailable."
                 )
+                # Tell the now-approved user (once) in the channel they wrote
+                # in, so they know they can start talking. Best-effort.
+                if ok and origin and self._api is not None:
+                    # Greet them by first name when we resolved one; fall back
+                    # to a plain greeting so we never send a dangling "Hey !".
+                    greeting = (
+                        f"Hey {name.split()[0]}! " if name and name.split() else "Hey! "
+                    )
+                    try:
+                        await self.send(
+                            origin,
+                            f"✅ {greeting}You've been added to the allow-list — "
+                            "you can talk to me now. Go ahead!",
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "carbonvoice: failed to notify approved user %s: %s",
+                            arg, exc,
+                        )
 
         elif action == "deny":
             if not arg:
                 reply = "Usage: /cv-deny-user <user_guid>"
             else:
                 self._approvals.revoke(arg)  # drop if previously approved
-                # CLEAR the pending entry (don't silence it): if they write
-                # again the owner is re-notified, so the add/remove cycle
-                # stays open. The cooldown still rate-limits the next prompt.
-                self._pending_approval.pop(arg, None)
+                # Keep the pending entry but ARM its cooldown (notified_at=now)
+                # instead of deleting it. Deleting reset the cooldown, so a
+                # sender who spams messages got a NEW prompt within a second of
+                # being denied — an endless deny→message→prompt→deny loop. By
+                # arming the cooldown the add/remove cycle stays open (they can
+                # ask again after the cooldown) without instant re-prompting.
+                self._drop_pending_prompts_for(arg)
+                ent = self._pending_approval.get(arg)
+                if ent is None:
+                    ent = {"channel": "", "notified_at": None}
+                    self._pending_approval[arg] = ent
+                ent["notified_at"] = time.monotonic()
                 reply = (
                     f"🚫 {arg} denied — removed from the allow-list. "
                     "They can request access again later."

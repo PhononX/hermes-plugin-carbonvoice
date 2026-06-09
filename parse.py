@@ -231,6 +231,41 @@ def bot_has_reacted(
     return False
 
 
+def reactors_for(
+    msg: Dict[str, Any], reaction_ids: "set[str]"
+) -> "set[str]":
+    """Return the set of user_ids who reacted to *msg* with any id in
+    *reaction_ids*.
+
+    Reads the same ``reaction_summary.top_user_reactions`` shape as
+    :func:`bot_has_reacted`, but generalized: instead of asking "did THIS
+    user react with THIS id", it returns "who reacted with one of these
+    ids". Used for one-tap owner approval — the adapter checks whether the
+    owner is among the reactors with the approve/reject reaction on its
+    pending prompt. Returns an empty set on anything it can't parse.
+    """
+    out: "set[str]" = set()
+    if not reaction_ids:
+        return out
+    summary = msg.get("reaction_summary")
+    if not isinstance(summary, dict):
+        return out
+    entries = summary.get("top_user_reactions")
+    if not isinstance(entries, list):
+        return out
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        rid = first_str(e.get("reaction_id"), e.get("id"))
+        if rid in reaction_ids:
+            uid = first_str(
+                e.get("user_id"), e.get("user_guid"), e.get("creator_id")
+            )
+            if uid:
+                out.add(uid)
+    return out
+
+
 def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:
     """Map a Carbon Voice channel payload to Hermes ``chat_type``.
 

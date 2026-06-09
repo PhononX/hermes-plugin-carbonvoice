@@ -52,12 +52,13 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 **Interactive onboarding.** When an unauthorized user messages the bot, it asks **you** (the owner) in the home channel:
 
 > 👤 *Teammate Name (Abc123…) wants to talk to me but isn't authorized.*
-> *To allow them, reply:* `/cv-allow-user Abc123…`
-> *To block them, reply:* `/cv-deny-user Abc123…`
+> *React 💯 to allow · 👎 to block — or reply* `/cv-allow-user Abc123…`
 
-Reply `/cv-allow-user <user_guid>` and they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). Commands (owner-only, in the home channel): `/cv-allow-user <id>`, `/cv-deny-user <id>`, `/cv-list-allow-users`. (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
+**One-tap approval (recommended):** just **react 💯** on that prompt to allow them, or **👎** to block — no typing, no copying the user id. Only *your* (the owner's) reaction counts, so a stranger can't approve their own prompt. (Reaction ids default to the CV built-ins `affirmative` (💯) / `negative` (👎 — stored code ⛔); override with `CARBONVOICE_APPROVE_REACTION_ID` / `CARBONVOICE_REJECT_REACTION_ID`.)
 
-The unauthorized sender doesn't get a text reply (that would clutter the channel and, under deny-by-default, spam every old conversation). Instead the bot puts a silent **⁉️ reaction** on their message — "seen, pending approval". The reaction id defaults to the CV built-in `confused`; override with `CARBONVOICE_PENDING_REACTION_ID`. To avoid spamming you, the owner prompt is rate-limited to once per `CARBONVOICE_APPROVAL_COOLDOWN_S` (default 1800 s / 30 min) per user — but you ARE re-prompted after the cooldown, in case the first ask was missed. `/cv-deny-user` removes a user *and* clears their pending state, so denied users can request access again later (and you can freely remove/re-add anyone).
+Or use the text commands (owner-only, in the home channel), which still work as a fallback: `/cv-allow-user <id>`, `/cv-deny-user <id>`, `/cv-list-allow-users`. Either way they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
+
+The unauthorized sender's messages are **dropped silently** — no text reply, no reaction. (Per-message feedback would either clutter the channel or, as a reaction, flood the owner with one CV notification per message from a spamming stranger.) The only feedback is the **owner prompt** above, rate-limited to once per `CARBONVOICE_APPROVAL_COOLDOWN_S` (default 1800 s / 30 min) per user (you ARE re-prompted after the cooldown, in case the first ask was missed), plus a one-time **"you've been added — you can talk to me now"** message sent to the user (in the channel they wrote in) once you approve them. A denied user is dropped silently and can request access again after the cooldown — so you can freely remove/re-add anyone.
 
 To add people up front instead, set `CARBONVOICE_ALLOWED_USERS`:
 
@@ -144,11 +145,13 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
 | `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow-user`-approved users. |
 | `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
-| `CARBONVOICE_APPROVAL_COOLDOWN_S` | `1800` | Min seconds between owner-approval prompts for the same unknown user. The owner is re-prompted after this window in case the first ask was missed. (The sender always gets a ⁉️ reaction on each message, independent of this.) |
+| `CARBONVOICE_APPROVAL_COOLDOWN_S` | `1800` | Min seconds between owner-approval prompts for the same unknown user. The owner is re-prompted after this window in case the first ask was missed. Also gates how soon a denied user can trigger a fresh prompt. |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 | `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |
-| `CARBONVOICE_PENDING_REACTION_ID` | `confused` | Reaction (⁉️) put on an unauthorized sender's message as a silent "pending approval" signal, instead of a text reply. |
+| `CARBONVOICE_PENDING_REACTION_ID` | `confused` | _(Reserved.)_ Reaction id for a "pending approval" marker on an unauthorized sender's message. **Not used by default** — per-message reactions flooded the owner with notifications, so unauthorized messages are now dropped silently. Kept for operators who wire it back in. |
+| `CARBONVOICE_APPROVE_REACTION_ID` | `affirmative` | Reaction the **owner** taps (💯) on a "wants to talk" prompt to allow that user — one-tap approval, no typed command. |
+| `CARBONVOICE_REJECT_REACTION_ID` | `negative` | Reaction the **owner** taps (👎) on a "wants to talk" prompt to block that user. |
 | `CARBONVOICE_DISABLE_ACK_REACTION` | `false` | Disable the visual ack reaction. |
 | `CARBONVOICE_DISABLE_MARK_READ` | `false` | Disable clearing the unread notification after the agent replies. |
 | `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Path to the audit log of rejected senders (one JSON line per rejection). |
