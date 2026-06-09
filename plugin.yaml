@@ -1,7 +1,7 @@
 name: carbonvoice-platform
 label: Carbon Voice
 kind: platform
-version: 0.3.5
+version: 0.3.6
 description: >
   Carbon Voice gateway adapter for Hermes Agent.
   Connects via Socket.IO (primary) with REST polling fallback — no public
@@ -41,15 +41,19 @@ optional_env:
     prompt: "Allowed creator id (or empty)"
     password: false
   - name: CARBONVOICE_ALLOWED_USERS
-    description: "Comma-separated Carbon Voice user_guids allowed to trigger the bot (when set, only these users are accepted)"
-    prompt: "Allowed user_guids (comma-separated, blank to keep open)"
+    description: "Extra Carbon Voice user_guids allowed, beyond the auto-detected owner and users approved via /cv-allow-user. Access is deny-by-default."
+    prompt: "Extra allowed user_guids (comma-separated, optional)"
     password: false
   - name: CARBONVOICE_ALLOW_ALL_USERS
-    description: "Default true. Set to false (with empty ALLOWED_USERS) to explicitly close the bot to everyone"
-    prompt: "Allow all users? (true/false)"
+    description: "Deny-by-default (false). Set true to disable gating and let anyone talk to the bot (old open behavior)."
+    prompt: "Allow ALL users? (true/false, default false)"
+    password: false
+  - name: CARBONVOICE_APPROVAL_COOLDOWN_S
+    description: "Min seconds between owner-approval prompts (and the sender's 'request sent' notice) for the same unknown user (default: 1800). Owner is re-prompted after the window if the first ask was missed."
+    prompt: "Approval re-prompt cooldown (seconds)"
     password: false
   - name: CARBONVOICE_HOME_CHANNEL
-    description: "Default Carbon Voice channel_guid for cron/notification delivery"
+    description: "Carbon Voice channel_guid for cron/notifications AND where the bot asks the owner to approve unknown senders (/cv-allow-user)"
     prompt: "Home channel guid"
     password: false
   - name: CARBONVOICE_HOME_CHANNEL_NAME
@@ -59,6 +63,22 @@ optional_env:
   - name: CARBONVOICE_REACTION_ID
     description: "Reaction id used to acknowledge inbound messages (default: 'acknowledged'). Available ids are logged on startup."
     prompt: "Ack reaction id"
+    password: false
+  - name: CARBONVOICE_PENDING_REACTION_ID
+    description: "(Reserved, not used by default.) Reaction id for a 'pending approval' marker on an unauthorized sender's message (default: 'confused' ⁉️). Per-message reactions flooded the owner with notifications, so unauthorized messages are now dropped silently; kept for operators who wire it back in."
+    prompt: "Pending-approval reaction id"
+    password: false
+  - name: CARBONVOICE_APPROVE_REACTION_ID
+    description: "Reaction the owner taps on a 'wants to talk' prompt to ALLOW that user — one-tap approval, no typed command (default: 'affirmative' 💯). Available ids are logged on startup."
+    prompt: "Owner approve reaction id"
+    password: false
+  - name: CARBONVOICE_REJECT_REACTION_ID
+    description: "Reaction the owner taps on a 'wants to talk' prompt to BLOCK that user (default: 'negative' 👎). Available ids are logged on startup."
+    prompt: "Owner reject reaction id"
+    password: false
+  - name: CARBONVOICE_STUCK_MAX_AGE_S
+    description: "How long (seconds) a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor (default: 300)."
+    prompt: "Stuck-message max age (seconds)"
     password: false
   - name: CARBONVOICE_DISABLE_ACK_REACTION
     description: "Disable the visual ack reaction on inbound messages (default: false)"
@@ -95,4 +115,8 @@ optional_env:
   - name: CARBONVOICE_MAX_ATTACHMENT_MB
     description: "Maximum size (MB) for inbound attachments the plugin will download and forward to the agent's multimodal pipeline. Images, PDFs, and text files under the cap are downloaded to ~/.hermes/{image,document}_cache and exposed via MessageEvent.media_urls so the agent can see/read them. Anything larger is logged as a WARNING and skipped (the text part of the message still reaches the agent). Default 10 MB."
     prompt: "Max inbound attachment size in MB"
+    password: false
+  - name: CARBONVOICE_SEND_DEDUP_WINDOW_S
+    description: "Drop an identical outbound reply to the same channel within this many seconds (default: 90). Defends against the gateway re-sending the same response once per queued follow-up when delivery confirmation is lost (e.g. CV 502 mid-stream). Set 0 to disable."
+    prompt: "Outbound dedup window (seconds)"
     password: false

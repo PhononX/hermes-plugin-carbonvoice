@@ -65,7 +65,7 @@ jobs:
           sys.modules[pkg_name] = pkg
 
           # Modules that don't touch gateway.*
-          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
+          for name in ['constants', 'parse', 'dedupe', 'state', 'api', 'transport', 'permits', 'audit', 'reactions', 'channels', 'gate', 'conversations']:
               spec = importlib.util.spec_from_file_location(
                   f'{pkg_name}.{name}', ROOT / f'{name}.py'
               )
@@ -81,19 +81,49 @@ jobs:
 
           from carbonvoice.audit import AllowlistGate
           import os
-          # Default-allow semantics: unset env vars → allow anyone.
+          # DENY-BY-DEFAULT: unset env vars → nobody allowed (security fix).
           os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS', None)
           os.environ.pop('CARBONVOICE_ALLOWED_USERS', None)
-          assert AllowlistGate.from_env().is_allowed('anyone')
-          # Explicit close.
-          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'false'
-          assert not AllowlistGate.from_env().is_allowed('anyone')
+          _g = AllowlistGate.from_env()
+          assert _g.is_allowed('anyone') is False, 'deny-by-default'
+          assert _g.has_any_authorizer is False
+          # The owner (whoami.created_by, set at connect) is always allowed —
+          # this is what makes deny-by-default usable with zero config.
+          _g.set_owner('OWNER')
+          assert _g.is_owner('OWNER') and _g.is_allowed('OWNER')
+          assert _g.is_allowed('anyone') is False
+          assert _g.has_any_authorizer is True
+          # allow-all is now an explicit opt-IN escape hatch (was the default).
+          os.environ['CARBONVOICE_ALLOW_ALL_USERS'] = 'true'
+          assert AllowlistGate.from_env().is_allowed('anyone') is True
           os.environ.pop('CARBONVOICE_ALLOW_ALL_USERS')
-          # Allowed list overrides the default.
+          # Static env list still works alongside the owner.
           os.environ['CARBONVOICE_ALLOWED_USERS'] = 'abc'
-          g = AllowlistGate.from_env()
-          assert g.is_allowed('abc') and not g.is_allowed('xyz')
+          g = AllowlistGate.from_env(); g.set_owner('OWNER')
+          assert g.is_allowed('abc') and g.is_allowed('OWNER') and not g.is_allowed('xyz')
           os.environ.pop('CARBONVOICE_ALLOWED_USERS')
+
+          # Interactive allow-list: command parser + ApprovalStore degrades
+          # safely without Hermes core (no gateway.pairing in standalone CI).
+          from carbonvoice.permits import parse_admin_command, ApprovalStore
+          assert parse_admin_command('/cv-allow-user Fmx4') == ('allow', 'Fmx4')
+          assert parse_admin_command('  /CV-DENY-USER  ABC ') == ('deny', 'ABC')
+          assert parse_admin_command('/cv-list-allow-users') == ('list', None)
+          assert parse_admin_command('/cv-allow-user') == ('allow', None)  # missing arg → usage
+          assert parse_admin_command('hi /cv-allow-user X') is None        # not a command
+          assert parse_admin_command('/cv-nope X') is None
+          assert parse_admin_command('/cv-allow X') is None                # old short form gone
+          # list-allow-users must not be shadowed by allow-user
+          assert parse_admin_command('/cv-list-allow-users')[0] == 'list'
+          assert parse_admin_command(None) is None and parse_admin_command('') is None
+          _appr = ApprovalStore()
+          assert _appr.available is False
+          assert _appr.is_approved('x') is False and _appr.approve('x') is False
+          assert _appr.revoke('x') is False and _appr.list_approved() == []
+          # Gate consults the ApprovalStore for dynamic approvals.
+          ga = AllowlistGate.from_env(_appr); ga.set_owner('OWNER')
+          assert ga.is_allowed('OWNER') and not ga.is_allowed('x')
+          print('deny-by-default allow-list + interactive commands: OK')
 
           from carbonvoice.dedupe import SeenCache
           c = SeenCache(ttl_s=60)
@@ -357,6 +387,9 @@ jobs:
           class _GetClient:
               def __init__(self, resp): self._resp = resp
               async def get(self, url): return self._resp
+              # get_message_v5 now routes through _request_retrying →
+              # client.request(method, url); the mock must accept it.
+              async def request(self, method, url, **kw): return self._resp
           async def _env_test():
               a = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a._client = _GetClient(_EnvResp())
               out = await a.get_message_v5('m1')
@@ -365,6 +398,46 @@ jobs:
               assert await a2.get_message_v5('m2') == {'id': 'm2'}  # flat passthrough
           _asyncio.run(_env_test())
           print('get_message_v5 unwraps {message:…} envelope + flat passthrough — OK')
+
+          # Transient-5xx retry: CV returns 502s in bursts; latency-critical
+          # idempotent reads/reactions must retry with short backoff instead
+          # of stalling until the next poll tick. Sends must NOT retry (could
+          # duplicate a delivered message).
+          from carbonvoice.constants import (
+              TRANSIENT_RETRY_ATTEMPTS, TRANSIENT_STATUS,
+          )
+          assert TRANSIENT_RETRY_ATTEMPTS >= 1
+          assert 502 in TRANSIENT_STATUS and 503 in TRANSIENT_STATUS
+          class _R:
+              def __init__(self, s): self.status_code = s
+          class _SeqClient:
+              def __init__(self, seq): self.seq = list(seq); self.calls = 0
+              async def request(self, method, url, **kw):
+                  s = self.seq[min(self.calls, len(self.seq) - 1)]
+                  self.calls += 1
+                  return _R(s)
+          async def _retry_test():
+              a = CarbonVoiceAPI.__new__(CarbonVoiceAPI)
+              a._client = _SeqClient([502, 200])
+              r = await a._request_retrying('GET', '/x')
+              assert r.status_code == 200 and a._client.calls == 2, 'retry then succeed'
+              a._client = _SeqClient([200])
+              r = await a._request_retrying('GET', '/x')
+              assert a._client.calls == 1, 'success → no retry'
+              a._client = _SeqClient([404])
+              r = await a._request_retrying('GET', '/x')
+              assert r.status_code == 404 and a._client.calls == 1, '404 is not transient'
+              a._client = _SeqClient([502])
+              r = await a._request_retrying('GET', '/x')
+              assert r.status_code == 502 and a._client.calls == TRANSIENT_RETRY_ATTEMPTS + 1, \
+                  'exhausts retries on persistent 502'
+          _asyncio.run(_retry_test())
+          # send() must NOT route through the retrying helper (no dup sends).
+          import inspect as _insp
+          _send_src = _insp.getsource(CarbonVoiceAPI.send_text_v5)
+          assert '_request_retrying' not in _send_src, \
+              'send_text_v5 must NOT retry — a retried send can duplicate a message'
+          print('transient-5xx retry: reads/reactions retry, sends do not — OK')
 
           # PR 4 — thread-context cache on ConversationTracker:
           # TTL eviction (entries past ttl_s return None) + LRU eviction
@@ -517,6 +590,132 @@ jobs:
               'adapter must set channel_context defensively (cross-core compat)'
           print('adapter MessageEvent.channel_context: set defensively (compat)')
 
+          # Interactive allow-list: cooldown re-notify (A), sender feedback
+          # (B), and a deny that re-opens the add/remove cycle (#3).
+          #  - notified_at must use a None sentinel (NOT 0.0): time.monotonic()
+          #    can be < cooldown right after boot, so a 0.0 sentinel would
+          #    silence the very FIRST owner prompt. Regression guard.
+          assert "\"notified_at\": None" in adapter_src or \
+                 "'notified_at': None" in adapter_src, \
+              'first-prompt sentinel must be None, not 0.0 (boot-time edge)'
+          assert 'self._approval_cooldown_s' in adapter_src, \
+              'allow-list owner prompt must be rate-limited by a cooldown (A)'
+          #  - deny must POP the pending entry (re-open the cycle), never
+          #    setdefault it to a sentinel (which would silence re-requests #3).
+          assert '_pending_approval.pop(arg, None)' in adapter_src, \
+              'deny must clear the pending entry so the user can re-request (#3)'
+          assert '_pending_approval.setdefault(' not in adapter_src, \
+              'deny must not silence the user via setdefault — breaks re-add (#3)'
+
+          # Duplicate-response guard. The core re-sends the same "first
+          # response" once per queued follow-up when streaming delivery
+          # isn't confirmed (CV 502s make this common), so the user sees the
+          # same reply many times. Two defenses must stay in place:
+          #  (1) SUPPORTS_MESSAGE_EDITING=False — CV has no edit API; declaring
+          #      it stops the stream consumer assuming an editable bubble.
+          #  (2) an outbound send-dedup that drops an identical re-send to the
+          #      same channel within a short window (reports success so the
+          #      core stops retrying).
+          assert 'SUPPORTS_MESSAGE_EDITING = False' in adapter_src, \
+              'CV has no edit API — must declare SUPPORTS_MESSAGE_EDITING=False ' \
+              '(else the stream consumer re-sends on unconfirmed delivery)'
+          assert '_send_dedup_window_s' in adapter_src and '_last_sent' in adapter_src, \
+              'send() must dedup identical re-sends per channel (duplicate-response guard)'
+          assert 'hashlib.sha256(content' in adapter_src, \
+              'send-dedup must key on a hash of the exact outbound text'
+
+          # Fetch reentrancy guard. Every WS message:created/updated event
+          # fires on_tick → _fetch_missed_messages; a burst would otherwise
+          # run overlapping fetches over the same cursor window in parallel,
+          # multiplying re-processing (a key amplifier of the bursts). A lock
+          # must serialize fetches and coalesce overlapping ticks.
+          assert '_fetch_lock' in adapter_src, \
+              'message fetches must be serialized by a lock (no parallel re-fetch)'
+          assert '_fetch_lock.locked()' in adapter_src, \
+              'overlapping ticks must coalesce (skip if a fetch is in progress)'
+
+          # Stuck-message cursor pin guard. A message with no transcript is
+          # held (return None → cursor not advanced) ONLY while young; past
+          # CARBONVOICE_STUCK_MAX_AGE_S it must advance past, or one
+          # permanently-empty message (image-only / system / failed STT)
+          # pins the cursor and re-feeds the whole window every poll/restart
+          # — the "cadena de mensajes ya procesados" bug. The age check must
+          # gate the stuck return.
+          assert 'self._stuck_max_age_s' in adapter_src, \
+              'empty-transcript stuck-hold must be bounded by a max age, ' \
+              'or a permanently-empty message pins the cursor forever'
+          assert 'message_age_seconds(' in adapter_src, \
+              'adapter must compute message age to bound the stuck-hold'
+          # parse.message_age_seconds: ISO parsing incl. trailing Z + naive.
+          from carbonvoice.parse import message_age_seconds, now_utc
+          from datetime import datetime, timezone, timedelta
+          _now = datetime(2026, 6, 8, 16, 0, 0, tzinfo=timezone.utc)
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00Z'}, _now) == 60.0
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00+00:00'}, _now) == 60.0
+          assert message_age_seconds({'created_at': '2026-06-08T15:59:00'}, _now) == 60.0  # naive→UTC
+          assert message_age_seconds({'created_at': '2026-06-05T19:36:44.437Z'}, _now) > 5*60
+          assert message_age_seconds({'id': 'x'}, _now) is None          # no ts → safe retry
+          assert message_age_seconds({'created_at': 'garbage'}, _now) is None
+          assert now_utc().tzinfo is not None
+          print('stuck-message cursor-pin guard + message_age_seconds: OK')
+          #  - sender feedback (B) must be a REACTION, not a text reply.
+          #    An unauthorized sender gets NO per-message feedback at all:
+          #    no text reply (it spammed old conversations under deny-by-
+          #    default) and no ⁉️ reaction (un-cooldowned, it buried the owner
+          #    in one CV notification per spam message). Mirrors
+          #    cv-claude-channels: drop silently; the only feedback is the
+          #    rate-limited owner prompt + a one-time "you've been added"
+          #    notice once approved.
+          assert 'sent to its' not in adapter_src, \
+              'unauthorized-sender feedback must NOT be a channel text reply (spam)'
+          assert 'self._reactions.pending(' not in adapter_src, \
+              'must NOT react per-message to unauthorized senders ' \
+              '(un-cooldowned ⁉️ floods the owner with notifications)'
+          # On approval the now-allowed user is told once, in the channel they
+          # wrote in, that they can talk now.
+          assert "You've been added" in adapter_src, \
+              'an approved user must get a one-time "you can talk now" notice'
+          # The ReactionService still EXPOSES pending() (kept for operators who
+          # opt back in), it's just not wired into the unauthorized path.
+          import importlib as _il
+          _rx = _il.import_module('carbonvoice.reactions')
+          _svc = _rx.ReactionService(type('A', (), {'react': lambda *a, **k: None})())
+          assert hasattr(_svc, 'pending') and callable(_svc.pending)
+          print('adapter interactive allow-list: silent drop + owner prompt + approval notice')
+
+          # One-tap owner approval: the owner reacts 💯/⛔ on the bot's
+          # "X wants to talk" prompt instead of copying /cv-allow-user <id>
+          # (mirrors cv-claude-channels). The adapter must track prompt
+          # message_id → creator_id and resolve only the OWNER's reaction.
+          assert '_pending_prompts' in adapter_src, \
+              'adapter must map prompt message_id → creator_id for reaction approval'
+          assert '_check_pending_prompt_reactions' in adapter_src, \
+              'adapter must resolve owner 💯/⛔ reactions on pending prompts'
+          from carbonvoice.constants import (
+              DEFAULT_APPROVE_REACTION_ID, DEFAULT_REJECT_REACTION_ID,
+          )
+          assert DEFAULT_APPROVE_REACTION_ID == 'affirmative'  # 👍
+          assert DEFAULT_REJECT_REACTION_ID == 'negative'      # 👎
+          assert DEFAULT_APPROVE_REACTION_ID != DEFAULT_REJECT_REACTION_ID
+          # reactors_for: only counts the named reactions; needs a real uid.
+          from carbonvoice.parse import reactors_for
+          _pm = lambda rxns: {'reaction_summary': {'top_user_reactions': rxns}}
+          assert reactors_for(_pm([{'user_id': 'O', 'reaction_id': 'affirmative'}]),
+                              {'affirmative', 'negative'}) == {'O'}
+          assert reactors_for(_pm([{'user_id': 'O', 'reaction_id': 'affirmative'}]),
+                              {'negative'}) == set()
+          # a stranger reacting on their own prompt must not appear as the owner
+          assert 'O' not in reactors_for(
+              _pm([{'user_id': 'STRANGER', 'reaction_id': 'affirmative'}]),
+              {'affirmative'})
+          assert reactors_for(_pm([{'reaction_id': 'affirmative'}]), {'affirmative'}) == set()  # no uid
+          assert reactors_for({}, {'affirmative'}) == set()
+          # The owner-only check must gate on the owner id, never blanket-trust
+          # whoever reacted (else any reactor self-approves).
+          assert 'self._allowlist.owner_id' in adapter_src, \
+              'reaction approval must verify the reactor IS the owner'
+          print('adapter one-tap approval: owner 💯/⛔ on prompt → allow/deny — OK')
+
           # V5 source-of-truth migration — the socket / v3-poll push
           # payload is V2-shaped and trails the V5 GET on async fields
           # (tagged_user_ids resolves after a backend job, attachment
@@ -550,20 +749,34 @@ jobs:
               'gets a fresh evaluation (the original "voice memo with ' \
               'picker tag never reaches the bot" bug)'
           # Make sure no one accidentally re-introduces an unconditional
-          # ``seen.mark`` before the gate runs. Count occurrences: there
-          # should be exactly three ``self._seen.mark(message_id)`` calls —
+          # ``seen.mark`` before the *mention/process* gate runs. Count
+          # occurrences: there should be exactly six
+          # ``self._seen.mark(message_id)`` calls —
           # (a) the server-side reaction-dedup skip (already-acked message),
-          # (b) the rejected-but-stable path, (c) after the gate accepts —
-          # plus ``self._seen.is_seen(message_id)`` for the early dedup
-          # check. The reaction-dedup mark is conditional on the bot's ack,
-          # so it never touches a revisitable rejection (those carry no ack)
-          # and can't re-introduce the post-tag dedup bug.
-          assert adapter_src.count('self._seen.mark(message_id)') == 3, \
-              'adapter._process_message must mark seen in exactly three ' \
-              'places: (a) reaction-dedup skip (already acked), (b) a ' \
-              'non-revisitable rejection, (c) when the gate accepts. ' \
+          # (b) the owner allow-list command path (/cv-*), (c) the
+          # rejected-but-stable mention-gate path, (d) after the gate accepts,
+          # (e) the *aged-out stuck* path (a message still missing its
+          # transcript past CARBONVOICE_STUCK_MAX_AGE_S — image-only / system
+          # / failed STT — advanced past instead of pinning the cursor), and
+          # (f) the *unauthorized sender* path — mark the specific message
+          # we just reacted ⁉️ to, so the poll loop (worsened by 502 retries
+          # re-fetching the same window) doesn't re-evaluate the SAME
+          # unauthorized message every tick (the 2500×-"dropped unauthorized"
+          # burst). (f) is bounded + safe: it suppresses only THIS message,
+          # not the user — once approved, their NEW messages pass the gate;
+          # and the SeenCache TTL is short so even this one re-evaluates later
+          # if still unapproved. Plus ``self._seen.is_seen(message_id)`` for
+          # the early dedup check. None of these marks a message that should
+          # later reach the agent after a tag-resolution re-fire (the
+          # revisitable mention-gate rejection is deliberately NOT marked).
+          assert adapter_src.count('self._seen.mark(message_id)') == 6, \
+              'adapter._process_message must mark seen in exactly six ' \
+              'places: (a) reaction-dedup skip, (b) owner /cv-* command, ' \
+              '(c) a non-revisitable mention rejection, (d) when the gate ' \
+              'accepts, (e) the aged-out stuck path, (f) the unauthorized ' \
+              'sender path (suppress re-processing the same dropped message). ' \
               'Counting drift usually means someone added an unconditional ' \
-              'mark before the gate — that re-introduces the post-tag dedup bug.'
+              'mark before the mention gate — that re-introduces the post-tag dedup bug.'
           print('adapter revisitable-rejection dedup contract: wired')
 
           # Server-side reaction dedup: the adapter must skip a message the
@@ -590,15 +803,27 @@ jobs:
           assert 'first_stuck_idx' in adapter_src, \
               '_fetch_missed_messages must track the first stuck message ' \
               'and hold the cursor before it (stuck-message handling)'
-          # The not-ready-transcript branch must return None, not False —
-          # returning False would let the cursor advance past a message CV
-          # is still transcribing.
+          # The not-ready-transcript branch must hold the cursor (return
+          # None) for a YOUNG message — returning False there would let the
+          # cursor advance past a message CV is still transcribing — but it
+          # must return False once the message ages past the stuck cutoff, so
+          # a permanently-empty message can't pin the cursor (see the
+          # stuck-cursor-pin guard above). Locate the `if not transcript:`
+          # block and assert it contains BOTH an age-gated False and a
+          # trailing bare `return None` (the young/transient default).
           import re as _re
-          _m = _re.search(r'if not transcript:\s*\n\s*return (\w+)', adapter_src)
-          assert _m and _m.group(1) == 'None', \
-              'the empty-transcript branch of _process_message must ' \
-              f'return None (stuck), got {_m.group(1) if _m else "no match"}'
-          print('adapter stuck-message cursor-hold contract: wired')
+          _blk = _re.search(
+              r'if not transcript:\n(?P<body>(?:[ \t].*\n|\n)+)', adapter_src
+          )
+          assert _blk, 'could not locate the empty-transcript branch'
+          _body = _blk.group('body')
+          assert _re.search(r'\bself\._stuck_max_age_s\b', _body), \
+              'empty-transcript branch must consult the stuck max-age cutoff'
+          assert _re.search(r'\breturn False\b', _body), \
+              'aged-out stuck message must return False (advance the cursor)'
+          assert _re.search(r'\n[ \t]+return None\b', _body), \
+              'young stuck message must still return None (hold the cursor)'
+          print('adapter stuck-message cursor-hold contract: age-bounded, wired')
 
           # parse helpers must handle BOTH V5 and V2 shapes — V5 because
           # that's what the v5 GET returns post-enrichment, V2 because

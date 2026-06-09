@@ -25,8 +25,12 @@ processed on the next startup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
+import os
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -48,11 +52,15 @@ from gateway.session import SessionSource
 
 from .api import CarbonVoiceAPI
 from .audit import AllowlistGate, IgnoredSenderLog, default_ignored_log_path
+from .permits import ApprovalStore, parse_admin_command
 from .channels import ChannelCache
 from .conversations import ConversationTracker
 from .constants import (
+    DEFAULT_APPROVE_REACTION_ID,
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_REJECT_REACTION_ID,
+    DEFAULT_STUCK_MAX_AGE_S,
     DEFAULT_WS_RETRY_MAX_MS,
     MAX_MESSAGE_LENGTH,
 )
@@ -66,7 +74,10 @@ from .parse import (
     extract_message_id,
     extract_transcript,
     first_str,
+    message_age_seconds,
     now_iso,
+    now_utc,
+    reactors_for,
 )
 # extract_transcript is also re-exported via parse for the parent-text path
 # (now handled by ConversationTracker, but the import here is kept so
@@ -82,6 +93,20 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     """Hermes ↔ Carbon Voice bridge over Socket.IO + REST polling fallback."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
+    # Cap on tracked one-tap approval prompts (prompt msg_id → creator_id).
+    # A flood of unknown senders can't grow this unbounded; oldest evict.
+    _MAX_PENDING_PROMPTS = 200
+
+    # Carbon Voice has no in-place message edit API — a "reply" is always a
+    # new message. Declaring this False (like Signal / Weixin / WeCom) tells
+    # the core's stream consumer NOT to attempt progressive edits, so it uses
+    # the send-once path instead of editing a streamed bubble. Without it the
+    # consumer keeps an editable-message assumption that, when a send fails
+    # (e.g. CV returns 502), leaves "final delivery" unconfirmed and the core
+    # re-sends the same response once per queued follow-up — the observed
+    # "same message multiple times" duplication.
+    SUPPORTS_MESSAGE_EDITING = False
 
     # Voice-out integration with Hermes core's auto-TTS pipeline.
     #
@@ -147,6 +172,39 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         self._max_attachment_bytes: int = int(
             extra.get("max_attachment_mb") or 10
         ) * 1024 * 1024
+        # Stuck-message cutoff: a message with no transcript holds the cursor
+        # (gets retried) only while younger than this. Past it we assume the
+        # transcript will never arrive (image-only / system / failed STT) and
+        # advance past it, so a single permanently-empty message can't pin the
+        # cursor and re-feed the whole window on every poll/restart.
+        self._stuck_max_age_s: float = float(
+            extra.get("stuck_max_age_s")
+            or os.environ.get("CARBONVOICE_STUCK_MAX_AGE_S")
+            or DEFAULT_STUCK_MAX_AGE_S
+        )
+        # Outbound dedup: defense-in-depth against the core re-sending the
+        # same response once per queued follow-up when delivery confirmation
+        # is lost (e.g. CV 502 mid-stream). Keyed by channel → (text-hash,
+        # monotonic ts); a repeat of the SAME text to the SAME channel within
+        # the window is dropped. Independent of SUPPORTS_MESSAGE_EDITING, so
+        # it also covers cores/paths we don't control. Window is short so a
+        # user legitimately repeating themselves isn't blocked for long.
+        self._send_dedup_window_s: float = float(
+            extra.get("send_dedup_window_s")
+            or os.environ.get("CARBONVOICE_SEND_DEDUP_WINDOW_S")
+            or 90
+        )
+        self._last_sent: Dict[str, "tuple[str, float]"] = {}
+        # Serialize message fetches. Every WS ``message:created`` /
+        # ``message:updated`` event (and each reconnect) fires on_tick →
+        # _fetch_missed_messages. A burst of events would otherwise run many
+        # overlapping fetches over the SAME cursor window in parallel, each
+        # re-processing the same messages — a key amplifier of the
+        # duplicate-processing bursts. The lock makes fetches mutually
+        # exclusive; _fetch_missed_messages skips (coalesces) if one is
+        # already running, since the in-flight fetch already covers the
+        # latest window.
+        self._fetch_lock = asyncio.Lock()
 
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
@@ -164,16 +222,61 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 self._api,
                 reaction_id=extra.get("reaction_id"),
                 enabled=not bool(extra.get("disable_ack_reaction")),
+                pending_reaction_id=(
+                    extra.get("pending_reaction_id")
+                    or os.environ.get("CARBONVOICE_PENDING_REACTION_ID")
+                    or None
+                ),
             )
             if self._api
             else None
         )
-        self._allowlist = AllowlistGate.from_env()
+        # Dynamic allow-list (Hermes core's PairingStore) + deny-by-default
+        # gate. The owner is filled in at connect() from whoami.created_by.
+        self._approvals = ApprovalStore()
+        self._allowlist = AllowlistGate.from_env(self._approvals)
         self._gate = MentionGate.from_env()
         self._ignored_log = (
             IgnoredSenderLog(ignored_log_path, self._channels)
             if self._channels
             else None
+        )
+
+        # Interactive onboarding: the channel where the agent asks the owner
+        # to approve unknown senders. ``home_channel`` falls back to the
+        # legacy CARBONVOICE_HOME_CHANNEL env if not in ``extra``.
+        self._home_channel: Optional[str] = (
+            first_str(extra.get("home_channel"))
+            or first_str(os.environ.get("CARBONVOICE_HOME_CHANNEL"))
+        )
+        # Per-process record of unauthorized senders we've prompted about:
+        # ``user_id → {"channel": <where they wrote>, "notified_at": <monotonic>}``.
+        # Rate-limits the owner prompt (and the "request sent" reply to the
+        # sender) to once per cooldown, and remembers the channel so
+        # /cv-allow-user can resolve their name. /cv-deny-user CLEARS the
+        # entry (rather than silencing it) so a denied user can ask again
+        # and the owner is re-notified — the add/remove cycle stays open.
+        self._pending_approval: Dict[str, Dict[str, Any]] = {}
+        self._approval_cooldown_s: int = int(
+            extra.get("approval_notify_cooldown_s")
+            or os.environ.get("CARBONVOICE_APPROVAL_COOLDOWN_S")
+            or 1800  # 30 min
+        )
+        # One-tap owner approval: maps the bot's prompt message_id → the
+        # creator_id it asks about, so when the owner reacts 👍/👎 on that
+        # prompt we know who to approve/deny without them typing the id.
+        # Mirrors cv-claude-channels' pendingPermissionMessages. Bounded by
+        # _MAX_PENDING_PROMPTS so a flood of strangers can't grow it forever.
+        self._pending_prompts: "OrderedDict[str, str]" = OrderedDict()
+        self._approve_reaction_id: str = (
+            extra.get("approve_reaction_id")
+            or os.environ.get("CARBONVOICE_APPROVE_REACTION_ID")
+            or DEFAULT_APPROVE_REACTION_ID
+        )
+        self._reject_reaction_id: str = (
+            extra.get("reject_reaction_id")
+            or os.environ.get("CARBONVOICE_REJECT_REACTION_ID")
+            or DEFAULT_REJECT_REACTION_ID
         )
 
         # Per-thread reply anchors + parent-text cache + (eventually)
@@ -191,7 +294,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         await self._api.open()
 
         try:
-            self._self_user_id = await self._api.whoami()
+            self._self_user_id, owner_id = await self._api.whoami()
         except Exception as exc:
             logger.error("carbonvoice: /whoami failed: %s", exc)
             await self._api.close()
@@ -200,6 +303,35 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             logger.error("carbonvoice: /whoami returned no user id")
             await self._api.close()
             return False
+
+        # Deny-by-default: the bot's creator (whoami.created_by) is the
+        # owner — always authorized, and the seed from which they approve
+        # everyone else via /cv-allow. Auto-detected so the security
+        # default needs no manual setup.
+        self._allowlist.set_owner(owner_id)
+        if owner_id:
+            logger.info("carbonvoice: owner is %s (auto-detected from created_by)", owner_id)
+            # Mirror the owner into the dynamic allow-list (PairingStore).
+            # Hermes core's own authorization checks the pairing store for
+            # every platform but doesn't know about `created_by`, so without
+            # this the owner could pass the plugin gate yet be blocked by
+            # core. Idempotent.
+            if self._approvals.approve(owner_id, "owner"):
+                logger.info("carbonvoice: owner mirrored into pairing store")
+            else:
+                logger.warning(
+                    "carbonvoice: could NOT mirror owner into pairing store "
+                    "(PairingStore available=%s) — core may block the owner",
+                    self._approvals.available,
+                )
+        if not self._allowlist.has_any_authorizer:
+            logger.warning(
+                "carbonvoice: deny-by-default is active but NO authorized "
+                "users — whoami returned no owner and CARBONVOICE_ALLOWED_USERS "
+                "is empty. The bot will ignore everyone. Set "
+                "CARBONVOICE_ALLOWED_USERS to your user_guid, or "
+                "CARBONVOICE_ALLOW_ALL_USERS=true to disable gating."
+            )
 
         if self._reactions is not None:
             await self._reactions.discover()
@@ -241,6 +373,30 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
 
+        # Outbound dedup: drop an identical re-send to the same channel inside
+        # the dedup window. The core re-sends the same "first response" once
+        # per queued follow-up when streaming delivery wasn't confirmed (CV
+        # 502s make this common); without this guard the user sees the same
+        # reply many times. We report success (not failure) so the core
+        # treats it as delivered and stops retrying. Keyed by an order-stable
+        # hash of the exact text.
+        dedup_key = chat_id or ""
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if dedup_key:
+            prev = self._last_sent.get(dedup_key)
+            now_m = time.monotonic()
+            if (
+                prev is not None
+                and prev[0] == content_hash
+                and now_m - prev[1] < self._send_dedup_window_s
+            ):
+                logger.info(
+                    "carbonvoice: suppressed duplicate send to %s "
+                    "(same text within %.0fs dedup window)",
+                    dedup_key, self._send_dedup_window_s,
+                )
+                return SendResult(success=True, message_id=None)
+
         # v5 transport: the resolved thread root is sent to the server as
         # ``reply_to_message_id`` (cv-api PR #277 renamed the old
         # ``thread_id`` input). The server resolves threading itself —
@@ -264,6 +420,11 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 reply_to_message_id=thread_id,
             )
             msg_id = first_str(data.get("id"), data.get("message_id"))
+            # Record for outbound dedup only on a real, successful send — a
+            # failed send must NOT prime the dedup (else a legit retry of a
+            # genuinely-undelivered message would be suppressed).
+            if dedup_key:
+                self._last_sent[dedup_key] = (content_hash, time.monotonic())
             return SendResult(success=True, message_id=msg_id, raw_response=data)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
@@ -916,6 +1077,17 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._api is None:
             return
 
+        # Coalesce overlapping ticks: if a fetch is already running, skip —
+        # it already covers the latest cursor window. Prevents a burst of WS
+        # events from spawning parallel fetches that re-process the same
+        # messages (a key amplifier of the duplicate-processing bursts).
+        if self._fetch_lock.locked():
+            logger.debug("carbonvoice: fetch already in progress — skipping tick")
+            return
+        async with self._fetch_lock:
+            await self._fetch_missed_messages_locked()
+
+    async def _fetch_missed_messages_locked(self) -> None:
         request_started_at = now_iso()
 
         if not self._cursor.last_seen_at:
@@ -930,6 +1102,14 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("carbonvoice: /v3/messages/recent failed: %s", exc)
             return  # don't advance cursor — retry same window next tick
+
+        # One-tap approval: resolve any owner 👍/👎 reactions on our pending
+        # prompts. Done first (and best-effort) so an approval lands even if
+        # the prompt isn't in this fetch window. Never blocks the main path.
+        try:
+            await self._check_pending_prompt_reactions(messages)
+        except Exception as exc:
+            logger.debug("carbonvoice: pending-prompt reaction check failed: %s", exc)
 
         messages.sort(key=lambda m: m.get("created_at") or "")
 
@@ -1147,6 +1327,18 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._creator_id and creator_id and creator_id != self._creator_id:
             return False
 
+        # Dedup FIRST — before the allowlist gate. The same message_id can
+        # arrive twice nearly simultaneously (socket event + poll fetch); if
+        # the gate's unauthorized branch ran before this check, BOTH copies
+        # would log "dropped", react, and prompt before either marked seen —
+        # the observed double-drop-per-message burst from a spamming sender.
+        # Marking happens at each terminal branch below; checking up front
+        # makes a redundant copy a no-op. (Revisitable gate rejections are
+        # deliberately NOT marked, so they still get re-evaluated — see the
+        # mention-gate branch.)
+        if self._seen.is_seen(message_id):
+            return False
+
         # Allowlist gate — default is allow-all (see AllowlistGate docstring).
         # When the operator has configured a restriction, short-circuit
         # rejected senders here so we can log them with a resolved username
@@ -1156,20 +1348,49 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: dropped message from unauthorized sender %s",
                 creator_id,
             )
+            # Deny-by-default onboarding: react ⁉️ on the sender's message
+            # (silent "pending approval") and ask the owner in the home
+            # channel to approve them (rate-limited per pending user).
+            await self._maybe_notify_unauthorized(
+                creator_id, channel_id, message_id
+            )
             if self._ignored_log is not None and creator_id:
                 self._ignored_log.record(creator_id, channel_id)
-            return False
-
-        # Dedupe early so retries on still-transcribing messages don't multiply.
-        if self._seen.is_seen(message_id):
+            # Mark THIS message seen so the poll loop doesn't re-process the
+            # exact same unauthorized message every tick. Without this, a
+            # not-yet-approved sender's message is re-evaluated on every poll
+            # (worsened by 502 retries re-fetching the same window) — the
+            # observed 2500×-"dropped unauthorized" burst. This does NOT lock
+            # the *user* out: once the owner approves them, their NEW messages
+            # pass the gate normally; only this specific already-reacted
+            # message is suppressed (SeenCache TTL is short, so even it
+            # re-evaluates later if still unapproved).
+            self._seen.mark(message_id)
             return False
 
         # Two-phase transcript: empty means "not ready yet" (CV is still
         # transcribing). Return None — the *stuck* signal — so the poll
         # loop holds the cursor just before this message and retries it
         # next tick, rather than advancing past it. Don't mark seen.
+        #
+        # BUT only while the message is young. A message with no transcript
+        # is "stuck" only transiently; some never get one (image-only,
+        # system events, failed STT). If we held the cursor for those
+        # forever, every poll/restart would re-fetch the whole window from
+        # the pinned timestamp and re-feed already-processed messages — the
+        # "cadena de mensajes" bug. Past CARBONVOICE_STUCK_MAX_AGE_S we stop
+        # waiting and let it advance the cursor (return False, not None).
         transcript = extract_transcript(msg)
         if not transcript:
+            age = message_age_seconds(msg, now_utc())
+            if age is not None and age > self._stuck_max_age_s:
+                logger.info(
+                    "carbonvoice: message %s has no transcript after %.0fs "
+                    "(> %ss) — treating as permanently empty, advancing past it",
+                    message_id, age, self._stuck_max_age_s,
+                )
+                self._seen.mark(message_id)
+                return False
             return None
 
         # V5 source-of-truth enrichment. The socket / v3-poll push gives
@@ -1233,6 +1454,30 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             )
             self._seen.mark(message_id)
             return False
+
+        # Admin allow-list commands (/cv-allow, /cv-deny, /cv-list). Only the
+        # OWNER may run these — a normally-approved user must not be able to
+        # escalate by approving others. Handled here and NOT forwarded to the
+        # agent.
+        if self._allowlist.is_owner(creator_id):
+            cmd = parse_admin_command(transcript)
+            if cmd is not None:
+                # Dedup BEFORE running the command. The command sends a reply
+                # ("✅ Allowed …") which bumps updated_at and re-fires the
+                # poll; if the durable ack isn't on the server yet (or the
+                # SeenCache was lost to a restart), the re-fetched command
+                # re-runs and re-replies — the observed 298×-spam bug. So we
+                # (1) mark the in-memory SeenCache and (2) put the durable
+                # server-side ack reaction *and wait for it* — BEFORE sending
+                # the reply. ``ack_sync`` blocks until the marker is on the
+                # server, so the re-fetch is guaranteed deduped by the
+                # ``bot_has_reacted`` check above. ``approve``/``revoke`` are
+                # idempotent too, so a stale in-flight copy is a harmless no-op.
+                self._seen.mark(message_id)
+                if self._reactions is not None:
+                    await self._reactions.ack_sync(message_id)
+                await self._handle_admin_command(channel_id, cmd)
+                return False
 
         # Resolve chat_type before the mention gate so the gate can short-
         # circuit group messages without spinning up the rest of the
@@ -1444,6 +1689,268 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # the poll/WS loop while the agent thinks.
         asyncio.create_task(self._dispatch(event))
         return True
+
+    # ── Interactive allow-list (deny-by-default onboarding) ──────────────
+
+    async def _maybe_notify_unauthorized(
+        self, creator_id: str, channel_id: str, message_id: str = ""
+    ) -> None:
+        """React to an unknown sender's message + ask the owner to approve.
+
+        The sender gets a silent "pending approval" reaction (⁉️) on their
+        message — NOT a text reply. A text reply clutters the channel and,
+        worse, spammed every old conversation when we switched to
+        deny-by-default (each re-flagged sender got a wall message). A
+        reaction is unobtrusive and self-evidently "seen but not answered".
+
+        The owner prompt (in the home channel) is rate-limited to once per
+        ``approval_notify_cooldown_s`` per user so a persistent stranger
+        doesn't spam the owner — but the owner IS re-notified after the
+        cooldown (a single prompt could be missed). Always records the
+        channel they wrote in (for name resolution on approval).
+        """
+        if not creator_id:
+            return
+
+        # No reaction on the sender's message. We used to react ⁉️ here, but
+        # it was NOT cooldown-gated — a spamming stranger got one reaction per
+        # message, which buried the owner in CV notifications. Mirroring
+        # cv-claude-channels: an unknown sender's messages are dropped
+        # silently; the only feedback is the owner prompt below (rate-limited)
+        # and a one-time "you've been added" message to the sender once the
+        # owner approves them (see _handle_admin_command's allow branch).
+        now = time.monotonic()
+        entry = self._pending_approval.get(creator_id)
+        if entry is None:
+            # notified_at=None means "never prompted" — distinct from a real
+            # timestamp. (time.monotonic() can be small right after boot, so a
+            # 0.0 sentinel would silence the FIRST prompt if a stranger wrote
+            # within one cooldown of startup.)
+            entry = {"channel": channel_id, "notified_at": None}
+            self._pending_approval[creator_id] = entry
+        else:
+            # Keep the most recent channel for name resolution.
+            entry["channel"] = channel_id or entry.get("channel") or ""
+        # Cooldown gate: skip if we prompted recently (but always prompt the
+        # first time, when notified_at is None).
+        last = entry.get("notified_at")
+        if last is not None and now - float(last) < self._approval_cooldown_s:
+            return
+        entry["notified_at"] = now
+
+        # (A) prompt the owner in the home channel.
+        if self._api is not None and self._home_channel:
+            name = ""
+            if self._channels is not None:
+                try:
+                    name = await self._channels.resolve_name(channel_id, creator_id) or ""
+                except Exception:
+                    name = ""
+            who = f"{name} ({creator_id})" if name else creator_id
+            text = (
+                f"👤 {who} wants to talk to me but isn't authorized.\n"
+                f"React 💯 to allow · 👎 to block — "
+                f"or reply /cv-allow-user {creator_id}"
+            )
+            try:
+                result = await self.send(self._home_channel, text)
+                # Map the prompt message → the user it's about, so an owner
+                # 👍/👎 reaction on it resolves the decision without typing
+                # the id. (cv-claude-channels' pendingPermissionMessages.)
+                prompt_id = getattr(result, "message_id", None)
+                if prompt_id:
+                    self._pending_prompts[prompt_id] = creator_id
+                    while len(self._pending_prompts) > self._MAX_PENDING_PROMPTS:
+                        self._pending_prompts.popitem(last=False)
+                logger.info(
+                    "carbonvoice: asked owner to approve %s in home channel "
+                    "(prompt=%s, react 💯/👎)",
+                    creator_id, prompt_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: failed to notify owner about %s: %s",
+                    creator_id, exc,
+                )
+        elif self._api is not None:
+            logger.info(
+                "carbonvoice: unauthorized sender %s — no CARBONVOICE_HOME_CHANNEL "
+                "configured, can't ask the owner to approve (set it to enable "
+                "interactive onboarding)",
+                creator_id,
+            )
+
+    async def _check_pending_prompt_reactions(
+        self, polled: "list[Dict[str, Any]]"
+    ) -> None:
+        """Resolve owner 👍/👎 reactions on pending approval prompts.
+
+        For each tracked prompt (prompt msg_id → creator_id), read the
+        reactions on that prompt message and, if the OWNER reacted with the
+        approve or reject reaction, apply the decision — no typed command.
+        Mirrors cv-claude-channels' ``checkPendingPermissions``.
+
+        Prompts already in the polled batch are read from it (free); any
+        others are fetched by id (the owner's reaction won't necessarily
+        bring the bot's own prompt into ``fetch_recent``). Only the owner's
+        reaction counts — a stranger reacting 👍 on their own prompt must
+        not self-approve.
+        """
+        if not self._pending_prompts or self._api is None:
+            return
+        owner = self._allowlist.owner_id
+        if not owner:
+            return  # without a known owner, nobody can authorize via reaction
+        wanted = {self._approve_reaction_id, self._reject_reaction_id}
+
+        by_id = {
+            mid: m
+            for m in polled
+            if isinstance(m, dict) and (mid := extract_message_id(m))
+        }
+        # Snapshot keys — we mutate _pending_prompts as we resolve.
+        for prompt_id in list(self._pending_prompts.keys()):
+            creator_id = self._pending_prompts.get(prompt_id)
+            if not creator_id:
+                continue
+            msg = by_id.get(prompt_id)
+            if msg is None:
+                try:
+                    msg = await self._api.get_message_v5(prompt_id)
+                except Exception:
+                    msg = None
+            if not isinstance(msg, dict):
+                continue
+            reactors = reactors_for(msg, wanted)
+            if owner not in reactors:
+                continue
+            # Owner reacted. Approve takes precedence if both are present.
+            approvers = reactors_for(msg, {self._approve_reaction_id})
+            cmd = "allow" if owner in approvers else "deny"
+            self._pending_prompts.pop(prompt_id, None)
+            logger.info(
+                "carbonvoice: owner reacted %s on prompt %s → %s %s",
+                "💯" if cmd == "allow" else "👎", prompt_id, cmd, creator_id,
+            )
+            try:
+                await self._handle_admin_command(
+                    self._home_channel or "", (cmd, creator_id)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: failed to apply reaction verdict for %s: %s",
+                    creator_id, exc,
+                )
+
+    def _drop_pending_prompts_for(self, creator_id: str) -> None:
+        """Forget any pending approval prompts about *creator_id* (after a
+        decision via either reaction or command), so a stale reaction on an
+        old prompt can't re-trigger."""
+        for pid in [
+            p for p, c in self._pending_prompts.items() if c == creator_id
+        ]:
+            self._pending_prompts.pop(pid, None)
+
+    async def _resolve_pending_name(self, user_id: str) -> str:
+        """Display name of a pending user, from the channel they wrote in."""
+        entry = self._pending_approval.get(user_id) or {}
+        origin = entry.get("channel")
+        if not origin or self._channels is None:
+            return ""
+        try:
+            return await self._channels.resolve_name(origin, user_id) or ""
+        except Exception:
+            return ""
+
+    async def _handle_admin_command(
+        self, channel_id: str, cmd: "tuple[str, Optional[str]]"
+    ) -> None:
+        """Run an owner allow-list command and reply in *channel_id*."""
+        action, arg = cmd
+        reply: Optional[str] = None
+
+        if action == "list":
+            rows = self._approvals.list_approved()
+            if not rows:
+                reply = (
+                    "No allowed users yet. "
+                    "(The owner and CARBONVOICE_ALLOWED_USERS still apply.)"
+                )
+            else:
+                lines = []
+                for r in rows:
+                    uid = r.get("user_id") or ""
+                    nm = r.get("user_name") or ""
+                    lines.append(f"• {nm} ({uid})" if nm else f"• {uid}")
+                reply = "Allowed users:\n" + "\n".join(lines)
+
+        elif action == "allow":
+            if not arg:
+                reply = "Usage: /cv-allow-user <user_guid>"
+            else:
+                # Resolve the name from the channel they originally wrote in
+                # (saved in _pending_approval) — they're a stranger in the
+                # home channel, so resolving there yields nothing.
+                name = await self._resolve_pending_name(arg)
+                # Grab their origin channel BEFORE popping the pending entry,
+                # so we can tell them (in the channel they wrote in) that
+                # they've been added.
+                origin = (self._pending_approval.get(arg) or {}).get("channel")
+                ok = self._approvals.approve(arg, name)
+                self._pending_approval.pop(arg, None)
+                self._drop_pending_prompts_for(arg)
+                reply = (
+                    f"✅ Allowed {name or arg}. They can talk to me now."
+                    if ok
+                    else f"⚠️ Couldn't approve {arg} — allow-list store unavailable."
+                )
+                # Tell the now-approved user (once) in the channel they wrote
+                # in, so they know they can start talking. Best-effort.
+                if ok and origin and self._api is not None:
+                    # Greet them by first name when we resolved one; fall back
+                    # to a plain greeting so we never send a dangling "Hey !".
+                    greeting = (
+                        f"Hey {name.split()[0]}! " if name and name.split() else "Hey! "
+                    )
+                    try:
+                        await self.send(
+                            origin,
+                            f"✅ {greeting}You've been added to the allow-list — "
+                            "you can talk to me now. Go ahead!",
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "carbonvoice: failed to notify approved user %s: %s",
+                            arg, exc,
+                        )
+
+        elif action == "deny":
+            if not arg:
+                reply = "Usage: /cv-deny-user <user_guid>"
+            else:
+                self._approvals.revoke(arg)  # drop if previously approved
+                # Keep the pending entry but ARM its cooldown (notified_at=now)
+                # instead of deleting it. Deleting reset the cooldown, so a
+                # sender who spams messages got a NEW prompt within a second of
+                # being denied — an endless deny→message→prompt→deny loop. By
+                # arming the cooldown the add/remove cycle stays open (they can
+                # ask again after the cooldown) without instant re-prompting.
+                self._drop_pending_prompts_for(arg)
+                ent = self._pending_approval.get(arg)
+                if ent is None:
+                    ent = {"channel": "", "notified_at": None}
+                    self._pending_approval[arg] = ent
+                ent["notified_at"] = time.monotonic()
+                reply = (
+                    f"🚫 {arg} denied — removed from the allow-list. "
+                    "They can request access again later."
+                )
+
+        if reply and self._api is not None:
+            try:
+                await self.send(channel_id, reply)
+            except Exception as exc:
+                logger.warning("carbonvoice: failed to send admin reply: %s", exc)
 
     async def _dispatch(self, event: MessageEvent) -> None:
         try:

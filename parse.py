@@ -30,6 +30,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_utc() -> "datetime":
+    """Timezone-aware current UTC time (for :func:`message_age_seconds`)."""
+    return datetime.now(timezone.utc)
+
+
 def extract_transcript(msg: Dict[str, Any]) -> str:
     """Pull the human-readable transcript from a CV message payload.
 
@@ -98,6 +103,26 @@ def extract_channel_id(msg: Dict[str, Any]) -> Optional[str]:
 def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     # Same field across V2 and V5.
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
+
+
+def message_age_seconds(msg: Dict[str, Any], now: "datetime") -> Optional[float]:
+    """Seconds between a message's ``created_at`` and ``now``.
+
+    Returns ``None`` when the payload carries no parseable timestamp (so
+    callers can fall back to age-agnostic behavior). ``created_at`` is an
+    ISO-8601 string across V2/V5 (``2026-06-05T19:36:44.437Z``); the
+    trailing ``Z`` is normalized to ``+00:00`` for :meth:`fromisoformat`.
+    """
+    raw = first_str(msg.get("created_at"), msg.get("created"))
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (now - ts).total_seconds()
 
 
 def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -204,6 +229,41 @@ def bot_has_reacted(
         if uid == bot_id and rid == reaction_id:
             return True
     return False
+
+
+def reactors_for(
+    msg: Dict[str, Any], reaction_ids: "set[str]"
+) -> "set[str]":
+    """Return the set of user_ids who reacted to *msg* with any id in
+    *reaction_ids*.
+
+    Reads the same ``reaction_summary.top_user_reactions`` shape as
+    :func:`bot_has_reacted`, but generalized: instead of asking "did THIS
+    user react with THIS id", it returns "who reacted with one of these
+    ids". Used for one-tap owner approval — the adapter checks whether the
+    owner is among the reactors with the approve/reject reaction on its
+    pending prompt. Returns an empty set on anything it can't parse.
+    """
+    out: "set[str]" = set()
+    if not reaction_ids:
+        return out
+    summary = msg.get("reaction_summary")
+    if not isinstance(summary, dict):
+        return out
+    entries = summary.get("top_user_reactions")
+    if not isinstance(entries, list):
+        return out
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        rid = first_str(e.get("reaction_id"), e.get("id"))
+        if rid in reaction_ids:
+            uid = first_str(
+                e.get("user_id"), e.get("user_guid"), e.get("creator_id")
+            )
+            if uid:
+                out.add(uid)
+    return out
 
 
 def chat_type_from_channel(channel: Optional[Dict[str, Any]]) -> str:

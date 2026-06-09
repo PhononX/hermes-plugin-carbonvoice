@@ -15,7 +15,7 @@ The plugin connects a Hermes Agent instance to Carbon Voice as a bot user. It li
 | Offline catch-up | Cursor persisted to `$HERMES_HOME/state/carbonvoice.json`; messages received while Hermes was down are re-fetched on startup. Polls by `updated_at` (`use_last_updated`). **Stuck-message hold:** if a message's transcript isn't ready yet, `_process_message` returns `None` and the poll loop holds the cursor *just before* it (advances only to the previous message's `created_at`) so the next poll retries it instead of advancing past — borrowed from the Claude Code Channel's null-return contract. |
 | Outbound replies | `POST /v3/messages/start` with `reply_to_message_id` for threading. Stale-anchor retry as top-level on CV 400. |
 | Self-loop filter | Compares `creator_id` against the agent's own `user_guid` (resolved at startup via `/whoami`). |
-| Sender allowlist | Optional restriction by `user_guid`. Default: open. |
+| Sender allowlist (**deny-by-default**) | Only the auto-detected owner (`whoami.created_by`), `CARBONVOICE_ALLOWED_USERS`, and `/cv-allow-user`-approved users can talk to the bot. Unknown senders trigger an interactive approval prompt to the owner in the home channel. `CARBONVOICE_ALLOW_ALL_USERS=true` reopens it. |
 | Visual ack reaction | Optional. Fires on receipt to give users sub-100ms feedback before the agent finishes thinking. |
 | Mark-as-read | Optional. Clears the unread notification once the agent has attempted to handle the message. |
 | Username resolution in logs | Cached for the process lifetime. |
@@ -36,8 +36,12 @@ hermes/
 ├── api.py            CarbonVoiceAPI — async HTTP client. One method per
 │                     CV endpoint we call. Raises on HTTP/network errors.
 │
-├── audit.py          AllowlistGate (env-driven sender allowlist) +
-│                     IgnoredSenderLog (JSON-lines audit of rejections).
+├── audit.py          AllowlistGate (deny-by-default: owner + env +
+│                     pairing) + IgnoredSenderLog (JSON-lines audit).
+│
+├── permits.py        ApprovalStore (dynamic allow-list backed by core's
+│                     PairingStore) + /cv-* command parser. Powers the
+│                     interactive owner-approval onboarding flow.
 │
 ├── channels.py       ChannelCache — resolves channel_id → "dm" | "group"
 │                     via GET /channel/{id}. Per-process cache, no TTL.
@@ -88,13 +92,30 @@ Every variable is optional except `CARBONVOICE_PAT`. Listed by what they control
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max backoff for WS reconnects. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Cursor file path. |
 
-### Sender allowlist (existing)
+### Sender allowlist — **deny-by-default + interactive approval**
+A user may reach the agent if **any** of: (1) they are the **owner**
+(`whoami.created_by`, auto-detected at connect, always allowed); (2) they
+are in `CARBONVOICE_ALLOWED_USERS`; (3) they were approved at runtime via
+`/cv-allow-user` (stored in Hermes core's `PairingStore`, which the core
+authorization also consults — so approving here authorizes in core too).
+Default (no config) → only the owner. The owner approves others from the
+home channel (owner-only commands): `/cv-allow-user <id>`,
+`/cv-deny-user <id>`, `/cv-list-allow-users`.
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed to trigger the bot. |
-| `CARBONVOICE_ALLOW_ALL_USERS` | `true` | When `false` and `ALLOWED_USERS` is empty, the bot is fully closed. |
+| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Extra `user_guid`s allowed, beyond the owner and `/cv-allow-user`-approved users. |
+| `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** `true` disables gating entirely (old open behavior). Was the implicit `true` default before this change. |
+| `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Where the bot asks the owner to approve unknown senders. Without it, unknown senders are denied silently (no prompt). |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Legacy single-user restriction. |
 | `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Audit log path. |
+
+> **Migration / security note.** The default flipped from allow-all to
+> **deny-all**. Existing deployments with an empty allow-list now answer
+> only the owner until they `/cv-allow-user` others (or set
+> `CARBONVOICE_ALLOW_ALL_USERS=true`). This closes the hole where anyone on
+> a shared channel could drive the agent on the host. Warrants a version
+> bump + CHANGELOG callout.
 
 ### Mention gate (new)
 | Variable | Default | Purpose |

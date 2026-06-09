@@ -7,6 +7,7 @@ catches everything and returns a dict).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -18,7 +19,13 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
-from .constants import DEFAULT_BASE_URL, HTTP_TIMEOUT
+from .constants import (
+    DEFAULT_BASE_URL,
+    HTTP_TIMEOUT,
+    TRANSIENT_RETRY_ATTEMPTS,
+    TRANSIENT_RETRY_BACKOFF_S,
+    TRANSIENT_STATUS,
+)
 from .parse import auth_headers, first_str
 
 logger = logging.getLogger(__name__)
@@ -59,14 +66,62 @@ class CarbonVoiceAPI:
             raise RuntimeError("CarbonVoiceAPI used before open()")
         return self._client
 
-    async def whoami(self) -> Optional[str]:
-        """Return the agent's own ``user_guid``, or None when not parseable."""
+    async def _request_retrying(self, method: str, url: str, **kwargs):
+        """Issue a request, retrying ONLY on transient 5xx (502/503/504) and
+        network errors, with short backoff. For idempotent calls only — never
+        wrap a send/POST that creates a message (a retry could duplicate it).
+
+        CV's gateway returns 502s in bursts; without this a transient hiccup
+        on a latency-critical read (e.g. v5 enrichment, a reaction) stalls
+        until the next ~5s poll tick. Retries recover in <1s. Returns the
+        final response (the caller still inspects status); raises the last
+        network error if every attempt failed to connect.
+        """
+        client = self._require_client()
+        last_exc: Optional[Exception] = None
+        for attempt in range(TRANSIENT_RETRY_ATTEMPTS + 1):
+            try:
+                resp = await client.request(method, url, **kwargs)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_exc = exc
+                if attempt >= TRANSIENT_RETRY_ATTEMPTS:
+                    raise
+            else:
+                if (
+                    resp.status_code in TRANSIENT_STATUS
+                    and attempt < TRANSIENT_RETRY_ATTEMPTS
+                ):
+                    logger.debug(
+                        "carbonvoice: %s %s → %s, retry %d/%d",
+                        method, url, resp.status_code,
+                        attempt + 1, TRANSIENT_RETRY_ATTEMPTS,
+                    )
+                else:
+                    return resp
+            await asyncio.sleep(TRANSIENT_RETRY_BACKOFF_S * (attempt + 1))
+        # Exhausted retries on repeated network errors.
+        if last_exc is not None:
+            raise last_exc
+        return resp  # pragma: no cover - loop always returns or raises
+
+    async def whoami(self) -> "tuple[Optional[str], Optional[str]]":
+        """Return ``(user_guid, owner_id)`` for the bot account.
+
+        - ``user_guid`` — the agent's own id (for the self-loop guard).
+        - ``owner_id`` — ``user.created_by``, the user who *created* the bot
+          account. That's the deny-by-default owner: always authorized, and
+          auto-detected here so no manual setup is needed. Either may be
+          None when not parseable.
+        """
         client = self._require_client()
         resp = await client.get("/whoami")
         resp.raise_for_status()
         data = resp.json() or {}
         user = data.get("user") or {}
-        return first_str(user.get("user_guid"), user.get("_id"), user.get("id"))
+        return (
+            first_str(user.get("user_guid"), user.get("_id"), user.get("id")),
+            first_str(user.get("created_by")),
+        )
 
     async def fetch_recent(
         self,
@@ -475,8 +530,7 @@ class CarbonVoiceAPI:
         ``thread_id`` field). The unwrap is defensive: if the endpoint
         ever returns a flat body, that is passed through unchanged.
         """
-        client = self._require_client()
-        resp = await client.get(f"/v5/messages/{message_id}")
+        resp = await self._request_retrying("GET", f"/v5/messages/{message_id}")
         if resp.status_code >= 400 or not resp.content:
             return None
         data = resp.json()
@@ -562,9 +616,15 @@ class CarbonVoiceAPI:
         return data if isinstance(data, list) else []
 
     async def react(self, reaction_id: str, message_id: str) -> None:
-        """POST /reactions/{reaction_id}/{message_id} — empty body."""
-        client = self._require_client()
-        resp = await client.post(f"/reactions/{reaction_id}/{message_id}")
+        """POST /reactions/{reaction_id}/{message_id} — empty body.
+
+        Retries transient 5xx: re-reacting is idempotent server-side (the same
+        reaction by the same user is a no-op), so a retry can't duplicate, and
+        the visual ack shouldn't be lost to a one-off CV 502.
+        """
+        resp = await self._request_retrying(
+            "POST", f"/reactions/{reaction_id}/{message_id}"
+        )
         resp.raise_for_status()
 
     async def mark_read(self, channel_id: str, message_id: str) -> None:

@@ -24,47 +24,92 @@ from typing import TYPE_CHECKING, Optional, Set
 
 if TYPE_CHECKING:
     from .channels import ChannelCache
+    from .permits import ApprovalStore
 
 logger = logging.getLogger(__name__)
 
 
 class AllowlistGate:
-    """Default-allow access control for inbound Carbon Voice messages.
+    """**Deny-by-default** access control for inbound Carbon Voice messages.
 
-    Semantics (intentionally permissive — the plugin is mostly used for
-    personal/dev bots where install-and-forget should "just work"):
+    A user may reach the agent if ANY of these holds:
 
-    - ``CARBONVOICE_ALLOWED_USERS=a,b,c`` → only those user_guids accepted
-    - ``CARBONVOICE_ALLOW_ALL_USERS=false`` (with no allowed list) → deny all
-    - Anything else (including unset) → allow all
+      1. **allow-all** is explicitly enabled (``CARBONVOICE_ALLOW_ALL_USERS=true``)
+         — the escape hatch back to the old open behavior.
+      2. they are the **owner** — ``whoami.created_by``, the user who created
+         the bot account. Auto-detected at connect; always allowed. This is
+         what makes deny-by-default usable without any manual setup.
+      3. they are in ``CARBONVOICE_ALLOWED_USERS`` (static env list).
+      4. they were **approved at runtime** via ``/cv-allow`` — the
+         :class:`~permits.ApprovalStore` (Hermes core's ``PairingStore``).
 
-    Setting ``CARBONVOICE_ALLOW_ALL_USERS=true`` is redundant but accepted
-    for explicitness; the in-process default in ``register()`` writes it
-    to ``os.environ`` so Hermes core's own allowlist check also sees it.
+    Default (no config) → **only the owner**. This closes the security hole
+    where anyone on a shared channel could ask the agent to read or run
+    things on the host. The owner grows the list interactively from the
+    home channel (``/cv-allow <id>``) without restarting.
+
+    History: the default used to be allow-all (``CARBONVOICE_ALLOW_ALL_USERS``
+    defaulted true / was an opt-out). It is now an opt-IN. Existing
+    deployments with an empty allow-list will, after this change, only
+    answer the owner until they approve others — see README/CHANGELOG.
     """
 
-    def __init__(self, allow_all: bool, allowed_ids: Set[str]):
+    def __init__(
+        self,
+        allow_all: bool,
+        allowed_ids: Set[str],
+        approvals: Optional["ApprovalStore"] = None,
+    ):
         self._allow_all = allow_all
         self._allowed_ids = allowed_ids
+        self._approvals = approvals
+        self._owner_id: Optional[str] = None  # set at connect via set_owner()
 
     @classmethod
-    def from_env(cls) -> "AllowlistGate":
+    def from_env(
+        cls, approvals: Optional["ApprovalStore"] = None
+    ) -> "AllowlistGate":
         raw = os.getenv("CARBONVOICE_ALLOWED_USERS", "")
         allowed = {u.strip() for u in raw.split(",") if u.strip()}
-        if allowed:
-            return cls(allow_all=False, allowed_ids=allowed)
-        # No specific list — default open, unless explicitly disabled.
-        disabled = os.getenv("CARBONVOICE_ALLOW_ALL_USERS", "").strip().lower() in (
-            "false", "0", "no", "off",
+        # allow-all is now an explicit opt-IN (truthy enables it); deny is
+        # the default.
+        allow_all = os.getenv("CARBONVOICE_ALLOW_ALL_USERS", "").strip().lower() in (
+            "true", "1", "yes", "on",
         )
-        return cls(allow_all=not disabled, allowed_ids=set())
+        return cls(allow_all=allow_all, allowed_ids=allowed, approvals=approvals)
+
+    def set_owner(self, owner_id: Optional[str]) -> None:
+        """Record the bot owner (``whoami.created_by``). Always allowed."""
+        self._owner_id = (owner_id or "").strip() or None
+
+    @property
+    def owner_id(self) -> Optional[str]:
+        return self._owner_id
+
+    def is_owner(self, user_id: Optional[str]) -> bool:
+        return bool(self._owner_id and user_id and user_id == self._owner_id)
+
+    @property
+    def has_any_authorizer(self) -> bool:
+        """True if *anyone* can be allowed (owner / env list / allow-all).
+
+        When this is False after connect, deny-by-default would mute the bot
+        for everyone — the adapter logs a loud bootstrap warning.
+        """
+        return bool(self._allow_all or self._owner_id or self._allowed_ids)
 
     def is_allowed(self, user_id: Optional[str]) -> bool:
         if self._allow_all:
             return True
         if not user_id:
             return False
-        return user_id in self._allowed_ids
+        if self._owner_id and user_id == self._owner_id:
+            return True
+        if user_id in self._allowed_ids:
+            return True
+        if self._approvals is not None and self._approvals.is_approved(user_id):
+            return True
+        return False
 
 
 class IgnoredSenderLog:

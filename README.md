@@ -41,13 +41,32 @@ Open Carbon Voice (web, mobile, or desktop) and DM the agent's account. It react
 
 ---
 
-### Optional: restrict who can talk to the bot
+### Who can talk to the bot (deny-by-default)
 
-By default the bot accepts messages from any Carbon Voice user (good for personal/dev setups). To limit access to specific people, add their `user_guid`s to `~/.hermes/.env`:
+**The bot only responds to authorized users.** Since the agent can read and run things on the host, an open bot is a security hole — so access is **deny-by-default**. A user is allowed if any of these holds:
+
+- **They're the owner** — the Carbon Voice user who *created* the bot account (`whoami.created_by`). Auto-detected at startup; **always allowed, no setup needed.**
+- They're listed in `CARBONVOICE_ALLOWED_USERS` (a static comma-separated list).
+- The owner approved them at runtime (see below).
+
+**Interactive onboarding.** When an unauthorized user messages the bot, it asks **you** (the owner) in the home channel:
+
+> 👤 *Teammate Name (Abc123…) wants to talk to me but isn't authorized.*
+> *React 💯 to allow · 👎 to block — or reply* `/cv-allow-user Abc123…`
+
+**One-tap approval (recommended):** just **react 💯** on that prompt to allow them, or **👎** to block — no typing, no copying the user id. Only *your* (the owner's) reaction counts, so a stranger can't approve their own prompt. (Reaction ids default to the CV built-ins `affirmative` (💯) / `negative` (👎 — stored code ⛔); override with `CARBONVOICE_APPROVE_REACTION_ID` / `CARBONVOICE_REJECT_REACTION_ID`.)
+
+Or use the text commands (owner-only, in the home channel), which still work as a fallback: `/cv-allow-user <id>`, `/cv-deny-user <id>`, `/cv-list-allow-users`. Either way they're approved instantly (persisted, survives restarts — no `.env` edit, no restart). (Set `CARBONVOICE_HOME_CHANNEL` so the bot knows where to ask you.)
+
+The unauthorized sender's messages are **dropped silently** — no text reply, no reaction. (Per-message feedback would either clutter the channel or, as a reaction, flood the owner with one CV notification per message from a spamming stranger.) The only feedback is the **owner prompt** above, rate-limited to once per `CARBONVOICE_APPROVAL_COOLDOWN_S` (default 1800 s / 30 min) per user (you ARE re-prompted after the cooldown, in case the first ask was missed), plus a one-time **"you've been added — you can talk to me now"** message sent to the user (in the channel they wrote in) once you approve them. A denied user is dropped silently and can request access again after the cooldown — so you can freely remove/re-add anyone.
+
+To add people up front instead, set `CARBONVOICE_ALLOWED_USERS`:
 
 ```bash
 echo 'CARBONVOICE_ALLOWED_USERS=<your_user_guid>,<teammate_guid>' >> "$(hermes config env-path)"
 ```
+
+To go back to the old open behavior, set `CARBONVOICE_ALLOW_ALL_USERS=true`.
 
 > 💡 Prefer a GUI for editing the `.env`? Run `open $(hermes config env-path)` to open it in your default editor, or `hermes dashboard` for the web UI at <http://127.0.0.1:9119>.
 
@@ -86,7 +105,7 @@ That's the only required variable. By default the bot accepts messages from any 
 CARBONVOICE_ALLOWED_USERS=<your_carbonvoice_user_guid>[,<another_guid>...]
 ```
 
-To explicitly close the bot to everyone (e.g., temporary maintenance mode), set `CARBONVOICE_ALLOW_ALL_USERS=false` and leave `CARBONVOICE_ALLOWED_USERS` empty. Your own `user_guid` shows up in the gateway logs as `carbonvoice: connected as <guid>` on startup.
+Access is **deny-by-default**: only the owner (auto-detected), users in `CARBONVOICE_ALLOWED_USERS`, and users approved via `/cv-allow-user` can talk to the bot. To disable gating entirely (open to everyone), set `CARBONVOICE_ALLOW_ALL_USERS=true`. Your own `user_guid` shows up in the gateway logs as `carbonvoice: owner is <guid>` on startup.
 
 ## Run
 
@@ -121,12 +140,18 @@ If Hermes is restarted, any messages that arrived while it was offline are fetch
 | `CARBONVOICE_POLL_INTERVAL_MS` | `5000` | Polling interval (when WS is down or unavailable). |
 | `CARBONVOICE_WS_RETRY_MAX_MS` | `30000` | Max WebSocket reconnect backoff. |
 | `CARBONVOICE_STATE_PATH` | `$HERMES_HOME/state/carbonvoice.json` | Path to the cursor state file. |
+| `CARBONVOICE_STUCK_MAX_AGE_S` | `300` | How long a message with no transcript is retried before being treated as permanently empty (image-only / system / failed STT) and skipped, so it can't pin the polling cursor. |
+| `CARBONVOICE_SEND_DEDUP_WINDOW_S` | `90` | Drop an identical outbound reply to the same channel within this window — defends against the gateway re-sending the same response per queued follow-up when delivery confirmation is lost (CV 502 mid-stream). `0` disables. |
 | `CARBONVOICE_CREATOR_ID` | _(unset)_ | Restrict inbound messages to a single Carbon Voice `user_guid`. |
-| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed to trigger the bot. When set, **only** these users are accepted. |
-| `CARBONVOICE_ALLOW_ALL_USERS` | `true` | Default open access. Set to `false` (and leave `CARBONVOICE_ALLOWED_USERS` empty) to explicitly close the bot. |
+| `CARBONVOICE_ALLOWED_USERS` | _(unset)_ | Comma-separated `user_guid`s allowed, *in addition to* the auto-detected owner and `/cv-allow-user`-approved users. |
+| `CARBONVOICE_ALLOW_ALL_USERS` | `false` | **Deny-by-default.** Set to `true` to disable gating and let anyone talk to the bot (the old open behavior). |
+| `CARBONVOICE_APPROVAL_COOLDOWN_S` | `1800` | Min seconds between owner-approval prompts for the same unknown user. The owner is re-prompted after this window in case the first ask was missed. Also gates how soon a denied user can trigger a fresh prompt. |
 | `CARBONVOICE_HOME_CHANNEL` | _(unset)_ | Default `channel_guid` for cron/notification delivery. |
 | `CARBONVOICE_HOME_CHANNEL_NAME` | _(unset)_ | Display name for the home channel. |
 | `CARBONVOICE_REACTION_ID` | `acknowledged` | Reaction id used to ack inbound messages. Available ids are logged on startup; pin a different one with this var. |
+| `CARBONVOICE_PENDING_REACTION_ID` | `confused` | _(Reserved.)_ Reaction id for a "pending approval" marker on an unauthorized sender's message. **Not used by default** — per-message reactions flooded the owner with notifications, so unauthorized messages are now dropped silently. Kept for operators who wire it back in. |
+| `CARBONVOICE_APPROVE_REACTION_ID` | `affirmative` | Reaction the **owner** taps (💯) on a "wants to talk" prompt to allow that user — one-tap approval, no typed command. |
+| `CARBONVOICE_REJECT_REACTION_ID` | `negative` | Reaction the **owner** taps (👎) on a "wants to talk" prompt to block that user. |
 | `CARBONVOICE_DISABLE_ACK_REACTION` | `false` | Disable the visual ack reaction. |
 | `CARBONVOICE_DISABLE_MARK_READ` | `false` | Disable clearing the unread notification after the agent replies. |
 | `CARBONVOICE_IGNORED_SENDERS_LOG` | `$HERMES_HOME/logs/carbonvoice-ignored-senders.log` | Path to the audit log of rejected senders (one JSON line per rejection). |
@@ -266,7 +291,7 @@ The adapter never accepts inbound HTTP — both transports are outbound-initiate
 
 **`401 Unauthorized` on `/whoami`** — your PAT is wrong, expired, or revoked. Generate a new one at https://www.developer.carbonvoice.app/.
 
-**`No user allowlists configured` warning** — the bot rejects all senders until you set `CARBONVOICE_ALLOW_ALL_USERS=true` or `CARBONVOICE_ALLOWED_USERS=<guid>`.
+**`deny-by-default is active but NO authorized users` warning** — `whoami` returned no owner (`created_by`) and `CARBONVOICE_ALLOWED_USERS` is empty, so the bot will ignore everyone. Set `CARBONVOICE_ALLOWED_USERS=<your_guid>` (or `CARBONVOICE_ALLOW_ALL_USERS=true` to disable gating). Normally the owner is auto-detected and this never fires.
 
 **Messages from voice notes don't arrive** — transcription can take a few seconds. The adapter waits for `message:updated` (or the next poll) to pick up the populated transcript. If a transcript never arrives, check the Carbon Voice account has transcription enabled.
 
