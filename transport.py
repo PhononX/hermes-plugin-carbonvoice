@@ -19,7 +19,11 @@ except ImportError:
     SOCKETIO_AVAILABLE = False
     socketio = None  # type: ignore[assignment]
 
-from .constants import DEFAULT_WS_RETRY_INITIAL_MS
+from .constants import (
+    AGENT_NAME_HEADER,
+    AGENT_NAME_VALUE,
+    DEFAULT_WS_RETRY_INITIAL_MS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +163,7 @@ class Transport:
         await sio.connect(
             self._base_url,
             auth={"authorization": f"Bearer {self._pat}"},
+            headers={AGENT_NAME_HEADER: AGENT_NAME_VALUE},
             transports=["websocket"],
         )
 

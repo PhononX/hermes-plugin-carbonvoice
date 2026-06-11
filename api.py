@@ -20,13 +20,14 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from .constants import (
+    AGENT_ID_HEADER,
     DEFAULT_BASE_URL,
     HTTP_TIMEOUT,
     TRANSIENT_RETRY_ATTEMPTS,
     TRANSIENT_RETRY_BACKOFF_S,
     TRANSIENT_STATUS,
 )
-from .parse import auth_headers, first_str
+from .parse import client_headers, first_str
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,18 @@ class CarbonVoiceAPI:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
-                headers=auth_headers(self._pat),
+                headers=client_headers(self._pat),
                 timeout=HTTP_TIMEOUT,
             )
+
+    def set_agent_id(self, user_guid: str) -> None:
+        """Tag all subsequent requests with the bot's own id (from /whoami).
+
+        Only the few bootstrap calls made before whoami resolves go out
+        without it — the id isn't known yet at that point.
+        """
+        if self._client is not None and user_guid:
+            self._client.headers[AGENT_ID_HEADER] = user_guid
 
     async def close(self) -> None:
         if self._client is not None:
@@ -684,7 +694,7 @@ async def standalone_send(
     }
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/"),
-        headers=auth_headers(pat),
+        headers=client_headers(pat),
         timeout=HTTP_TIMEOUT,
     ) as client:
         try:

@@ -19,6 +19,16 @@ DEFAULT_STUCK_MAX_AGE_S = 5 * 60
 HTTP_TIMEOUT = 30.0
 MAX_MESSAGE_LENGTH = 8000
 
+# Request-source headers so the backend can categorize traffic per client
+# (mirrors the Flutter app's lowercase-hyphenated headers like ``platform``
+# and ``mobile-app-version``). ``agent-name`` is static — it identifies the
+# integration type (hermes vs openclaw vs cloud-channel vs the apps).
+# ``agent-id`` is dynamic — the bot account's user_guid from /whoami,
+# injected once known so traffic can also be grouped per agent account.
+AGENT_NAME_HEADER = "agent-name"
+AGENT_NAME_VALUE = "hermes"
+AGENT_ID_HEADER = "agent-id"
+
 # Carbon Voice's API gateway intermittently returns 502/503/504 (observed in
 # bursts). A transient 5xx on a latency-critical GET/reaction would otherwise
 # wait for the next poll tick (~5s) to recover; a couple of fast retries with

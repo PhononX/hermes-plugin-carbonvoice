@@ -303,6 +303,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             logger.error("carbonvoice: /whoami returned no user id")
             await self._api.close()
             return False
+        # From here on every request also carries agent-id, so the backend
+        # can attribute traffic to this specific agent account.
+        self._api.set_agent_id(self._self_user_id)
 
         # Deny-by-default: the bot's creator (whoami.created_by) is the
         # owner — always authorized, and the seed from which they approve
