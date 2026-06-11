@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .constants import AGENT_NAME_HEADER, AGENT_NAME_VALUE
+from .constants import AGENT_NAME_HEADER, AGENT_NAME_VALUE, USER_AGENT
 
 
 def auth_headers(pat: str) -> Dict[str, str]:
@@ -22,8 +22,13 @@ def auth_headers(pat: str) -> Dict[str, str]:
 
 def client_headers(pat: str) -> Dict[str, str]:
     """Default headers for every Carbon Voice API client: auth plus the
-    static source tag the backend uses to attribute traffic to Hermes."""
-    return {**auth_headers(pat), AGENT_NAME_HEADER: AGENT_NAME_VALUE}
+    source tags the backend uses to attribute traffic to Hermes (the
+    User-Agent is the one its request logger captures today)."""
+    return {
+        **auth_headers(pat),
+        AGENT_NAME_HEADER: AGENT_NAME_VALUE,
+        "user-agent": USER_AGENT,
+    }
 
 
 def first_str(*vals: Any) -> Optional[str]:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 DEFAULT_BASE_URL = "https://api.carbonvoice.app"
 DEFAULT_POLL_INTERVAL_MS = 5_000
 DEFAULT_WS_RETRY_INITIAL_MS = 1_000
@@ -28,6 +31,25 @@ MAX_MESSAGE_LENGTH = 8000
 AGENT_NAME_HEADER = "agent-name"
 AGENT_NAME_VALUE = "hermes"
 AGENT_ID_HEADER = "agent-id"
+
+
+def _plugin_version() -> str:
+    try:
+        text = (Path(__file__).parent / "plugin.yaml").read_text()
+        match = re.search(r"^version:\s*(\S+)", text, re.MULTILINE)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+# The backend's request logger only captures a fixed header set (ua,
+# mobile-app-version, platform), so the User-Agent is what actually lets it
+# categorize Hermes traffic today — agent-name/agent-id above are sent for
+# when the backend starts logging them. After /whoami the api client appends
+# " (agent-id: <guid>)" so the ua field also distinguishes agent accounts.
+USER_AGENT = f"hermes-plugin/{_plugin_version()}"
 
 # Carbon Voice's API gateway intermittently returns 502/503/504 (observed in
 # bursts). A transient 5xx on a latency-critical GET/reaction would otherwise

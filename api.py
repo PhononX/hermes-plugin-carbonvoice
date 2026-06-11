@@ -26,6 +26,7 @@ from .constants import (
     TRANSIENT_RETRY_ATTEMPTS,
     TRANSIENT_RETRY_BACKOFF_S,
     TRANSIENT_STATUS,
+    USER_AGENT,
 )
 from .parse import client_headers, first_str
 
@@ -57,11 +58,16 @@ class CarbonVoiceAPI:
     def set_agent_id(self, user_guid: str) -> None:
         """Tag all subsequent requests with the bot's own id (from /whoami).
 
-        Only the few bootstrap calls made before whoami resolves go out
-        without it — the id isn't known yet at that point.
+        Goes into both ``agent-id`` and the User-Agent — the backend's
+        request logger only captures the ua field today, so that's where
+        the id must live for per-agent grouping. Only the few bootstrap
+        calls made before whoami resolves go out without it.
         """
         if self._client is not None and user_guid:
             self._client.headers[AGENT_ID_HEADER] = user_guid
+            self._client.headers["user-agent"] = (
+                f"{USER_AGENT} (agent-id: {user_guid})"
+            )
 
     async def close(self) -> None:
         if self._client is not None:
