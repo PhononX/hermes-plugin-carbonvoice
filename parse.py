@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .constants import AGENT_NAME_HEADER, AGENT_NAME_VALUE, USER_AGENT
+
 
 def auth_headers(pat: str) -> Dict[str, str]:
     """Carbon Voice accepts PATs via Bearer auth and other keys via x-api-key."""
@@ -16,6 +18,17 @@ def auth_headers(pat: str) -> Dict[str, str]:
     if trimmed.lower().startswith("cv_pat_"):
         return {"Authorization": f"Bearer {trimmed}"}
     return {"x-api-key": trimmed}
+
+
+def client_headers(pat: str) -> Dict[str, str]:
+    """Default headers for every Carbon Voice API client: auth plus the
+    source tags the backend uses to attribute traffic to Hermes (the
+    User-Agent is the one its request logger captures today)."""
+    return {
+        **auth_headers(pat),
+        AGENT_NAME_HEADER: AGENT_NAME_VALUE,
+        "user-agent": USER_AGENT,
+    }
 
 
 def first_str(*vals: Any) -> Optional[str]:
