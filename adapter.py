@@ -72,6 +72,7 @@ from .parse import (
     extract_channel_id,
     extract_creator_id,
     extract_message_id,
+    extract_share_link_id,
     extract_transcript,
     first_str,
     message_age_seconds,
@@ -1296,6 +1297,154 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         return media_urls, media_types, link_urls
 
+    async def _fetch_forwarded_content(
+        self, share_link_id: str, channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a forwarded message's original content via its share link.
+
+        Returns ``{"text": <forwarded block>, "media_urls": [...],
+        "media_types": [...]}`` on success, or ``None`` when the content
+        isn't retrievable *yet* — share-link fetch failed, the original's
+        attachments are still uploading, or an image download failed. The
+        caller treats None as the stuck signal (hold cursor, retry next
+        poll) while the message is young, and degrades to a placeholder
+        past the cutoff. Mirrors cv-claude-channels' share-link handling.
+
+        The text block:
+
+            [Forwarded message from <name>]
+            <original transcript or "(no transcript)">
+            [Attached link: ...]          ← link attachments, inline
+            [Attachment foo.pdf — ...]    ← non-image files, noted only
+
+        Image attachments are downloaded through the share-link-scoped
+        signed-URL route (the bot may lack access to the original
+        message's channel; the link itself authorizes) into the same
+        IMAGE_CACHE_DIR as regular inbound images, and returned as bare
+        local paths for ``MessageEvent.media_urls``.
+        """
+        try:
+            share_link = await self._api.get_share_link(share_link_id)
+        except Exception as exc:
+            logger.warning(
+                "carbonvoice: share-link fetch failed for %s: %s",
+                share_link_id, exc,
+            )
+            return None
+        shared = (share_link or {}).get("shared_message")
+        if not isinstance(shared, dict):
+            logger.warning(
+                "carbonvoice: share link %s has no shared_message "
+                "(revoked / expired / no access?)",
+                share_link_id,
+            )
+            return None
+
+        # Original sender: resolve against this channel's roster (cache
+        # hit). The original author often isn't a member of the channel
+        # the forward landed in — fall back to the raw id.
+        sm_creator = extract_creator_id(shared)
+        sender = ""
+        if sm_creator and self._channels is not None:
+            sender = await self._channels.resolve_name(
+                channel_id, sm_creator
+            ) or ""
+        sender = sender or sm_creator or "unknown sender"
+
+        from gateway.platforms.base import IMAGE_CACHE_DIR
+
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        att_lines: list[str] = []
+
+        for att in extract_attachments(shared):
+            aid = att.get("_id") or ""
+            mime = (att.get("mime_type") or "").lower()
+            att_type = (att.get("type") or "").lower()
+            link = att.get("link") or ""
+            filename = att.get("filename") or aid or "attachment.bin"
+            status = (att.get("status") or "").lower()
+
+            if att_type == "link":
+                # Same inline-URL treatment as wrapper-level link
+                # attachments — the agent fetches it with its web tools.
+                if link:
+                    att_lines.append(f"[Attached link: {link}]")
+                continue
+            if status == "failed":
+                att_lines.append(
+                    f"[Attachment {filename} — upload failed on the "
+                    "original message]"
+                )
+                continue
+            if status and status != "uploaded":
+                # Initializing / Uploading — the original's file isn't on
+                # S3 yet. Retry the whole forward.
+                logger.info(
+                    "carbonvoice: forwarded attachment %s still %s — "
+                    "holding for retry", filename, status,
+                )
+                return None
+            if not mime.startswith("image/"):
+                # Same image-only scope as _collect_inbound_media (no
+                # document pipeline in Hermes core yet) — but note the
+                # file in the text so the agent knows it exists.
+                att_lines.append(
+                    f"[Attachment {filename} ({mime or 'unknown type'}) — "
+                    "not imported: only image attachments are supported]"
+                )
+                logger.warning(
+                    "carbonvoice: skipping forwarded attachment %s (%s) — "
+                    "only image/* is wired (see DEVELOPMENT.md §4)",
+                    filename, mime or "no-mime",
+                )
+                continue
+            if not aid:
+                continue
+            try:
+                local_path = await self._api.download_share_link_attachment(
+                    share_link_id,
+                    aid,
+                    IMAGE_CACHE_DIR,
+                    filename=filename,
+                    max_bytes=self._max_attachment_bytes,
+                )
+            except ValueError as exc:
+                # Size cap — permanent, don't hold the cursor for it.
+                att_lines.append(
+                    f"[Attachment {filename} — skipped: too large]"
+                )
+                logger.warning(
+                    "carbonvoice: oversized forwarded attachment %s: %s",
+                    filename, exc,
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: forwarded attachment download failed "
+                    "%s (%s): %s — holding for retry",
+                    filename, aid, exc,
+                )
+                return None
+            media_urls.append(str(local_path))
+            media_types.append(mime)
+            logger.info(
+                "carbonvoice: forwarded attachment downloaded — "
+                "att=%s mime=%s path=%s", aid, mime, local_path,
+            )
+
+        block = (
+            f"[Forwarded message from {sender}]\n"
+            + (extract_transcript(shared) or "(no transcript)")
+        )
+        if att_lines:
+            block += "\n" + "\n".join(att_lines)
+        return {
+            "text": block,
+            "media_urls": media_urls,
+            "media_types": media_types,
+        }
+
     async def _process_message(self, msg: Dict[str, Any]) -> Optional[bool]:
         """Process one inbound message; return its disposition for the cursor.
 
@@ -1303,10 +1452,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
           - ``False`` — skipped for good (self-loop, single-user restrict,
             not allowed, deduped, gate-rejected). Safe to advance past.
           - ``None``  — *stuck*: the transcript isn't ready yet (CV is
-            still transcribing). The caller holds the cursor just *before*
-            this message so the next poll re-fetches and retries it,
-            instead of advancing past and risking a skip. Mirrors the
-            Claude Code Channel's null-return contract.
+            still transcribing), or the message is a forward whose
+            share-link content couldn't be resolved yet. The caller holds
+            the cursor just *before* this message so the next poll
+            re-fetches and retries it, instead of advancing past and
+            risking a skip. Mirrors the Claude Code Channel's null-return
+            contract.
         """
         message_id = extract_message_id(msg)
         if not message_id:
@@ -1382,16 +1533,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # waiting and let it advance the cursor (return False, not None).
         transcript = extract_transcript(msg)
         if not transcript:
-            age = message_age_seconds(msg, now_utc())
-            if age is not None and age > self._stuck_max_age_s:
+            # Forwards are the exception to the stuck-wait: a forward with
+            # no typed comment never gets a transcript of its own — the
+            # content lives behind the share link (fetched below). Only a
+            # *voice* comment (is_text_message False) still waits for STT
+            # like any voice message, and at the age cutoff it falls
+            # through to forward processing (comment lost) instead of
+            # being skipped (whole forward lost).
+            share_link_hint = extract_share_link_id(msg)
+            if not share_link_hint or msg.get("is_text_message") is False:
+                age = message_age_seconds(msg, now_utc())
+                if age is None or age <= self._stuck_max_age_s:
+                    return None
+                if not share_link_hint:
+                    logger.info(
+                        "carbonvoice: message %s has no transcript after %.0fs "
+                        "(> %ss) — treating as permanently empty, advancing past it",
+                        message_id, age, self._stuck_max_age_s,
+                    )
+                    self._seen.mark(message_id)
+                    return False
                 logger.info(
-                    "carbonvoice: message %s has no transcript after %.0fs "
-                    "(> %ss) — treating as permanently empty, advancing past it",
-                    message_id, age, self._stuck_max_age_s,
+                    "carbonvoice: forward %s voice comment never transcribed "
+                    "after %.0fs — proceeding with forwarded content only",
+                    message_id, age,
                 )
-                self._seen.mark(message_id)
-                return False
-            return None
 
         # V5 source-of-truth enrichment. The socket / v3-poll push gives
         # us a V2-shaped payload that trails the v5 GET on async fields:
@@ -1514,6 +1680,34 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 self._seen.mark(message_id)
             return False
 
+        # Forwarded message (share link): resolve the original message's
+        # content BEFORE committing (mark-seen + ack) so a failed or
+        # not-ready fetch can return None — the stuck signal — and the
+        # cursor holds for a retry next poll. Mirrors cv-claude-channels'
+        # retry-don't-skip contract for share links. Past the stuck cutoff
+        # we degrade to a placeholder rather than pinning the cursor
+        # forever (revoked/expired links never resolve).
+        forwarded: Optional[Dict[str, Any]] = None
+        share_link_id = extract_share_link_id(msg)
+        if share_link_id and self._api is not None:
+            forwarded = await self._fetch_forwarded_content(
+                share_link_id, channel_id
+            )
+            if forwarded is None:
+                age = message_age_seconds(msg, now_utc())
+                if age is None or age <= self._stuck_max_age_s:
+                    return None
+                logger.warning(
+                    "carbonvoice: forwarded content for %s (share link %s) "
+                    "unavailable after %.0fs — delivering placeholder",
+                    message_id, share_link_id, age,
+                )
+                forwarded = {
+                    "text": "[Forwarded message — original content unavailable]",
+                    "media_urls": [],
+                    "media_types": [],
+                }
+
         # Decision is "process" — commit to it. Marking seen here (rather
         # than before the gate) guarantees we only dedup messages we
         # actually dispatch; a re-fire with new metadata still gets a
@@ -1562,6 +1756,24 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # there is no inline ``@[name](guid)`` markup left to strip; pass
         # the transcript through as-is.
         clean_text = transcript
+
+        # Forwarded message: the agent reads the original content first,
+        # then the forwarder's comment (when there is one) — same layout
+        # cv-claude-channels sends:
+        #
+        #     [Forwarded message from <original sender>]
+        #     <original transcript / attachment lines>
+        #
+        #     [Forwarded by <user>]
+        #     <comment>
+        if forwarded is not None:
+            if transcript:
+                clean_text = (
+                    f"{forwarded['text']}\n\n"
+                    f"[Forwarded by {user_name}]\n{transcript}"
+                )
+            else:
+                clean_text = forwarded["text"]
 
         # Session sharing in groups: pass the thread root as
         # ``SessionSource.thread_id`` so Hermes core composes a shared
@@ -1618,6 +1830,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # browser / fetch tools to consume them. Anything else (PDFs,
         # binaries, …) is dropped with a WARNING.
         media_urls, media_types, link_urls = await self._collect_inbound_media(msg)
+
+        # Images attached to the *forwarded* (original) message ride the
+        # same vision pipeline as the wrapper's own attachments. Forwarded
+        # images first — they're what the text block describes.
+        if forwarded is not None and forwarded["media_urls"]:
+            media_urls = list(forwarded["media_urls"]) + media_urls
+            media_types = list(forwarded["media_types"]) + media_types
 
         # If CV's link-share UI was used, surface the URL(s) inline so
         # the agent can fetch them naturally. Prepending preserves the
