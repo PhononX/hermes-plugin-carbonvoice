@@ -60,9 +60,11 @@ from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_REJECT_REACTION_ID,
+    DEFAULT_REVISIT_MAX_AGE_S,
     DEFAULT_STUCK_MAX_AGE_S,
     DEFAULT_WS_RETRY_MAX_MS,
     MAX_MESSAGE_LENGTH,
+    STUCK_RETRY_DELAY_S,
 )
 from .dedupe import SeenCache
 from .gate import MentionGate
@@ -72,6 +74,7 @@ from .parse import (
     extract_channel_id,
     extract_creator_id,
     extract_message_id,
+    extract_share_link_id,
     extract_transcript,
     first_str,
     message_age_seconds,
@@ -182,6 +185,22 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             or os.environ.get("CARBONVOICE_STUCK_MAX_AGE_S")
             or DEFAULT_STUCK_MAX_AGE_S
         )
+        # Revisit window for tag-lagged voice messages: a *voice* message in
+        # a group channel gets its ``tagged_user_ids`` ~10–30s after creation
+        # (Flutter applies the picker tags via the batch PUT only once STT
+        # finishes). A gate rejection for "no mention" on such a message is
+        # therefore provisional — we hold the cursor (stuck signal) while the
+        # message is younger than this, so the next tick re-fetches and
+        # re-evaluates with the by-then-populated array. Without the hold,
+        # the tag-set ``message:updated`` is the LAST event that message ever
+        # emits — one stale read (or one coalesced-away tick) and the cursor
+        # is past it forever (observed live: tag landed at +30s, bot never
+        # answered). Text messages carry tags at create time and never hold.
+        self._revisit_max_age_s: float = float(
+            extra.get("revisit_max_age_s")
+            or os.environ.get("CARBONVOICE_REVISIT_MAX_AGE_S")
+            or DEFAULT_REVISIT_MAX_AGE_S
+        )
         # Outbound dedup: defense-in-depth against the core re-sending the
         # same response once per queued follow-up when delivery confirmation
         # is lost (e.g. CV 502 mid-stream). Keyed by channel → (text-hash,
@@ -201,10 +220,20 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # overlapping fetches over the SAME cursor window in parallel, each
         # re-processing the same messages — a key amplifier of the
         # duplicate-processing bursts. The lock makes fetches mutually
-        # exclusive; _fetch_missed_messages skips (coalesces) if one is
-        # already running, since the in-flight fetch already covers the
-        # latest window.
+        # exclusive; _fetch_missed_messages coalesces overlapping ticks to a
+        # single *trailing* re-fetch (``_tick_pending``) — never a plain
+        # drop, because the event that fired mid-flight may announce a write
+        # (e.g. the tag-resolution PUT) that the in-flight fetch's HTTP query
+        # predates. Dropping it would lose the only re-fire that message
+        # ever gets.
         self._fetch_lock = asyncio.Lock()
+        self._tick_pending = False
+        # One-shot delayed re-tick while something is stuck (no-transcript
+        # or revisit-held messages). In WS mode polling is stopped, so
+        # without this a held message would only retry when the *next*
+        # unrelated event happens to arrive — potentially much later on a
+        # quiet workspace.
+        self._stuck_retry_task: Optional[asyncio.Task] = None
 
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
@@ -356,6 +385,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._stuck_retry_task is not None and not self._stuck_retry_task.done():
+            self._stuck_retry_task.cancel()
+        self._stuck_retry_task = None
         await self._transport.stop()
         await self._cursor.stop()
         if self._api is not None:
@@ -1080,15 +1112,26 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         if self._api is None:
             return
 
-        # Coalesce overlapping ticks: if a fetch is already running, skip —
-        # it already covers the latest cursor window. Prevents a burst of WS
-        # events from spawning parallel fetches that re-process the same
-        # messages (a key amplifier of the duplicate-processing bursts).
+        # Coalesce overlapping ticks to a TRAILING re-fetch, never a drop.
+        # A burst of WS events must not spawn parallel fetches over the same
+        # cursor window (duplicate-processing amplifier) — but the event that
+        # arrives mid-fetch may announce a write the in-flight HTTP query
+        # predates (observed: the tag-resolution PUT fired while the
+        # transcript-ready tick was still fetching; dropping that tick lost
+        # the only re-fire the message ever gets). So a tick that finds the
+        # lock held flags ``_tick_pending``; the lock holder loops one more
+        # fetch per flag before releasing.
         if self._fetch_lock.locked():
-            logger.debug("carbonvoice: fetch already in progress — skipping tick")
+            self._tick_pending = True
+            logger.debug(
+                "carbonvoice: fetch already in progress — queuing trailing re-fetch"
+            )
             return
         async with self._fetch_lock:
             await self._fetch_missed_messages_locked()
+            while self._tick_pending:
+                self._tick_pending = False
+                await self._fetch_missed_messages_locked()
 
     async def _fetch_missed_messages_locked(self) -> None:
         request_started_at = now_iso()
@@ -1146,6 +1189,29 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             prev_created = messages[first_stuck_idx - 1].get("created_at")
             if isinstance(prev_created, str) and prev_created:
                 self._cursor.advance(prev_created)
+
+        # Something is held (no-transcript stuck or revisit-held): schedule a
+        # one-shot delayed re-tick so the retry doesn't depend on the next
+        # unrelated WS event arriving. In WS mode polling is stopped, so on a
+        # quiet workspace a held message would otherwise wait for the next
+        # reconnect cycle (observed: tens of minutes). One task at a time —
+        # each retry re-schedules itself via this same path while anything
+        # remains held.
+        if first_stuck_idx is not None:
+            self._schedule_stuck_retry()
+
+    def _schedule_stuck_retry(self) -> None:
+        if self._stuck_retry_task is not None and not self._stuck_retry_task.done():
+            return
+
+        async def _retry() -> None:
+            await asyncio.sleep(STUCK_RETRY_DELAY_S)
+            try:
+                await self._fetch_missed_messages()
+            except Exception as exc:
+                logger.debug("carbonvoice: stuck-retry tick failed: %s", exc)
+
+        self._stuck_retry_task = asyncio.create_task(_retry())
 
     # ── Inbound multimodal (PR 7) ────────────────────────────────────────
     #
@@ -1299,6 +1365,154 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         return media_urls, media_types, link_urls
 
+    async def _fetch_forwarded_content(
+        self, share_link_id: str, channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a forwarded message's original content via its share link.
+
+        Returns ``{"text": <forwarded block>, "media_urls": [...],
+        "media_types": [...]}`` on success, or ``None`` when the content
+        isn't retrievable *yet* — share-link fetch failed, the original's
+        attachments are still uploading, or an image download failed. The
+        caller treats None as the stuck signal (hold cursor, retry next
+        poll) while the message is young, and degrades to a placeholder
+        past the cutoff. Mirrors cv-claude-channels' share-link handling.
+
+        The text block:
+
+            [Forwarded message from <name>]
+            <original transcript or "(no transcript)">
+            [Attached link: ...]          ← link attachments, inline
+            [Attachment foo.pdf — ...]    ← non-image files, noted only
+
+        Image attachments are downloaded through the share-link-scoped
+        signed-URL route (the bot may lack access to the original
+        message's channel; the link itself authorizes) into the same
+        IMAGE_CACHE_DIR as regular inbound images, and returned as bare
+        local paths for ``MessageEvent.media_urls``.
+        """
+        try:
+            share_link = await self._api.get_share_link(share_link_id)
+        except Exception as exc:
+            logger.warning(
+                "carbonvoice: share-link fetch failed for %s: %s",
+                share_link_id, exc,
+            )
+            return None
+        shared = (share_link or {}).get("shared_message")
+        if not isinstance(shared, dict):
+            logger.warning(
+                "carbonvoice: share link %s has no shared_message "
+                "(revoked / expired / no access?)",
+                share_link_id,
+            )
+            return None
+
+        # Original sender: resolve against this channel's roster (cache
+        # hit). The original author often isn't a member of the channel
+        # the forward landed in — fall back to the raw id.
+        sm_creator = extract_creator_id(shared)
+        sender = ""
+        if sm_creator and self._channels is not None:
+            sender = await self._channels.resolve_name(
+                channel_id, sm_creator
+            ) or ""
+        sender = sender or sm_creator or "unknown sender"
+
+        from gateway.platforms.base import IMAGE_CACHE_DIR
+
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        att_lines: list[str] = []
+
+        for att in extract_attachments(shared):
+            aid = att.get("_id") or ""
+            mime = (att.get("mime_type") or "").lower()
+            att_type = (att.get("type") or "").lower()
+            link = att.get("link") or ""
+            filename = att.get("filename") or aid or "attachment.bin"
+            status = (att.get("status") or "").lower()
+
+            if att_type == "link":
+                # Same inline-URL treatment as wrapper-level link
+                # attachments — the agent fetches it with its web tools.
+                if link:
+                    att_lines.append(f"[Attached link: {link}]")
+                continue
+            if status == "failed":
+                att_lines.append(
+                    f"[Attachment {filename} — upload failed on the "
+                    "original message]"
+                )
+                continue
+            if status and status != "uploaded":
+                # Initializing / Uploading — the original's file isn't on
+                # S3 yet. Retry the whole forward.
+                logger.info(
+                    "carbonvoice: forwarded attachment %s still %s — "
+                    "holding for retry", filename, status,
+                )
+                return None
+            if not mime.startswith("image/"):
+                # Same image-only scope as _collect_inbound_media (no
+                # document pipeline in Hermes core yet) — but note the
+                # file in the text so the agent knows it exists.
+                att_lines.append(
+                    f"[Attachment {filename} ({mime or 'unknown type'}) — "
+                    "not imported: only image attachments are supported]"
+                )
+                logger.warning(
+                    "carbonvoice: skipping forwarded attachment %s (%s) — "
+                    "only image/* is wired (see DEVELOPMENT.md §4)",
+                    filename, mime or "no-mime",
+                )
+                continue
+            if not aid:
+                continue
+            try:
+                local_path = await self._api.download_share_link_attachment(
+                    share_link_id,
+                    aid,
+                    IMAGE_CACHE_DIR,
+                    filename=filename,
+                    max_bytes=self._max_attachment_bytes,
+                )
+            except ValueError as exc:
+                # Size cap — permanent, don't hold the cursor for it.
+                att_lines.append(
+                    f"[Attachment {filename} — skipped: too large]"
+                )
+                logger.warning(
+                    "carbonvoice: oversized forwarded attachment %s: %s",
+                    filename, exc,
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "carbonvoice: forwarded attachment download failed "
+                    "%s (%s): %s — holding for retry",
+                    filename, aid, exc,
+                )
+                return None
+            media_urls.append(str(local_path))
+            media_types.append(mime)
+            logger.info(
+                "carbonvoice: forwarded attachment downloaded — "
+                "att=%s mime=%s path=%s", aid, mime, local_path,
+            )
+
+        block = (
+            f"[Forwarded message from {sender}]\n"
+            + (extract_transcript(shared) or "(no transcript)")
+        )
+        if att_lines:
+            block += "\n" + "\n".join(att_lines)
+        return {
+            "text": block,
+            "media_urls": media_urls,
+            "media_types": media_types,
+        }
+
     async def _process_message(self, msg: Dict[str, Any]) -> Optional[bool]:
         """Process one inbound message; return its disposition for the cursor.
 
@@ -1306,10 +1520,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
           - ``False`` — skipped for good (self-loop, single-user restrict,
             not allowed, deduped, gate-rejected). Safe to advance past.
           - ``None``  — *stuck*: the transcript isn't ready yet (CV is
-            still transcribing). The caller holds the cursor just *before*
-            this message so the next poll re-fetches and retries it,
-            instead of advancing past and risking a skip. Mirrors the
-            Claude Code Channel's null-return contract.
+            still transcribing), or the message is a forward whose
+            share-link content couldn't be resolved yet. The caller holds
+            the cursor just *before* this message so the next poll
+            re-fetches and retries it, instead of advancing past and
+            risking a skip. Mirrors the Claude Code Channel's null-return
+            contract.
         """
         message_id = extract_message_id(msg)
         if not message_id:
@@ -1385,16 +1601,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # waiting and let it advance the cursor (return False, not None).
         transcript = extract_transcript(msg)
         if not transcript:
-            age = message_age_seconds(msg, now_utc())
-            if age is not None and age > self._stuck_max_age_s:
+            # Forwards are the exception to the stuck-wait: a forward with
+            # no typed comment never gets a transcript of its own — the
+            # content lives behind the share link (fetched below). Only a
+            # *voice* comment (is_text_message False) still waits for STT
+            # like any voice message, and at the age cutoff it falls
+            # through to forward processing (comment lost) instead of
+            # being skipped (whole forward lost).
+            share_link_hint = extract_share_link_id(msg)
+            if not share_link_hint or msg.get("is_text_message") is False:
+                age = message_age_seconds(msg, now_utc())
+                if age is None or age <= self._stuck_max_age_s:
+                    return None
+                if not share_link_hint:
+                    logger.info(
+                        "carbonvoice: message %s has no transcript after %.0fs "
+                        "(> %ss) — treating as permanently empty, advancing past it",
+                        message_id, age, self._stuck_max_age_s,
+                    )
+                    self._seen.mark(message_id)
+                    return False
                 logger.info(
-                    "carbonvoice: message %s has no transcript after %.0fs "
-                    "(> %ss) — treating as permanently empty, advancing past it",
-                    message_id, age, self._stuck_max_age_s,
+                    "carbonvoice: forward %s voice comment never transcribed "
+                    "after %.0fs — proceeding with forwarded content only",
+                    message_id, age,
                 )
-                self._seen.mark(message_id)
-                return False
-            return None
 
         # V5 source-of-truth enrichment. The socket / v3-poll push gives
         # us a V2-shaped payload that trails the v5 GET on async fields:
@@ -1423,6 +1654,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 )
                 enriched = None
             if enriched:
+                # Staleness guard: the v5 GET can race a write the push
+                # payload already reflects (read-replica lag) — if the v2
+                # copy has ``tagged_user_ids`` and the v5 copy doesn't,
+                # keep the populated array rather than letting the
+                # enrichment erase the mention.
+                if not enriched.get("tagged_user_ids") and msg.get("tagged_user_ids"):
+                    enriched["tagged_user_ids"] = msg["tagged_user_ids"]
                 msg = enriched
                 # Re-pull transcript from the (canonical) v5 payload —
                 # usually the same string but keeps everything in one
@@ -1507,6 +1745,27 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 "carbonvoice: skip message %s in %s — %s",
                 message_id, channel_id, decision.reason,
             )
+            # Revisitable rejection ("group without @-mention") of a *voice*
+            # message: the verdict is provisional. Flutter applies picker
+            # tags via the batch ``PUT /messages/:id/tagged-users`` only
+            # after STT finishes (~10–30s post-create), so at this moment
+            # ``tagged_user_ids`` may simply not be populated yet — or our
+            # read raced the tag write (the tag-set ``message:updated`` tick
+            # can fetch within ~100ms of the PUT and see a stale copy).
+            # Returning False here advances the cursor past the message, and
+            # since the tag PUT emits the LAST update that message ever
+            # gets, the mention would be lost forever (observed live). So:
+            # hold the cursor (stuck signal) while the message is young
+            # enough for tags to still be in flight; the retry tick
+            # re-fetches and re-evaluates. Text messages carry their tags on
+            # the create body, so a missing mention there is final — no hold.
+            if (
+                decision.revisitable
+                and msg.get("is_text_message") is False
+            ):
+                age = message_age_seconds(msg, now_utc())
+                if age is not None and age <= self._revisit_max_age_s:
+                    return None
             # Leave revisitable rejections out of the dedup cache so a
             # follow-up ``message:updated`` re-fire (e.g. cv-api emits
             # one after the async tag-resolution job populates
@@ -1516,6 +1775,34 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             if not decision.revisitable:
                 self._seen.mark(message_id)
             return False
+
+        # Forwarded message (share link): resolve the original message's
+        # content BEFORE committing (mark-seen + ack) so a failed or
+        # not-ready fetch can return None — the stuck signal — and the
+        # cursor holds for a retry next poll. Mirrors cv-claude-channels'
+        # retry-don't-skip contract for share links. Past the stuck cutoff
+        # we degrade to a placeholder rather than pinning the cursor
+        # forever (revoked/expired links never resolve).
+        forwarded: Optional[Dict[str, Any]] = None
+        share_link_id = extract_share_link_id(msg)
+        if share_link_id and self._api is not None:
+            forwarded = await self._fetch_forwarded_content(
+                share_link_id, channel_id
+            )
+            if forwarded is None:
+                age = message_age_seconds(msg, now_utc())
+                if age is None or age <= self._stuck_max_age_s:
+                    return None
+                logger.warning(
+                    "carbonvoice: forwarded content for %s (share link %s) "
+                    "unavailable after %.0fs — delivering placeholder",
+                    message_id, share_link_id, age,
+                )
+                forwarded = {
+                    "text": "[Forwarded message — original content unavailable]",
+                    "media_urls": [],
+                    "media_types": [],
+                }
 
         # Decision is "process" — commit to it. Marking seen here (rather
         # than before the gate) guarantees we only dedup messages we
@@ -1565,6 +1852,24 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # there is no inline ``@[name](guid)`` markup left to strip; pass
         # the transcript through as-is.
         clean_text = transcript
+
+        # Forwarded message: the agent reads the original content first,
+        # then the forwarder's comment (when there is one) — same layout
+        # cv-claude-channels sends:
+        #
+        #     [Forwarded message from <original sender>]
+        #     <original transcript / attachment lines>
+        #
+        #     [Forwarded by <user>]
+        #     <comment>
+        if forwarded is not None:
+            if transcript:
+                clean_text = (
+                    f"{forwarded['text']}\n\n"
+                    f"[Forwarded by {user_name}]\n{transcript}"
+                )
+            else:
+                clean_text = forwarded["text"]
 
         # Session sharing in groups: pass the thread root as
         # ``SessionSource.thread_id`` so Hermes core composes a shared
@@ -1621,6 +1926,13 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # browser / fetch tools to consume them. Anything else (PDFs,
         # binaries, …) is dropped with a WARNING.
         media_urls, media_types, link_urls = await self._collect_inbound_media(msg)
+
+        # Images attached to the *forwarded* (original) message ride the
+        # same vision pipeline as the wrapper's own attachments. Forwarded
+        # images first — they're what the text block describes.
+        if forwarded is not None and forwarded["media_urls"]:
+            media_urls = list(forwarded["media_urls"]) + media_urls
+            media_types = list(forwarded["media_types"]) + media_types
 
         # If CV's link-share UI was used, surface the URL(s) inline so
         # the agent can fetch them naturally. Prepending preserves the

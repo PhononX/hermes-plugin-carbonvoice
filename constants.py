@@ -12,6 +12,19 @@ DEFAULT_WS_RETRY_MAX_MS = 30_000
 DEFAULT_SEEN_TTL_S = 5 * 60
 DEFAULT_FLUSH_DEBOUNCE_S = 5.0
 
+# How long a gate-rejected *voice* message in a group may stay revisit-held
+# (cursor pinned, re-evaluated each tick) waiting for its picker tags.
+# Flutter applies tags via the batch PUT only after STT (~10–30s after
+# create); within this window a "no mention" verdict is provisional. Text
+# messages carry tags on the create body and never hold. Override with
+# CARBONVOICE_REVISIT_MAX_AGE_S.
+DEFAULT_REVISIT_MAX_AGE_S = 90
+
+# Delay before the one-shot self-scheduled re-tick that retries stuck /
+# revisit-held messages. Keeps retries flowing in WS mode (where polling is
+# stopped) without waiting for the next unrelated socket event.
+STUCK_RETRY_DELAY_S = 6.0
+
 # How long a message may stay "stuck" (no transcript yet) before we stop
 # holding the cursor for it. CV usually finishes transcribing within
 # seconds; a message with no transcript after this window almost certainly

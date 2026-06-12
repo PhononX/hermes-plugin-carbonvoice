@@ -255,6 +255,27 @@ Carbon Voice users can attach images to a message via the standard CV UI — pho
 
 **Size cap:** Set via `CARBONVOICE_MAX_ATTACHMENT_MB` (default `10`). Anything larger is dropped with a log line so the agent doesn't blow through vision-API token budgets on a 50 MB screenshot. Raise the cap for specialized workflows.
 
+### Forwarded messages
+
+Forwarding a Carbon Voice message to the agent works like it does in cv-claude-channels: the agent receives the *original* message's content (transcript + attachments), followed by the forwarder's comment when there is one.
+
+When a user forwards a message, CV creates a *share link* and stamps its id on the new wrapper message as `share_link_id`. The wrapper itself carries only the forwarder's optional comment — so the plugin resolves the original via `GET /v3/message-sharelinks/:share_link_id` and composes what the agent reads:
+
+```
+[Forwarded message from <original sender>]
+<original transcript or "(no transcript)">
+[Attached link: https://...]                ← link attachments, inline
+[Attachment report.pdf (application/pdf) — not imported: …]
+
+[Forwarded by <user>]
+<the forwarder's comment>                   ← section omitted if no comment
+```
+
+- **Attachments on the forwarded message** follow the same rules as regular inbound attachments: images are downloaded (via the share-link-scoped signed-URL route `GET /message-sharelinks/:id/attachments/signedurl/:attachment_id` — the link itself authorizes, so the bot doesn't need access to the original channel) and passed to vision; links surface inline; other types are noted in the text but not imported. The same `CARBONVOICE_MAX_ATTACHMENT_MB` cap applies.
+- **Retry semantics:** if the share-link lookup fails, the original's attachments are still uploading, or an image download fails, the message is treated as *stuck* — the poll cursor holds and retries it, exactly like a transcript that isn't ready yet. Past `CARBONVOICE_STUCK_MAX_AGE_S` the plugin delivers a `[Forwarded message — original content unavailable]` placeholder instead of pinning the cursor forever (revoked/expired links never resolve).
+- **Mention gate still applies:** in group channels the forward must @-mention the agent (in the forwarder's comment) like any other message; forwards in DMs are always processed.
+- **Nested forwards** are resolved one level deep (same as cv-claude-channels): the original message's content is fetched, but a forward-of-a-forward doesn't recurse further.
+
 #### Upstream dependency (Hermes core)
 
 Voice-out lands cleanly only when Hermes core honors two contracts the plugin relies on:

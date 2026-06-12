@@ -118,6 +118,20 @@ def extract_creator_id(msg: Dict[str, Any]) -> Optional[str]:
     return first_str(msg.get("creator_id"), msg.get("creator_guid"))
 
 
+def extract_share_link_id(msg: Dict[str, Any]) -> Optional[str]:
+    """Share-link id marking a *forwarded* message, or None.
+
+    When a user forwards a message, cv-api creates a MessageForward record
+    and stamps its id onto the new (wrapper) message as ``share_link_id``
+    (and the deprecated alias ``forward_id`` — both are set to the same
+    value by ``addForwardToMessage``). Present on V2 and V5 payloads. The
+    original message's content is NOT on the wrapper; it must be fetched
+    via ``GET /v3/message-sharelinks/{share_link_id}`` (the same flow
+    cv-claude-channels uses).
+    """
+    return first_str(msg.get("share_link_id"), msg.get("forward_id"))
+
+
 def message_age_seconds(msg: Dict[str, Any], now: "datetime") -> Optional[float]:
     """Seconds between a message's ``created_at`` and ``now``.
 
@@ -154,6 +168,10 @@ def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
         - ``length_in_bytes``: int or None (CV sometimes leaves it null)
         - ``type``: typically ``"file"``; other AttachmentType values
           (``link``, ``location``, ...) are rare on inbound
+        - ``status``: upload state (``Uploaded`` / ``Uploading`` /
+          ``Initializing`` / ``Failed``) or ``""`` when absent — callers
+          should treat a missing status as Uploaded (older payloads
+          predate the status field)
 
     Entries missing both ``_id`` and ``link`` are dropped (defensive —
     CV's responses occasionally include legacy/null rows). Voice memos
@@ -177,6 +195,7 @@ def extract_attachments(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
             "mime_type": att.get("mime_type") or "",
             "length_in_bytes": att.get("length_in_bytes"),
             "type": att.get("type") or "file",
+            "status": att.get("status") or "",
         })
     return out
 

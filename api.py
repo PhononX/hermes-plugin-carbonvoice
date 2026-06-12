@@ -458,9 +458,13 @@ class CarbonVoiceAPI:
         client = self._require_client()
         resp = await client.get(f"/attachments/signedurl/{attachment_id}")
         resp.raise_for_status()
-        # CV returns the URL either as a plain string or wrapped in
+        return self._unquote_url(resp.text)
+
+    @staticmethod
+    def _unquote_url(text: str) -> str:
+        # CV returns signed URLs either as a plain string or wrapped in
         # quotes (JSON string). Strip leading/trailing quotes either way.
-        url = resp.text.strip()
+        url = text.strip()
         if len(url) >= 2 and url[0] == url[-1] and url[0] in ('"', "'"):
             url = url[1:-1]
         return url
@@ -487,14 +491,32 @@ class CarbonVoiceAPI:
             httpx.HTTPStatusError: on the signed-URL fetch or the S3
                 download.
         """
+        signed_url = await self.get_attachment_download_url(attachment_id)
+        return await self._download_from_signed_url(
+            signed_url,
+            attachment_id,
+            dest_dir,
+            filename=filename,
+            max_bytes=max_bytes,
+        )
+
+    async def _download_from_signed_url(
+        self,
+        signed_url: str,
+        attachment_id: str,
+        dest_dir: "Path",
+        *,
+        filename: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> "Path":
+        """Stream a pre-signed S3 GET URL to ``dest_dir``; shared by the
+        regular and share-link attachment download paths."""
         from pathlib import Path as _Path
 
         dest_dir = _Path(dest_dir).expanduser()
         dest_dir.mkdir(parents=True, exist_ok=True)
         out_name = filename or f"{attachment_id}.bin"
         out_path = dest_dir / out_name
-
-        signed_url = await self.get_attachment_download_url(attachment_id)
 
         # S3 GET — use a fresh client without our Bearer header, since
         # the signed URL carries its own credentials in the query.
@@ -524,6 +546,80 @@ class CarbonVoiceAPI:
                                 f"limit {max_bytes} mid-stream"
                             )
         return out_path
+
+    # ── Forwarded messages (share links) ────────────────────────────────
+    #
+    # Forwarding a message in CV creates a *share link* and stamps its id
+    # on the new wrapper message as ``share_link_id``. The wrapper carries
+    # only the forwarder's optional comment — the original content
+    # (transcript + attachments) lives behind the share link. Same flow
+    # cv-claude-channels uses. Note the attachment signed-URL route is
+    # share-link-scoped (NOT the regular ``/attachments/signedurl/:id``):
+    # the bot may have access to the forward without having access to the
+    # original message's channel, and the share-link route authorizes via
+    # the link itself.
+
+    async def get_share_link(
+        self, share_link_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """GET /v3/message-sharelinks/{id} — share-link + shared_message.
+
+        Returns the share-link dict (with ``shared_message`` carrying the
+        original message's ``creator_id`` / ``text_models`` /
+        ``attachments``) or None on 4xx (revoked, expired, no access).
+        Retries transient 5xx — this read sits on the latency-critical
+        inbound path.
+        """
+        resp = await self._request_retrying(
+            "GET", f"/v3/message-sharelinks/{share_link_id}"
+        )
+        if resp.status_code >= 400 or not resp.content:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+
+    async def get_share_link_attachment_download_url(
+        self, share_link_id: str, attachment_id: str
+    ) -> str:
+        """GET /message-sharelinks/{sl}/attachments/signedurl/{att}.
+
+        Pre-signed S3 GET URL for an attachment on the *shared* (original)
+        message, authorized through the share link. Plain-string response,
+        same contract as :meth:`get_attachment_download_url`.
+        """
+        client = self._require_client()
+        resp = await client.get(
+            f"/message-sharelinks/{share_link_id}"
+            f"/attachments/signedurl/{attachment_id}"
+        )
+        resp.raise_for_status()
+        return self._unquote_url(resp.text)
+
+    async def download_share_link_attachment(
+        self,
+        share_link_id: str,
+        attachment_id: str,
+        dest_dir: "Path",
+        *,
+        filename: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> "Path":
+        """Download an attachment of a forwarded message to ``dest_dir``.
+
+        Same semantics as :meth:`download_attachment` (size cap,
+        ValueError on overflow) but resolves the signed URL through the
+        share-link-scoped route.
+        """
+        signed_url = await self.get_share_link_attachment_download_url(
+            share_link_id, attachment_id
+        )
+        return await self._download_from_signed_url(
+            signed_url,
+            attachment_id,
+            dest_dir,
+            filename=filename,
+            max_bytes=max_bytes,
+        )
 
     async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
         """GET /v5/messages/{id} — returns the flat MessageV5 dict or None.
