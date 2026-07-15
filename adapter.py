@@ -128,9 +128,10 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
     # contract (one bubble, text + audio together).
     #
     # The base class default is False, so adapters that don't override
-    # this are unaffected. Requires the patched base.py from PR 6 (and
-    # the parallel upstream PR) — without it the attribute is read but
-    # ignored, and we ship a duplicate text bubble.
+    # this are unaffected. Upstream Hermes honors this flag since the
+    # Carbon Voice platform PR (NousResearch/hermes-agent#43226) — on
+    # older cores the attribute is ignored and a duplicate text bubble
+    # ships alongside the voice memo.
     voice_out_carries_text = True
 
     def __init__(self, config: PlatformConfig):
@@ -320,6 +321,16 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             logger.error("carbonvoice: CARBONVOICE_PAT not set")
             return False
 
+        # Credential-scoped lock: prevent two gateways (e.g. different
+        # HERMES_HOME dirs) from claiming the same PAT at once. Same-pid
+        # re-acquire is allowed, so reconnect retries don't self-block.
+        # Guarded with hasattr — the helper only exists on newer Hermes
+        # cores; older cores simply skip the check.
+        if hasattr(self, "_acquire_platform_lock") and not self._acquire_platform_lock(
+            "carbonvoice-pat", self._pat, "Carbon Voice PAT"
+        ):
+            return False
+
         await self._api.open()
 
         try:
@@ -392,6 +403,8 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         await self._cursor.stop()
         if self._api is not None:
             await self._api.close()
+        if hasattr(self, "_release_platform_lock"):
+            self._release_platform_lock()
         self._mark_disconnected()
 
     # ── Outbound (Hermes → Carbon Voice) ─────────────────────────────────
