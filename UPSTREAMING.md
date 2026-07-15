@@ -1,5 +1,20 @@
 # Upstreaming Carbon Voice as a native Hermes platform
 
+> **Status (2026-07-15): superseded — upstreaming landed as a BUNDLED PLUGIN,
+> not a native platform.** The native route below was implemented and submitted
+> as [NousResearch/hermes-agent#43226](https://github.com/NousResearch/hermes-agent/pull/43226);
+> core review asked to rework it as a platform plugin (upstream has since moved
+> ALL platforms — telegram, discord, slack, whatsapp… — to bundled plugins under
+> `plugins/platforms/`). The PR now ships this plugin nearly verbatim as
+> `plugins/platforms/carbonvoice/` plus one general core contract
+> (`voice_out_carries_text` honored in base.py's auto-TTS flow).
+>
+> **Sync discipline:** the same code lives here and in the upstream PR branch
+> until it merges. Fixes made in one home must be mirrored to the other.
+> Mirrored so far: the PAT credential-scoped lock in `connect()`/`disconnect()`
+> (hasattr-guarded here for older cores). The rest of this doc is the original
+> native-platform plan, kept for historical context.
+
 How to promote this external plugin into a **native/built-in** platform in
 Hermes Agent core. This is a planning doc — nothing here is done yet.
 
