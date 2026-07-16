@@ -316,7 +316,12 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Newer Hermes cores forward ``is_reconnect`` (cold boot vs gateway-
+        # driven reconnect); older cores call ``connect()`` bare — the
+        # keyword-with-default is compatible with both. No special handling
+        # needed: the disk cursor makes both paths identical (we always
+        # catch up from the last processed message).
         if not self._pat or self._api is None:
             logger.error("carbonvoice: CARBONVOICE_PAT not set")
             return False
