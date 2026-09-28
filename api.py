@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 try:
@@ -28,11 +29,32 @@ from .constants import (
     TRANSIENT_RETRY_ATTEMPTS,
     TRANSIENT_RETRY_BACKOFF_S,
     TRANSIENT_STATUS,
+    UPDATES_PAGE_LIMIT,
     USER_AGENT,
 )
-from .parse import client_headers, first_str
+from .parse import client_headers, first_str, normalize_v6
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidCursorError(Exception):
+    """The server rejected a ``/v6/messages/updates`` cursor (HTTP 400).
+
+    Distinct from every other failure on purpose: only this one means the
+    stored cursor is unusable and must be dropped (re-anchor by date). A
+    network error, 5xx or 401 says nothing about the cursor, which must be
+    kept for the next attempt.
+    """
+
+
+@dataclass
+class MessageUpdatesPage:
+    """One page of ``GET /v6/messages/updates``, messages already normalised
+    to the legacy shape (see :func:`parse.normalize_v6`)."""
+
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    has_more: bool = False
+    next_cursor: Optional[str] = None
 
 
 class CarbonVoiceAPI:
@@ -90,7 +112,7 @@ class CarbonVoiceAPI:
         wrap a send/POST that creates a message (a retry could duplicate it).
 
         CV's gateway returns 502s in bursts; without this a transient hiccup
-        on a latency-critical read (e.g. v5 enrichment, a reaction) stalls
+        on a latency-critical read (e.g. v6 enrichment, a reaction) stalls
         until the next ~5s poll tick. Retries recover in <1s. Returns the
         final response (the caller still inspects status); raises the last
         network error if every attempt failed to connect.
@@ -141,36 +163,75 @@ class CarbonVoiceAPI:
             first_str(user.get("created_by")),
         )
 
-    async def fetch_recent(
+    async def fetch_message_updates(
         self,
-        since_iso: str,
+        *,
+        date: Optional[str] = None,
+        cursor: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         direction: str = "newer",
-        limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        client = self._require_client()
-        # ``use_last_updated: True`` filters by ``updated_at`` instead
-        # of ``created_at``. Required for voice messages with picker
-        # tags: ``created_at`` fires when the audio bytes land (no
-        # transcript, no tagged_user_ids), but the backend updates the
-        # message ~10–15 s later when STT and the tag-resolution job
-        # finish, bumping ``updated_at`` and emitting cv-api's
-        # ``message:updated`` socket event. With the old
-        # ``created_at`` filter, the polling/catch-up after that socket
-        # event missed the message entirely — its ``created_at`` was
-        # already older than the cursor that advanced past the empty
-        # ``message:created`` window. SeenCache (TTL 5 min) handles the
-        # extra fan-out from messages that update multiple times in
-        # the lookback window.
-        body = {
-            "date": since_iso,
-            "direction": direction,
-            "limit": limit,
-            "use_last_updated": True,
-        }
-        resp = await client.post("/v3/messages/recent", json=body)
+        limit: int = UPDATES_PAGE_LIMIT,
+    ) -> MessageUpdatesPage:
+        """GET /v6/messages/updates — one keyset page, normalised to legacy.
+
+        The feed is ordered by ``last_updated_at``, so it surfaces messages
+        that were created *or* changed since the anchor. That is what voice
+        messages with picker tags need: ``created_at`` fires when the audio
+        lands (no transcript, no ``tagged_user_ids``) and the message is
+        updated ~10–30s later when STT and tag resolution finish.
+
+        Paging contract (cv-api ``MessagesResponseV6``):
+          - First page: ``date`` (ISO) + ``direction``. Later pages:
+            ``cursor = next_cursor`` + the same ``direction``, no ``date``
+            (a cursor supersedes the date anchor server-side).
+          - Keep paging while ``has_more``; never infer the end from a short
+            page.
+          - With ``direction=newer`` the final page still carries
+            ``next_cursor`` (the newest row seen) — persist it as the resume
+            point. It is null only on an empty date-anchored page; an empty
+            page reached via a cursor echoes the cursor back.
+          - A resume cursor may re-deliver up to ~4s of already-seen rows,
+            and the first date-anchored page is shifted back ~4s: callers
+            must de-duplicate by ``id``.
+
+        Scope with ``conversation_id`` — the legacy ``channel_id`` key is
+        rejected with a 400 by the v6 deprecated-fields pipe. Raises
+        :class:`InvalidCursorError` when a ``cursor`` was sent and the server
+        answers 400 (it rejects a cursor it can't decode with ``400 Invalid
+        cursor``); every other failure raises the usual httpx error so the
+        caller keeps its stored cursor.
+        """
+        # The server 400s on limit > 200 rather than capping it.
+        limit = max(1, min(int(limit), UPDATES_PAGE_LIMIT))
+        params: Dict[str, Any] = {"direction": direction, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        elif date:
+            params["date"] = date
+        else:
+            raise ValueError("fetch_message_updates needs a date or a cursor")
+        if conversation_id:
+            params["conversation_id"] = conversation_id.strip()
+
+        resp = await self._request_retrying(
+            "GET", "/v6/messages/updates", params=params
+        )
+        if cursor and resp.status_code == 400:
+            raise InvalidCursorError(resp.text[:200])
         resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else []
+        data = resp.json() or {}
+        if not isinstance(data, dict):
+            data = {}
+        raw = data.get("data")
+        next_cursor = data.get("next_cursor")
+        return MessageUpdatesPage(
+            messages=[
+                normalize_v6(m) for m in (raw if isinstance(raw, list) else [])
+                if isinstance(m, dict)
+            ],
+            has_more=bool(data.get("has_more")),
+            next_cursor=next_cursor if isinstance(next_cursor, str) and next_cursor else None,
+        )
 
     async def send_message(
         self,
@@ -564,21 +625,27 @@ class CarbonVoiceAPI:
     async def get_share_link(
         self, share_link_id: str
     ) -> Optional[Dict[str, Any]]:
-        """GET /v3/message-sharelinks/{id} — share-link + shared_message.
+        """GET /v6/message-sharelinks/{id} — share-link + shared_message.
 
-        Returns the share-link dict (with ``shared_message`` carrying the
-        original message's ``creator_id`` / ``text_models`` /
-        ``attachments``) or None on 4xx (revoked, expired, no access).
+        Returns the share-link dict with ``shared_message`` (the original
+        message, delivered as MessageV6 and normalised here to the legacy
+        shape, so ``creator_id`` / ``text_models`` / ``attachments[]._id``
+        read as before) or None on 4xx (revoked, expired, no access).
         Retries transient 5xx — this read sits on the latency-critical
         inbound path.
         """
         resp = await self._request_retrying(
-            "GET", f"/v3/message-sharelinks/{share_link_id}"
+            "GET", f"/v6/message-sharelinks/{share_link_id}"
         )
         if resp.status_code >= 400 or not resp.content:
             return None
         data = resp.json()
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        shared = data.get("shared_message")
+        if isinstance(shared, dict):
+            data = {**data, "shared_message": normalize_v6(shared)}
+        return data
 
     async def get_share_link_attachment_download_url(
         self, share_link_id: str, attachment_id: str
@@ -623,63 +690,72 @@ class CarbonVoiceAPI:
             max_bytes=max_bytes,
         )
 
-    async def get_message_v5(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """GET /v5/messages/{id} — returns the flat MessageV5 dict or None.
+    async def get_message_v6(
+        self,
+        message_id: str,
+        *,
+        language: Optional[str] = None,
+        presigned_url: bool = False,
+        fresh: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """GET /v6/messages/{id} — one message, normalised to legacy, or None.
 
-        The v5 single-GET wraps its payload in a ``{"message": {...}}``
-        envelope (unlike ``GET /v3/messages/{id}``, which is flat). We
-        unwrap it here so callers receive the flat shape that the
-        ``extract_*`` helpers and the mention gate expect:
-        ``tagged_user_ids``, ``parent_message_id``, and ``transcript``
-        live on the message object, not the envelope.
+        The response is a ``{"message": MessageV6}`` envelope; the message
+        is unwrapped and passed through :func:`parse.normalize_v6`, so
+        callers get the same shape as a socket payload
+        (``tagged_user_ids``, ``parent_message_id``, ``text_models``,
+        ``channel_ids``). Returning the envelope unchanged once hid every
+        field behind the ``message`` key and silently dropped @-mentions in
+        group channels. A flat body is tolerated defensively.
 
-        Returning the envelope unchanged hid every field behind the
-        ``message`` key — that was the bug that silently dropped
-        @-mentions in group channels: the enriched payload's
-        ``tagged_user_ids`` was invisible to ``is_user_mentioned``
-        (DMs masked it, since the gate passes them regardless).
-
-        ``parent_message_id`` is the canonical public thread field
-        (cv-contracts 4.0.1 / cv-api PR #277 removed the short-lived
-        ``thread_id`` field). The unwrap is defensive: if the endpoint
-        ever returns a flat body, that is passed through unchanged.
+        Optional query: ``language`` (preferred rendition), ``presigned_url``
+        (include presigned audio URLs), ``fresh`` (bypass the server's
+        per-message cache; the per-user fields are always live).
         """
-        resp = await self._request_retrying("GET", f"/v5/messages/{message_id}")
+        params: Dict[str, Any] = {}
+        if language:
+            params["language"] = language
+        if presigned_url:
+            params["presigned_url"] = "true"
+        if fresh:
+            params["fresh"] = "true"
+        resp = await self._request_retrying(
+            "GET", f"/v6/messages/{message_id}", params=params or None
+        )
         if resp.status_code >= 400 or not resp.content:
             return None
         data = resp.json()
         if not isinstance(data, dict):
             return None
         inner = data.get("message")
-        return inner if isinstance(inner, dict) else data
+        return normalize_v6(inner if isinstance(inner, dict) else data)
 
-    async def get_messages_by_ids_v5(
+    async def get_messages_by_ids_v6(
         self, conversation_id: str, message_ids: List[str]
     ) -> List[Dict[str, Any]]:
-        """POST /v5/messages/by-ids — batch fetch of multiple MessageV5s.
+        """POST /v6/messages/by-ids — batch fetch, normalised to legacy.
 
         Used by the thread-context fetch path (see
         ``adapter._fetch_thread_context``) to pull the transcripts for the
         message ids that ``list_channel_message_index`` identified as
         belonging to the thread, in a single round-trip.
 
-        The endpoint requires BOTH ``conversation_id`` and ``message_ids``
-        — it rejects the message-id list alone with a 400
-        ("conversation_id should not be empty"). The returned items are
-        flat MessageV5 dicts (no ``{"message": …}`` envelope, unlike the
-        single ``GET /v5/messages/{id}``), so ``extract_*`` helpers work on
-        them directly.
+        Body ``{conversation_id, message_ids}`` — both required (the id
+        list alone is a 400 "conversation_id should not be empty"); only
+        messages in that conversation are returned. The response is a bare
+        ``MessageV6[]`` array (no envelope).
         """
         if not message_ids:
             return []
         client = self._require_client()
         resp = await client.post(
-            "/v5/messages/by-ids",
+            "/v6/messages/by-ids",
             json={"conversation_id": conversation_id.strip(), "message_ids": message_ids},
         )
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else data.get("messages", []) if isinstance(data, dict) else []
+        items = data if isinstance(data, list) else []
+        return [normalize_v6(m) for m in items if isinstance(m, dict)]
 
     async def list_channel_message_index(
         self,
@@ -696,17 +772,18 @@ class CarbonVoiceAPI:
         recent messages, filter client-side by ``parent_message_id ==
         thread_id`` (CV is flat — every reply's ``parent_message_id`` is
         the true root, see DEVELOPMENT.md §4), then batch-fetch the
-        identified ids via :meth:`get_messages_by_ids_v5`.
+        identified ids via :meth:`get_messages_by_ids_v6`.
 
         ``direction='older'`` defaults to "the last <limit> messages in the
         channel" — what we want for thread context. The caller passes
         ``limit`` sized for typical active-channel volume (200 is a
         reasonable upper bound for a 30-message thread cap).
 
-        This is a v3-only endpoint today; the cv-api roadmap may add a
-        more direct ``GET /v5/channels/:id/threads/:thread_id/messages``
-        in the future, at which point the workaround here collapses to a
-        single call.
+        This unversioned endpoint has no v6 equivalent yet (the v6 list
+        routes page a whole conversation by date/cursor, not a thread), so
+        it stays on the legacy route; only the follow-up by-ids batch moved
+        to v6. A future thread-scoped route would collapse this to a single
+        call.
         """
         client = self._require_client()
         params: Dict[str, Any] = {
@@ -787,21 +864,6 @@ class CarbonVoiceAPI:
             params={"type": "message", "notification_removal_mode": "hard"},
         )
         resp.raise_for_status()
-
-    async def get_message(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """GET /v3/messages/{message_id} — returns the message dict or None on 4xx.
-
-        Same payload shape as inbound Socket.IO / fetch_recent messages, so
-        parse helpers (``extract_transcript``, ``extract_creator_id``, etc.)
-        work unchanged. Used to resolve the text of a parent message when an
-        inbound reply carries ``parent_message_id`` — gives the agent the
-        thread context it would otherwise have to guess at.
-        """
-        client = self._require_client()
-        resp = await client.get(f"/v3/messages/{message_id}")
-        if resp.status_code >= 400:
-            return None
-        return resp.json() if resp.content else None
 
     async def get_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """GET /channel/{id} — returns the PersonalizedChannel dict or None on 4xx.

@@ -2,7 +2,7 @@
 
 Architecture:
     Hermes  <──Socket.IO (primary)──   api.carbonvoice.app
-    Hermes  ── REST poll fallback ──>  /v3/messages/recent
+    Hermes  ── REST poll fallback ──>  GET /v6/messages/updates
     Hermes  ── POST /v3/messages/start ──>  outbound replies
 
 This module is the thin orchestrator that wires together:
@@ -17,7 +17,7 @@ This module is the thin orchestrator that wires together:
     audit        — allowlist gate + ignored-sender audit log
 
 No public webhook is required — the adapter holds an outbound Socket.IO
-connection and polls /v3/messages/recent as a fallback. Cursor state is
+connection and polls GET /v6/messages/updates as a fallback. Cursor state is
 persisted to disk so messages received while Hermes was offline are
 processed on the next startup.
 """
@@ -50,7 +50,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
-from .api import CarbonVoiceAPI
+from .api import CarbonVoiceAPI, InvalidCursorError
 from .audit import AllowlistGate, IgnoredSenderLog, default_ignored_log_path
 from .permits import ApprovalStore, parse_admin_command
 from .channels import ChannelCache
@@ -64,12 +64,14 @@ from .constants import (
     DEFAULT_STUCK_MAX_AGE_S,
     DEFAULT_WS_RETRY_MAX_MS,
     MAX_MESSAGE_LENGTH,
+    POLL_DEDUPE_MAX,
     SIGNAL_CLEAR_TTL_MS,
     SIGNAL_ERROR_COOLDOWN_S,
     SIGNAL_TTL_MS,
     SIGNAL_TYPE_BY_KIND,
     SIGNAL_TYPE_DEFAULT,
     STUCK_RETRY_DELAY_S,
+    UPDATES_MAX_PAGES_PER_TICK,
 )
 from .dedupe import SeenCache
 from .gate import MentionGate
@@ -254,6 +256,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         self._api = CarbonVoiceAPI(pat, base_url) if pat and HTTPX_AVAILABLE else None
         self._cursor = Cursor(state_path)
         self._seen = SeenCache()
+        # id → last_updated_at of rows handled from the updates feed, to drop
+        # the feed's ~4s re-deliveries (see _is_redelivered). Bounded LRU.
+        self._polled: "OrderedDict[str, str]" = OrderedDict()
         self._transport = Transport(
             base_url=base_url,
             pat=pat,
@@ -1099,7 +1104,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
           2. ``api.list_channel_message_index`` → ids + ``parent_message_id``.
           3. Client-side filter to thread (root + replies whose
              ``parent_message_id == thread_id``).
-          4. ``api.get_messages_by_ids_v5`` for the last ``limit``
+          4. ``api.get_messages_by_ids_v6`` for the last ``limit``
              transcripts in chronological order.
           5. Exclude the current triggering message (it will be delivered
              as the user message itself) and exclude our own prior bot
@@ -1177,10 +1182,10 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         ids = [mid for mid, _, _ in thread_items]
         try:
-            full = await self._api.get_messages_by_ids_v5(channel_id, ids)
+            full = await self._api.get_messages_by_ids_v6(channel_id, ids)
         except Exception as exc:
             logger.debug(
-                "carbonvoice: get_messages_by_ids_v5 for thread context failed: %s",
+                "carbonvoice: get_messages_by_ids_v6 for thread context failed: %s",
                 exc,
             )
             return ""
@@ -1273,61 +1278,155 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                 await self._fetch_missed_messages_locked()
 
     async def _fetch_missed_messages_locked(self) -> None:
+        """One sync of ``GET /v6/messages/updates``: fetch, process, persist.
+
+        1. **Fetch** — resume from the stored cursor (or anchor by the
+           ``lastSeenAt`` date seed when there is none) and follow
+           ``next_cursor`` while ``has_more``, up to
+           ``UPDATES_MAX_PAGES_PER_TICK`` pages.
+        2. **Process** every fetched message, dropping rows the feed
+           re-delivers (same ``id`` *and* ``last_updated_at`` as one already
+           handled — see :meth:`_is_redelivered`).
+        3. **Persist** the resume cursor only after the whole batch was
+           handled, so a crash mid-batch re-fetches (and de-duplicates)
+           instead of skipping. A stuck message holds the cursor at the page
+           that delivered it.
+        """
         request_started_at = now_iso()
 
-        if not self._cursor.last_seen_at:
+        if not self._cursor.cursor and not self._cursor.last_seen_at:
             logger.info(
                 "carbonvoice: first run, starting from %s", request_started_at
             )
             self._cursor.advance(request_started_at)
             return
 
-        try:
-            messages = await self._api.fetch_recent(self._cursor.last_seen_at)
-        except Exception as exc:
-            logger.warning("carbonvoice: /v3/messages/recent failed: %s", exc)
-            return  # don't advance cursor — retry same window next tick
+        # ── 1. Fetch ────────────────────────────────────────────────────
+        # Each entry pairs a page's messages with the cursor that fetched it
+        # (None for the date-anchored first page) — the hold point if a
+        # message on that page turns out to be stuck.
+        pages: "list[tuple[Optional[str], list[Dict[str, Any]]]]" = []
+        cursor = self._cursor.cursor
+        tail_cursor: Optional[str] = None  # next_cursor of the last page
+        complete = False          # reached has_more=false
+        reanchored = False        # stored cursor rejected, retried by date
+        abandon_cursor = False    # a cursor was rejected mid-sync
+        while len(pages) < UPDATES_MAX_PAGES_PER_TICK:
+            try:
+                page = await self._api.fetch_message_updates(
+                    cursor=cursor,
+                    date=None if cursor else self._cursor.last_seen_at,
+                )
+            except InvalidCursorError as exc:
+                # The server can't decode the cursor (400). Only this error
+                # discards it; every other failure below keeps it.
+                logger.warning(
+                    "carbonvoice: updates cursor rejected (%s) — re-anchoring "
+                    "by date %s", exc, self._cursor.last_seen_at,
+                )
+                self._cursor.clear_cursor()
+                if pages or reanchored:
+                    # Rejected mid-sync: handle what we have, persist no
+                    # cursor, and re-anchor by date on the next sync.
+                    abandon_cursor = True
+                    break
+                if not self._cursor.last_seen_at:
+                    self._cursor.advance(request_started_at)
+                    break
+                reanchored = True
+                cursor = None  # retry this sync from the date seed
+                continue
+            except Exception as exc:
+                # Network / 5xx / 401: says nothing about the cursor. Keep
+                # it and retry next tick (pages already fetched are still
+                # handled below).
+                logger.warning("carbonvoice: /v6/messages/updates failed: %s", exc)
+                break
+            pages.append((cursor, page.messages))
+            tail_cursor = page.next_cursor
+            if not page.has_more:
+                complete = True
+                break
+            if not page.next_cursor:
+                logger.warning(
+                    "carbonvoice: updates page has_more without next_cursor — "
+                    "stopping this sync"
+                )
+                break
+            cursor = page.next_cursor
+
+        if not pages:
+            return
+
+        all_messages = [m for _, msgs in pages for m in msgs]
 
         # One-tap approval: resolve any owner 👍/👎 reactions on our pending
         # prompts. Done first (and best-effort) so an approval lands even if
         # the prompt isn't in this fetch window. Never blocks the main path.
         try:
-            await self._check_pending_prompt_reactions(messages)
+            await self._check_pending_prompt_reactions(all_messages)
         except Exception as exc:
             logger.debug("carbonvoice: pending-prompt reaction check failed: %s", exc)
 
-        messages.sort(key=lambda m: m.get("created_at") or "")
-
-        # Track the first "stuck" message (transcript not ready yet —
-        # `_process_message` returns None). We hold the cursor just before
-        # it so the next poll re-fetches from there and retries, instead of
+        # ── 2. Process ──────────────────────────────────────────────────
+        # Track the first page holding a "stuck" message (transcript not
+        # ready yet — `_process_message` returns None). The cursor is held at
+        # that page so the next sync re-fetches and retries it, instead of
         # advancing past and risking a skip. Mirrors the Claude Code
         # Channel's stuck-message handling.
-        first_stuck_idx: Optional[int] = None
-        for i, msg in enumerate(messages):
-            try:
-                result = await self._process_message(msg)
-            except Exception as exc:
-                logger.error("carbonvoice: process_message error: %s", exc)
-                continue
-            if result is None and first_stuck_idx is None:
-                first_stuck_idx = i
+        first_stuck_page: Optional[int] = None
+        for page_idx, (_, msgs) in enumerate(pages):
+            for msg in msgs:
+                if self._is_redelivered(msg):
+                    continue
+                try:
+                    result = await self._process_message(msg)
+                except Exception as exc:
+                    logger.error("carbonvoice: process_message error: %s", exc)
+                    # Not handled — hold the cursor like a stuck message
+                    # while it is young, so a transient failure is retried
+                    # rather than skipped; past the stuck cutoff let it go so
+                    # one poison message can't pin the cursor forever.
+                    age = message_age_seconds(msg, now_utc())
+                    result = (
+                        None if age is None or age <= self._stuck_max_age_s
+                        else False
+                    )
+                if result is None:
+                    if first_stuck_page is None:
+                        first_stuck_page = page_idx
+                    continue
+                self._remember_polled(msg)
 
-        # Advance the cursor as far as is safe:
-        #   - no stuck messages → advance to the request start time
-        #     (clock-safe; avoids missing concurrent writes mid-call).
-        #   - some stuck → advance only to just before the first stuck
-        #     message, leaving it (and everything after) for the next poll.
-        #     Earlier already-dispatched messages are deduped by SeenCache
-        #     if the shrunk window re-fetches them.
-        #   - first message stuck (idx 0) or no usable timestamp → leave
-        #     the cursor unchanged so the stuck message is retried.
-        if first_stuck_idx is None:
+        # ── 3. Persist ──────────────────────────────────────────────────
+        #   - a cursor was rejected mid-sync → persist nothing; the next
+        #     sync re-anchors by the date seed.
+        #   - something stuck → hold at the cursor that fetched the first
+        #     stuck page (None = the date-anchored page: leave state as is).
+        #     Handled messages on re-fetched pages are dropped by
+        #     _is_redelivered / SeenCache.
+        #   - otherwise → the tail next_cursor. With direction=newer the
+        #     last page carries it even when has_more is false; it is null
+        #     only on an empty date-anchored page, in which case the date
+        #     seed moves to the request start instead.
+        if abandon_cursor:
+            pass
+        elif first_stuck_page is not None:
+            hold = pages[first_stuck_page][0]
+            if hold:
+                self._cursor.set_cursor(hold)
+        elif tail_cursor:
+            self._cursor.set_cursor(
+                tail_cursor, seed_iso=request_started_at if complete else None
+            )
+        elif complete:
             self._cursor.advance(request_started_at)
-        elif first_stuck_idx > 0:
-            prev_created = messages[first_stuck_idx - 1].get("created_at")
-            if isinstance(prev_created, str) and prev_created:
-                self._cursor.advance(prev_created)
+
+        if first_stuck_page is None and not complete and not abandon_cursor \
+                and len(pages) >= UPDATES_MAX_PAGES_PER_TICK:
+            # Backlog longer than one sync: continue from the persisted
+            # cursor in a trailing re-fetch (the lock holder loops on this).
+            self._tick_pending = True
 
         # Something is held (no-transcript stuck or revisit-held): schedule a
         # one-shot delayed re-tick so the retry doesn't depend on the next
@@ -1336,8 +1435,31 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # reconnect cycle (observed: tens of minutes). One task at a time —
         # each retry re-schedules itself via this same path while anything
         # remains held.
-        if first_stuck_idx is not None:
+        if first_stuck_page is not None:
             self._schedule_stuck_retry()
+
+    def _is_redelivered(self, msg: Dict[str, Any]) -> bool:
+        """True when the updates feed re-delivers a row already handled.
+
+        The feed shifts a date-anchored first page back ~4s and a young
+        resume cursor re-delivers up to ~4s behind it, so the same row can
+        arrive twice. Keyed on ``id`` + ``last_updated_at``: a genuine update
+        (transcript landed, tags resolved) bumps ``last_updated_at`` and is
+        processed again — the gates rely on that re-fire.
+        """
+        message_id = extract_message_id(msg)
+        if not message_id or message_id not in self._polled:
+            return False
+        return self._polled[message_id] == (msg.get("last_updated_at") or "")
+
+    def _remember_polled(self, msg: Dict[str, Any]) -> None:
+        message_id = extract_message_id(msg)
+        if not message_id:
+            return
+        self._polled[message_id] = msg.get("last_updated_at") or ""
+        self._polled.move_to_end(message_id)
+        while len(self._polled) > POLL_DEDUPE_MAX:
+            self._polled.popitem(last=False)
 
     def _schedule_stuck_retry(self) -> None:
         if self._stuck_retry_task is not None and not self._stuck_retry_task.done():
@@ -1766,44 +1888,44 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
                     message_id, age,
                 )
 
-        # V5 source-of-truth enrichment. The socket / v3-poll push gives
-        # us a V2-shaped payload that trails the v5 GET on async fields:
+        # v6 source-of-truth enrichment. The socket push gives us a
+        # legacy-shaped payload that trails the REST read on async fields:
         # ``tagged_user_ids`` is empty here until a backend job resolves
         # the tag picker selection, and attachment metadata can lag the
-        # same way. CV's v5 endpoint is the canonical post-resolution
-        # state — the Flutter client follows the same "socket = signal,
-        # REST = truth" pattern.
+        # same way. CV's ``GET /v6/messages/{id}`` is the canonical
+        # post-resolution state — the Flutter client follows the same
+        # "socket = signal, REST = truth" pattern.
         #
         # We do the GET only here, after the cheap-reject gates above
         # (self-loop, allowlist, dedupe, empty-transcript), so empty
         # ``message:created`` events don't pay the HTTP. On fetch
-        # failure we keep the V2 payload — defensive, so a transient
-        # /v5 hiccup doesn't drop an otherwise-deliverable message.
-        # The parse helpers (``extract_*``) prefer V5 fields when
-        # present, so reassigning ``msg`` is enough — no further
-        # downstream changes needed.
+        # failure we keep the pushed payload — defensive, so a transient
+        # hiccup doesn't drop an otherwise-deliverable message.
+        # ``get_message_v6`` normalises MessageV6 to the same legacy shape
+        # the socket delivers, so reassigning ``msg`` is enough — no
+        # further downstream changes needed.
         if self._api is not None:
             try:
-                enriched = await self._api.get_message_v5(message_id)
+                enriched = await self._api.get_message_v6(message_id)
             except Exception as exc:
                 logger.debug(
-                    "carbonvoice: v5 enrichment failed for %s: %s — "
-                    "continuing with v2 payload",
+                    "carbonvoice: v6 enrichment failed for %s: %s — "
+                    "continuing with pushed payload",
                     message_id, exc,
                 )
                 enriched = None
             if enriched:
-                # Staleness guard: the v5 GET can race a write the push
-                # payload already reflects (read-replica lag) — if the v2
-                # copy has ``tagged_user_ids`` and the v5 copy doesn't,
-                # keep the populated array rather than letting the
+                # Staleness guard: the REST read can race a write the push
+                # payload already reflects (read-replica lag) — if the
+                # pushed copy has ``tagged_user_ids`` and the fetched copy
+                # doesn't, keep the populated array rather than letting the
                 # enrichment erase the mention.
                 if not enriched.get("tagged_user_ids") and msg.get("tagged_user_ids"):
                     enriched["tagged_user_ids"] = msg["tagged_user_ids"]
                 msg = enriched
-                # Re-pull transcript from the (canonical) v5 payload —
-                # usually the same string but keeps everything in one
-                # shape after this point.
+                # Re-pull transcript from the canonical payload — usually
+                # the same string but keeps everything in one shape after
+                # this point.
                 transcript = extract_transcript(msg) or transcript
 
         # Server-side dedup (persistent, survives restarts). We put an ack
@@ -1816,9 +1938,9 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
         # keeps re-fetching the same message; without a durable marker the
         # SeenCache eventually lapses and the agent re-answers the same
         # message (observed: one message dispatched 5× across a day of
-        # restarts). We read ``reaction_summary`` from the canonical v5
+        # restarts). We read ``reaction_summary`` from the canonical v6
         # payload above. Mark seen too so immediate re-polls skip without
-        # paying another v5 GET. Mirrors the Claude Code Channel's
+        # paying another v6 GET. Mirrors the Claude Code Channel's
         # reaction-based ``isProcessed`` dedup.
         if (
             self._reactions is not None
@@ -2246,7 +2368,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
 
         Prompts already in the polled batch are read from it (free); any
         others are fetched by id (the owner's reaction won't necessarily
-        bring the bot's own prompt into ``fetch_recent``). Only the owner's
+        bring the bot's own prompt into the updates feed). Only the owner's
         reaction counts — a stranger reacting 👍 on their own prompt must
         not self-approve.
         """
@@ -2270,7 +2392,7 @@ class CarbonVoiceAdapter(BasePlatformAdapter):
             msg = by_id.get(prompt_id)
             if msg is None:
                 try:
-                    msg = await self._api.get_message_v5(prompt_id)
+                    msg = await self._api.get_message_v6(prompt_id)
                 except Exception:
                     msg = None
             if not isinstance(msg, dict):

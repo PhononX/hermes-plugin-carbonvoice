@@ -74,7 +74,7 @@ To go back to the old open behavior, set `CARBONVOICE_ALLOW_ALL_USERS=true`.
 
 ## What it does
 
-- **No webhook, no tunnel.** Connects via Socket.IO (primary) and polls `POST /v3/messages/recent` as a REST fallback.
+- **No webhook, no tunnel.** Connects via Socket.IO (primary) and polls `GET /v6/messages/updates` (cursor-paged) as a REST fallback.
 - **Offline catch-up.** Persists a cursor to `$HERMES_HOME/state/carbonvoice.json`, so messages that arrived while Hermes was down are processed on the next startup.
 - **Visual ack on receipt.** Reacts to every inbound message with a Carbon Voice reaction (default: `acknowledged`) so users see feedback in <100ms even before the agent finishes thinking.
 - **Mark-as-read.** Clears the unread notification once the agent has handled the message.
@@ -130,7 +130,7 @@ The adapter then runs in polling-only mode (functional, 5s latency).
 
 Now DM the agent's Carbon Voice account from another account. Hermes replies in the same channel, threaded to your message.
 
-If Hermes is restarted, any messages that arrived while it was offline are fetched via `/v3/messages/recent` on startup and processed before the live connection comes up.
+If Hermes is restarted, any messages that arrived while it was offline are fetched via `GET /v6/messages/updates` (resuming from the stored cursor) on startup and processed before the live connection comes up.
 
 ## Optional environment variables
 
@@ -259,7 +259,7 @@ Carbon Voice users can attach images to a message via the standard CV UI — pho
 
 Forwarding a Carbon Voice message to the agent works like it does in cv-claude-channels: the agent receives the *original* message's content (transcript + attachments), followed by the forwarder's comment when there is one.
 
-When a user forwards a message, CV creates a *share link* and stamps its id on the new wrapper message as `share_link_id`. The wrapper itself carries only the forwarder's optional comment — so the plugin resolves the original via `GET /v3/message-sharelinks/:share_link_id` and composes what the agent reads:
+When a user forwards a message, CV creates a *share link* and stamps its id on the new wrapper message as `share_link_id`. The wrapper itself carries only the forwarder's optional comment — so the plugin resolves the original via `GET /v6/message-sharelinks/:share_link_id` and composes what the agent reads:
 
 ```
 [Forwarded message from <original sender>]
@@ -296,12 +296,13 @@ Both contracts are pending upstream review (PR against `NousResearch/hermes-agen
 │   │   (message:created /              (real-time push)
 │   │    message:updated → REST fetch)
 │   │
-│   └── REST polling fallback ─────▶  POST /v3/messages/recent
-│       (every 5s while WS is down)    { date: lastSeenAt, direction: "newer" }
+│   └── REST polling fallback ─────▶  GET /v6/messages/updates
+│       (every 5s while WS is down)    ?cursor=<stored>&direction=newer
+│                                      (date=lastSeenAt when no cursor)
 │
 │   Outbound ─────────────────────▶  POST /v3/messages/start
 │
-│   State cursor (debounced 5s flush)
+│   State: updates cursor + date seed (debounced 5s flush)
 │   $HERMES_HOME/state/carbonvoice.json
 └──────────────────────────────┘
 ```

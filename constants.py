@@ -32,6 +32,20 @@ STUCK_RETRY_DELAY_S = 6.0
 # pass so it can't pin the cursor forever and re-feed the whole window on
 # every poll/restart. Override with CARBONVOICE_STUCK_MAX_AGE_S.
 DEFAULT_STUCK_MAX_AGE_S = 5 * 60
+
+# GET /v6/messages/updates paging. 200 is the server's default and maximum
+# page size. A single sync follows ``next_cursor`` for at most
+# UPDATES_MAX_PAGES_PER_TICK pages; if the feed still ``has_more`` after
+# that, the reached cursor is persisted and a trailing re-fetch continues
+# from it, so a long backlog can't monopolize one tick.
+UPDATES_PAGE_LIMIT = 200
+UPDATES_MAX_PAGES_PER_TICK = 25
+
+# The updates feed may re-deliver up to ~4s of already-seen rows behind a
+# resume cursor (and the first date-anchored page is shifted back ~4s).
+# The poller remembers this many (id → last_updated_at) pairs to drop those
+# re-deliveries; a genuine update carries a new last_updated_at and passes.
+POLL_DEDUPE_MAX = 2_000
 HTTP_TIMEOUT = 30.0
 MAX_MESSAGE_LENGTH = 8000
 

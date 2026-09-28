@@ -1,6 +1,13 @@
 """Cursor persistence for catch-up after Hermes restarts.
 
-A single ``lastSeenAt`` ISO timestamp is written to ``$HERMES_HOME/state/carbonvoice.json``.
+Two values are written to ``$HERMES_HOME/state/carbonvoice.json``:
+
+- ``cursor`` — the opaque ``next_cursor`` of ``GET /v6/messages/updates``,
+  the resume point of the poll feed. Preferred whenever present.
+- ``lastSeenAt`` — an ISO timestamp, the ``date`` seed used to anchor the
+  feed when there is no cursor yet (first run, or state written before the
+  v6 migration) or when the server rejects the stored cursor.
+
 Writes are debounced so a burst of messages doesn't fsync per message; on
 shutdown the adapter calls ``stop()`` which forces a final flush.
 """
@@ -33,12 +40,14 @@ def default_state_path() -> Path:
 
 
 class Cursor:
-    """Tracks ``lastSeenAt`` with debounced disk persistence."""
+    """Tracks the updates-feed ``cursor`` and the ``lastSeenAt`` date seed,
+    with debounced disk persistence."""
 
     def __init__(self, path: Path, flush_debounce_s: float = DEFAULT_FLUSH_DEBOUNCE_S):
         self._path = path
         self._flush_debounce_s = flush_debounce_s
         self._last_seen_at: Optional[str] = None
+        self._cursor: Optional[str] = None
         self._dirty = False
         self._flush_task: Optional[asyncio.Task] = None
 
@@ -50,6 +59,10 @@ class Cursor:
     def last_seen_at(self) -> Optional[str]:
         return self._last_seen_at
 
+    @property
+    def cursor(self) -> Optional[str]:
+        return self._cursor
+
     async def load(self) -> None:
         try:
             raw = self._path.read_text(encoding="utf-8")
@@ -57,14 +70,42 @@ class Cursor:
             last = data.get("lastSeenAt")
             if isinstance(last, str) and last:
                 self._last_seen_at = last
-                logger.info("carbonvoice: resuming from %s", last)
+            cursor = data.get("cursor")
+            if isinstance(cursor, str) and cursor:
+                self._cursor = cursor
+            if self._cursor:
+                logger.info("carbonvoice: resuming from stored updates cursor")
+            elif self._last_seen_at:
+                logger.info("carbonvoice: resuming from %s", self._last_seen_at)
         except FileNotFoundError:
             pass
         except Exception as exc:
             logger.warning("carbonvoice: failed to load state: %s", exc)
 
     def advance(self, iso_ts: str) -> None:
+        """Move the ``date`` seed (used only when there is no cursor)."""
         self._last_seen_at = iso_ts
+        self._dirty = True
+        self._schedule_flush()
+
+    def set_cursor(self, cursor: str, seed_iso: Optional[str] = None) -> None:
+        """Store the feed's resume cursor, optionally refreshing the seed.
+
+        The seed is what we fall back to if the server ever rejects this
+        cursor, so the caller refreshes it on every fully-handled sync.
+        """
+        self._cursor = cursor
+        if seed_iso:
+            self._last_seen_at = seed_iso
+        self._dirty = True
+        self._schedule_flush()
+
+    def clear_cursor(self) -> None:
+        """Drop a cursor the server rejected; the next sync re-anchors by
+        the ``lastSeenAt`` date seed."""
+        if self._cursor is None:
+            return
+        self._cursor = None
         self._dirty = True
         self._schedule_flush()
 
@@ -82,14 +123,14 @@ class Cursor:
         self._flush_task = asyncio.create_task(_delayed())
 
     async def flush(self) -> None:
-        if not self._dirty or self._last_seen_at is None:
+        if not self._dirty or (self._last_seen_at is None and self._cursor is None):
             return
+        data = {"lastSeenAt": self._last_seen_at}
+        if self._cursor:
+            data["cursor"] = self._cursor
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps({"lastSeenAt": self._last_seen_at}),
-                encoding="utf-8",
-            )
+            self._path.write_text(json.dumps(data), encoding="utf-8")
             self._dirty = False
         except Exception as exc:
             logger.warning("carbonvoice: failed to flush state: %s", exc)

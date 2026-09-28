@@ -291,7 +291,7 @@ jobs:
           import asyncio
           class _FakeAPI:
               def __init__(self): self.calls = 0
-              async def get_message(self, mid):
+              async def get_message_v6(self, mid):
                   self.calls += 1
                   return {'transcript_txt': f'parent of {mid}'} if mid == 'with-text' else None
           async def _tracker_async():
@@ -325,15 +325,14 @@ jobs:
               'send_text_v5',          # v5 outbound text
               'send_audio_v5',         # v5 outbound audio (multipart)
               'send_attachment_v5',    # v5 outbound attachments (URL-based)
-              'get_message_v5',        # v5 fetch single
-              'get_messages_by_ids_v5',# v5 batch fetch (PR 4 thread context)
+              'get_message_v6',        # v6 fetch single (normalised to legacy)
+              'get_messages_by_ids_v6',# v6 batch fetch (thread context)
               'list_channel_message_index',  # v3 channel index (PR 4)
               'get_signed_upload_urls',# v3 signed-URL fetch (PR 5)
               'upload_to_s3',          # direct S3 PUT (PR 5)
               'update_attachment',     # attachment status flip (PR 5)
-              'get_message',           # legacy v3 single fetch (kept)
               'get_channel',           # channel metadata + collaborator roster
-              'whoami', 'fetch_recent', 'fetch_reactions', 'react', 'mark_read',
+              'whoami', 'fetch_message_updates', 'fetch_reactions', 'react', 'mark_read',
           ):
               assert hasattr(CarbonVoiceAPI, method), f'CarbonVoiceAPI is missing {method}'
           print(f'CarbonVoiceAPI surface: {sum(1 for m in dir(CarbonVoiceAPI) if not m.startswith("_"))} public methods')
@@ -342,7 +341,7 @@ jobs:
           # {ids:[...]} to {conversation_id, message_ids:[...]} — the old shape
           # 400s, which is why thread-context fetch was silently broken).
           import inspect as _inspect, asyncio as _asyncio
-          _p = list(_inspect.signature(CarbonVoiceAPI.get_messages_by_ids_v5).parameters)
+          _p = list(_inspect.signature(CarbonVoiceAPI.get_messages_by_ids_v6).parameters)
           assert _p[:3] == ['self', 'conversation_id', 'message_ids'], _p
 
           # ChannelCache resolves chat_type AND the participant roster from a
@@ -372,10 +371,11 @@ jobs:
           _asyncio.run(_cc_test())
           print('ChannelCache: one call for chat_type+roster; TTL refetch — OK')
 
-          # get_message_v5 must UNWRAP the {"message": {...}} envelope the v5
-          # single-GET returns (the source-of-truth test mocked a flat payload
-          # and missed this — a regression silently drops @-mentions because
-          # tagged_user_ids hides behind the 'message' key).
+          # get_message_v6 must UNWRAP the {"message": {...}} envelope the
+          # single-GET returns (a flat-payload mock once missed this — a
+          # regression silently drops @-mentions because tagged_user_ids
+          # hides behind the 'message' key) and normalise MessageV6 to the
+          # legacy shape the parse path reads.
           class _EnvResp:
               status_code = 200
               content = b'{"message":{"id":"m1","tagged_user_ids":["BOT"]}}'
@@ -387,17 +387,18 @@ jobs:
           class _GetClient:
               def __init__(self, resp): self._resp = resp
               async def get(self, url): return self._resp
-              # get_message_v5 now routes through _request_retrying →
+              # get_message_v6 routes through _request_retrying →
               # client.request(method, url); the mock must accept it.
               async def request(self, method, url, **kw): return self._resp
           async def _env_test():
               a = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a._client = _GetClient(_EnvResp())
-              out = await a.get_message_v5('m1')
-              assert out == {'id': 'm1', 'tagged_user_ids': ['BOT']}, out  # unwrapped
+              out = await a.get_message_v6('m1')
+              assert 'message' not in out, out  # unwrapped
+              assert out['message_id'] == 'm1' and out['tagged_user_ids'] == ['BOT'], out
               a2 = CarbonVoiceAPI.__new__(CarbonVoiceAPI); a2._client = _GetClient(_FlatResp())
-              assert await a2.get_message_v5('m2') == {'id': 'm2'}  # flat passthrough
+              assert (await a2.get_message_v6('m2'))['message_id'] == 'm2'  # flat tolerated
           _asyncio.run(_env_test())
-          print('get_message_v5 unwraps {message:…} envelope + flat passthrough — OK')
+          print('get_message_v6 unwraps {message:…} envelope + normalises — OK')
 
           # Transient-5xx retry: CV returns 502s in bursts; latency-critical
           # idempotent reads/reactions must retry with short backoff instead
@@ -724,9 +725,9 @@ jobs:
           # (mention, multimodal) see the canonical post-resolution
           # state. Locks the contract that future refactors can't
           # silently revert.
-          assert 'get_message_v5(message_id)' in adapter_src, \
-              'adapter._process_message must enrich the V2 payload via ' \
-              'get_message_v5(message_id) — V5 is the source of truth ' \
+          assert 'get_message_v6(message_id)' in adapter_src, \
+              'adapter._process_message must enrich the pushed payload via ' \
+              'get_message_v6(message_id) — REST is the source of truth ' \
               'per cv-api design (see DEVELOPMENT.md §4 / §7)'
           assert 'msg = enriched' in adapter_src, \
               'adapter._process_message must reassign msg to the v5 ' \
@@ -792,7 +793,7 @@ jobs:
 
           # Stuck-message cursor hold: when a transcript isn't ready,
           # _process_message returns None (not False), and the poll loop
-          # holds the cursor just before the first stuck message instead
+          # holds the cursor at the page of the first stuck message instead
           # of advancing past it (which could skip a message whose
           # transcript never bumps updated_at in time). Mirrors the Claude
           # Code Channel's null-return + stuck-message handling.
@@ -800,9 +801,10 @@ jobs:
               '_process_message must return Optional[bool] (True=dispatched, ' \
               'False=skip, None=stuck) so the cursor can distinguish a ' \
               'not-ready transcript from a permanent skip'
-          assert 'first_stuck_idx' in adapter_src, \
-              '_fetch_missed_messages must track the first stuck message ' \
-              'and hold the cursor before it (stuck-message handling)'
+          assert 'first_stuck_page' in adapter_src, \
+              '_fetch_missed_messages must track the first page holding a ' \
+              'stuck message and hold the updates cursor there ' \
+              '(stuck-message handling)'
           # The not-ready-transcript branch must hold the cursor (return
           # None) for a YOUNG message — returning False there would let the
           # cursor advance past a message CV is still transcribing — but it

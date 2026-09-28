@@ -51,26 +51,25 @@ def now_utc() -> "datetime":
 def extract_transcript(msg: Dict[str, Any]) -> str:
     """Pull the human-readable transcript from a CV message payload.
 
-    Shape compatibility — checked in order so the V5 source-of-truth
-    payload wins, with the older shapes kept as fallback for the brief
-    window between socket signal and the v5 GET enrichment (and for
-    webhook callers that haven't migrated yet):
+    Shape compatibility, checked in order:
 
-      - **V5 / GET ``/v5/messages/:id``**: top-level ``transcript`` string.
-      - **V2 (socket push, ``/v3/messages/recent``)**: ``text_models[]``
-        with one entry of ``type == "transcript"`` carrying either a
-        joined ``timecodes[].t`` walk or a ``value`` string.
+      - **V5**: top-level ``transcript`` string. No longer fetched (REST
+        reads moved to v6) but kept for callers that still pass it.
+      - **Legacy (socket push, and every v6 read after**
+        :func:`normalize_v6`**)**: ``text_models[]`` with one entry of
+        ``type == "transcript"`` carrying either a joined
+        ``timecodes[].t`` walk or a ``value`` string.
       - **Webhook**: ``transcript_txt`` or ``ai_summary_txt`` flat
         strings.
 
     When the message is still being transcribed all of these are empty;
     callers must treat an empty return as "not ready yet" and retry.
     """
-    # V5 — preferred. Single source of truth per cv-api design.
+    # V5 — top-level string.
     v5_transcript = msg.get("transcript")
     if isinstance(v5_transcript, str) and v5_transcript.strip():
         return v5_transcript.strip()
-    # V2 — socket / v3-poll fallback.
+    # Legacy — socket push and normalised v6 reads.
     text_models = msg.get("text_models") or []
     if isinstance(text_models, list):
         for m in text_models:
@@ -126,7 +125,7 @@ def extract_share_link_id(msg: Dict[str, Any]) -> Optional[str]:
     (and the deprecated alias ``forward_id`` — both are set to the same
     value by ``addForwardToMessage``). Present on V2 and V5 payloads. The
     original message's content is NOT on the wrapper; it must be fetched
-    via ``GET /v3/message-sharelinks/{share_link_id}`` (the same flow
+    via ``GET /v6/message-sharelinks/{share_link_id}`` (the same flow
     cv-claude-channels uses).
     """
     return first_str(msg.get("share_link_id"), msg.get("forward_id"))
@@ -215,7 +214,7 @@ def is_user_mentioned(msg: Dict[str, Any], user_id: Optional[str]) -> bool:
     Hermes *after* the audio is recorded, so the tag lands on a later
     ``message:updated`` rather than at create time. The gate's
     ``revisitable`` rejection (leaves the message out of the dedup cache)
-    plus the ``get_message_v5`` enrichment guarantee that updated payload
+    plus the ``get_message_v6`` enrichment guarantee that updated payload
     is re-evaluated with the now-populated array.
     """
     if not user_id:
@@ -386,3 +385,154 @@ def extract_reply_anchor(msg: Dict[str, Any]) -> Optional[str]:
         msg.get("parent_message_id"), msg.get("parent_message_guid")
     )
     return parent or extract_message_id(msg)
+
+
+# ── v6 → legacy normalisation ───────────────────────────────────────────
+#
+# Every REST read now goes through cv-api's ``/v6`` message routes, whose
+# ``MessageV6`` shape differs from the legacy (v2/v3) shape the Socket.IO
+# ``message:created`` / ``message:updated`` events still deliver. Socket and
+# REST payloads flow through the same parse path (``extract_*``, the gates,
+# the conversation tracker), so instead of teaching every helper a third
+# shape we map v6 back to the legacy shape exactly once, at the v6 fetch
+# boundary in ``api.py``. Mirrors the reference TypeScript ``mapMessageV6``.
+
+# v6 keys that are renamed (or restructured) by :func:`normalize_v6`. They
+# are dropped from the output so a normalised message is indistinguishable
+# from a socket payload — in particular ``thread_id`` (which equals ``id`` on
+# a top-level message) must not leak through as if it were a parent id.
+_V6_RENAMED_KEYS = frozenset({
+    "content", "conversation_id", "workspace_id", "thread_id",
+    "updated_at", "attachments",
+})
+
+
+def _decode_waveform(encoded: Any) -> List[float]:
+    """Decode v6's compact base-36 waveform (``0``..``z``) into the legacy
+    ``waveform_percentages`` list of 0..1 floats. Invalid characters are
+    skipped rather than failing the whole message."""
+    if not isinstance(encoded, str):
+        return []
+    out: List[float] = []
+    for ch in encoded:
+        try:
+            out.append(int(ch, 36) / 35)
+        except ValueError:
+            continue
+    return out
+
+
+def _v6_transcript(content: Dict[str, Any]) -> str:
+    """``content.transcript``, else the words of ``content.time_codes``."""
+    transcript = content.get("transcript")
+    if isinstance(transcript, str) and transcript.strip():
+        return transcript.strip()
+    time_codes = content.get("time_codes") or []
+    if not isinstance(time_codes, list):
+        return ""
+    return " ".join(
+        tc["t"] for tc in time_codes
+        if isinstance(tc, dict) and isinstance(tc.get("t"), str) and tc["t"].strip()
+    ).strip()
+
+
+def normalize_v6(msg: Any) -> Dict[str, Any]:
+    """Map a cv-api ``MessageV6`` dict onto the legacy (v2/v3) message shape.
+
+    Field mapping:
+      - ``id`` → ``message_id`` (``id`` is kept too).
+      - ``conversation_id`` → ``channel_ids: [conversation_id]``.
+      - ``workspace_id`` → ``workspace_ids: [workspace_id]``.
+      - ``thread_id`` → ``parent_message_id`` only when it differs from ``id``
+        (v6 sets ``thread_id == id`` on a message that is not a reply).
+      - ``updated_at`` → ``last_updated_at``.
+      - ``content.transcript`` (else the joined ``content.time_codes`` words)
+        → a ``transcript`` entry in ``text_models``; ``content.ai_summary`` →
+        a ``summary`` entry.
+      - ``content.presigned_url`` / ``content.url`` → one ``audio_models``
+        entry. ``streaming_url`` is never used: it is the live rendition of a
+        message still being recorded, not a finished file.
+      - ``attachments[].id`` / ``.url`` → ``_id`` / ``link``.
+      - ``kind`` → ``is_text_message`` (``text`` → True, ``audio`` → False;
+        other kinds leave it unset, matching legacy payloads without it).
+
+    Every other key (``creator_id``, ``created_at``, ``status``,
+    ``tagged_user_ids``, ``reaction_summary``, ``share_link_id``, …) has the
+    same name and meaning in both shapes and is passed through unchanged.
+    Returns ``{}`` for anything that isn't a dict.
+    """
+    if not isinstance(msg, dict):
+        return {}
+
+    out: Dict[str, Any] = {
+        k: v for k, v in msg.items() if k not in _V6_RENAMED_KEYS
+    }
+
+    message_id = first_str(msg.get("id"))
+    if message_id:
+        out["message_id"] = message_id
+
+    conversation_id = first_str(msg.get("conversation_id"))
+    out["channel_ids"] = [conversation_id] if conversation_id else []
+
+    workspace_id = first_str(msg.get("workspace_id"))
+    out["workspace_ids"] = [workspace_id] if workspace_id else []
+
+    thread_id = first_str(msg.get("thread_id"))
+    if thread_id and thread_id != message_id:
+        out["parent_message_id"] = thread_id
+
+    if msg.get("updated_at") is not None:
+        out["last_updated_at"] = msg["updated_at"]
+
+    kind = msg.get("kind")
+    if kind == "text":
+        out["is_text_message"] = True
+    elif kind == "audio":
+        out["is_text_message"] = False
+
+    content = msg.get("content")
+    if not isinstance(content, dict):
+        content = {}
+    language = content.get("language")
+
+    text_models: List[Dict[str, Any]] = []
+    transcript = _v6_transcript(content)
+    if transcript:
+        text_models.append(
+            {"type": "transcript", "value": transcript, "language": language}
+        )
+    summary = content.get("ai_summary")
+    if isinstance(summary, str) and summary.strip():
+        text_models.append(
+            {"type": "summary", "value": summary.strip(), "language": language}
+        )
+    out["text_models"] = text_models
+
+    audio_url = first_str(content.get("presigned_url"), content.get("url"))
+    out["audio_models"] = (
+        [{
+            "_id": content.get("id"),
+            "url": audio_url,
+            "language": language,
+            "duration_ms": content.get("duration_ms"),
+            "waveform_percentages": _decode_waveform(
+                content.get("waveform_percentage")
+            ),
+            "is_original_audio": content.get("is_original_language"),
+        }]
+        if audio_url
+        else []
+    )
+
+    attachments: List[Dict[str, Any]] = []
+    for att in (msg.get("attachments") or []):
+        if not isinstance(att, dict):
+            continue
+        legacy = {k: v for k, v in att.items() if k not in ("id", "url")}
+        legacy["_id"] = att.get("id")
+        legacy["link"] = att.get("url")
+        attachments.append(legacy)
+    out["attachments"] = attachments
+
+    return out

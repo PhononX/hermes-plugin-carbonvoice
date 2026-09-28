@@ -8,7 +8,7 @@ that replace existing adapter state:
   (fixes the latent bug from `DEVELOPMENT.md §7.6`: the old
   `adapter._last_inbound_msg` was keyed by `channel_id`, so two
   concurrent threads in the same channel trampled each other).
-- **Parent text cache** — small LRU around `get_message()` so the
+- **Parent text cache** — small LRU around `get_message_v6()` so the
   adapter does not re-fetch the same parent transcript every time a
   star-shaped thread receives a new reply.
 
@@ -242,7 +242,7 @@ class ConversationTracker:
             # keep the empty value cached so we don't re-fetch.
             return cached or None
         try:
-            parent_msg = await self._api.get_message(parent_id)
+            parent_msg = await self._api.get_message_v6(parent_id)
         except Exception as exc:
             logger.debug(
                 "carbonvoice: get_parent_text(%s) failed: %s", parent_id, exc
